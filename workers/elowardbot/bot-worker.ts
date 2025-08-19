@@ -39,6 +39,9 @@ interface Env {
   DB: D1Database;
   // Optional site base url for reasons
   SITE_BASE_URL?: string;
+  // Internal write key for trusted calls from website backend
+  INTERNAL_WRITE_KEY?: string;
+  BOT_WRITE_KEY?: string;
 }
 
 const router = Router();
@@ -155,6 +158,19 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
   return u as { id: string; login: string; display_name: string };
 }
 
+// Validates any Twitch user token without requiring matching Client-Id.
+// Returns minimal identity: user_id and login.
+async function getUserFromAnyUserToken(_env: Env, userAccessToken: string) {
+  const res = await fetch('https://id.twitch.tv/oauth2/validate', {
+    headers: { Authorization: `OAuth ${userAccessToken}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.user_id || !data?.login) {
+    throw new Error('token validate failed');
+  }
+  return { id: String(data.user_id), login: String(data.login), display_name: String(data.login) } as { id: string; login: string; display_name: string };
+}
+
 async function sendTimeout(env: Env, botToken: string, broadcasterId: string, botUserId: string, targetUserId: string, seconds: number, reason: string) {
   const url = `${HELIX_BANS}?${toQuery({ broadcaster_id: broadcasterId, moderator_id: botUserId })}`;
   const res = await fetch(url, {
@@ -226,8 +242,8 @@ async function hmacValid(env: Env, bodyText: string, signatureHeader: string | n
 }
 
 async function getChannelConfig(env: Env, channel_login: string) {
-  const q = `SELECT channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
-             FROM twitch_bot_channels WHERE channel_login = ?`;
+  const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+             FROM twitch_bot_users WHERE channel_name = ?`;
   try {
     const stmt: any = env.DB.prepare(q).bind(channel_login.toLowerCase());
     if (typeof stmt.first === 'function') {
@@ -244,37 +260,49 @@ async function getChannelConfig(env: Env, channel_login: string) {
 
 async function upsertChannelConfig(env: Env, channel_login: string, patch: any) {
   const login = channel_login.toLowerCase();
-  const existing = await getChannelConfig(env, login);
-  if (!existing) {
-    const ins = `INSERT INTO twitch_bot_channels (channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds)
+  const v = (x: any) => (x === undefined ? null : x);
+  const to01 = (x: any) => (x === undefined || x === null ? null : (x === true || x === 1 ? 1 : x === false || x === 0 ? 0 : Number(x)));
+  // Ensure twitch_id present
+  let twitchId = v(patch.twitch_id) as string | null;
+  if (!twitchId) {
+    try {
+      const app = await getAppAccessToken(env);
+      const u = await getUserByLogin(env, app, login);
+      twitchId = u.id;
+    } catch {}
+  }
+  if (!twitchId) throw new Error('unable to resolve twitch_id');
+
+  // Upsert by primary key twitch_id
+  const upd = `UPDATE twitch_bot_users SET
+    channel_name = COALESCE(?, channel_name),
+    bot_enabled = COALESCE(?, bot_enabled),
+    timeout_seconds = COALESCE(?, timeout_seconds),
+    reason_template = COALESCE(?, reason_template),
+    ignore_roles = COALESCE(?, ignore_roles),
+    cooldown_seconds = COALESCE(?, cooldown_seconds),
+    updated_at = CURRENT_TIMESTAMP
+    WHERE twitch_id = ?`;
+  const result = await env.DB.prepare(upd).bind(
+    login,
+    to01(patch.bot_enabled),
+    v(patch.timeout_seconds),
+    v(patch.reason_template),
+    v(patch.ignore_roles),
+    v(patch.cooldown_seconds),
+    twitchId
+  ).run();
+  if ((result as any)?.meta?.changes === 0) {
+    const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds)
                  VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "⏱️ {seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"), COALESCE(?, 60))`;
     await env.DB.prepare(ins).bind(
+      twitchId,
       login,
-      patch.twitch_id || null,
-      patch.bot_enabled,
-      patch.timeout_seconds,
-      patch.reason_template,
-      patch.ignore_roles,
-      patch.cooldown_seconds
-    ).run();
-  } else {
-    const upd = `UPDATE twitch_bot_channels SET
-      twitch_id = COALESCE(?, twitch_id),
-      bot_enabled = COALESCE(?, bot_enabled),
-      timeout_seconds = COALESCE(?, timeout_seconds),
-      reason_template = COALESCE(?, reason_template),
-      ignore_roles = COALESCE(?, ignore_roles),
-      cooldown_seconds = COALESCE(?, cooldown_seconds),
-      updated_at = CURRENT_TIMESTAMP
-      WHERE channel_login = ?`;
-    await env.DB.prepare(upd).bind(
-      patch.twitch_id,
-      patch.bot_enabled,
-      patch.timeout_seconds,
-      patch.reason_template,
-      patch.ignore_roles,
-      patch.cooldown_seconds,
-      login
+      to01(patch.bot_enabled),
+      v(patch.timeout_seconds),
+      v(patch.reason_template),
+      v(patch.ignore_roles),
+      v(patch.cooldown_seconds)
     ).run();
   }
   return await getChannelConfig(env, login);
@@ -341,13 +369,39 @@ router.post('/bot/disable', async (req: Request, env: Env) => {
 });
 
 // Public endpoints authenticated by Twitch user token (frontend-friendly)
-router.post('/bot/enable_twitch', async (req: Request, env: Env) => {
+// Removed legacy twitch_token endpoints in favor of internal write-key paths and OAuth auto-enable.
+
+// -------- Internal enable/disable (trusted path via server-side secret) --------
+
+function internalAuthOk(env: Env, req: Request): boolean {
+  const provided = req.headers.get('X-Internal-Auth') || '';
+  const expected = (env as any).INTERNAL_WRITE_KEY || (env as any).BOT_WRITE_KEY || '';
+  return Boolean(expected) && provided === expected;
+}
+
+async function resolveLoginFromInput(env: Env, twitch_id?: string, channel_login?: string): Promise<{ login: string; id?: string } | null> {
+  if (channel_login) return { login: channel_login.toLowerCase() };
+  if (twitch_id) {
+    try {
+      const app = await getAppAccessToken(env);
+      const u = await getUserById(env, app, twitch_id);
+      return { login: u.login.toLowerCase(), id: u.id };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+router.post('/bot/enable_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
-    const { twitch_token } = await req.json();
-    if (!twitch_token) return json(400, { error: 'twitch_token required' });
-    const user = await getUserFromToken(env, twitch_token);
-    const cfg = await upsertChannelConfig(env, String(user.login).toLowerCase(), { bot_enabled: 1, twitch_id: user.id });
-    // Warm cooldown shard and reload
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    const resolved = await resolveLoginFromInput(env, twitch_id, channel_login);
+    if (!resolved?.login) return json(400, { error: 'missing twitch_id or channel_login' });
+    const cfg = await upsertChannelConfig(env, resolved.login, { bot_enabled: 1, twitch_id });
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
       await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
@@ -358,12 +412,15 @@ router.post('/bot/enable_twitch', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/disable_twitch', async (req: Request, env: Env) => {
+router.post('/bot/disable_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
-    const { twitch_token } = await req.json();
-    if (!twitch_token) return json(400, { error: 'twitch_token required' });
-    const user = await getUserFromToken(env, twitch_token);
-    const cfg = await upsertChannelConfig(env, String(user.login).toLowerCase(), { bot_enabled: 0, twitch_id: user.id });
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    const resolved = await resolveLoginFromInput(env, twitch_id, channel_login);
+    if (!resolved?.login) return json(400, { error: 'missing twitch_id or channel_login' });
+    const cfg = await upsertChannelConfig(env, resolved.login, { bot_enabled: 0, twitch_id });
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
       await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
@@ -374,17 +431,21 @@ router.post('/bot/disable_twitch', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/config_twitch', async (req: Request, env: Env) => {
+router.post('/bot/config_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
-    const body = await req.json();
-    const twitch_token = body?.twitch_token;
-    if (!twitch_token) return json(400, { error: 'twitch_token required' });
-    const user = await getUserFromToken(env, twitch_token);
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    const resolved = await resolveLoginFromInput(env, twitch_id, channel_login);
+    if (!resolved?.login) return json(400, { error: 'missing twitch_id or channel_login' });
     const patch: any = {};
     if (typeof body.timeout_seconds === 'number') patch.timeout_seconds = body.timeout_seconds;
     if (typeof body.reason_template === 'string') patch.reason_template = body.reason_template;
     if (typeof body.cooldown_seconds === 'number') patch.cooldown_seconds = body.cooldown_seconds;
-    const cfg = await upsertChannelConfig(env, String(user.login).toLowerCase(), { ...patch, twitch_id: user.id });
+    if (typeof body.bot_enabled === 'number' || typeof body.bot_enabled === 'boolean') patch.bot_enabled = body.bot_enabled;
+    if (twitch_id) patch.twitch_id = twitch_id;
+    const cfg = await upsertChannelConfig(env, resolved.login, patch);
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
       await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
@@ -436,10 +497,34 @@ router.get('/oauth/callback', async (req: Request, env: Env) => {
       // Optional: redirect to your dashboard success page
       return new Response(null, { status: 302, headers: { Location: `${env.WORKER_PUBLIC_URL}/oauth/done?actor=bot&login=${user.login}` } });
     } else {
-      const key = `broadcaster:${user.id}`;
-      const record = { user, channel_bot_granted: true, stored_at: Date.now() };
-      await env.BOT_KV.put(key, JSON.stringify(record));
-      return new Response(null, { status: 302, headers: { Location: `${env.WORKER_PUBLIC_URL}/oauth/done?actor=broadcaster&login=${user.login}` } });
+      // Broadcaster OAuth: auto-enable bot, subscribe EventSub, and warm cooldown shard
+      try {
+        await upsertChannelConfig(env, String(user.login).toLowerCase(), { bot_enabled: 1, twitch_id: user.id });
+      } catch {}
+      try {
+        // Subscribe EventSub for this broadcaster
+        const appToken = await getAppAccessToken(env);
+        const callback = `${env.WORKER_PUBLIC_URL}/eventsub/callback`;
+        const payload = {
+          type: 'channel.chat.message',
+          version: '1',
+          condition: { broadcaster_user_id: user.id },
+          transport: { method: 'webhook', callback, secret: env.EVENTSUB_SECRET },
+        };
+        await fetch(HELIX_EVENTSUB, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${appToken}`, 'Client-Id': env.TWITCH_CLIENT_ID, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+      } catch {}
+      try {
+        const id = env.BOT_MANAGER.idFromName('manager');
+        await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
+      } catch {}
+
+      // Redirect back to dashboard if available, else show done page
+      const redirect = env.SITE_BASE_URL ? `${env.SITE_BASE_URL}/dashboard?bot=enabled` : `${env.WORKER_PUBLIC_URL}/oauth/done?actor=broadcaster&login=${user.login}`;
+      return new Response(null, { status: 302, headers: { Location: redirect } });
     }
   } catch (e: any) {
     return json(500, { error: e?.message || 'oauth failed' });
@@ -467,7 +552,8 @@ router.post('/eventsub/subscribe', async (req: Request, env: Env) => {
     const payload = {
       type: 'channel.chat.message',
       version: '1',
-      condition: { broadcaster_user_id: user.id, user_id: user.id },
+      // Subscribe to all chat messages for the broadcaster. Do not include user_id or you'll filter to a single chatter.
+      condition: { broadcaster_user_id: user.id },
       transport: {
         method: 'webhook',
         callback,
@@ -544,7 +630,8 @@ router.post('/eventsub/callback', async (req: Request, env: Env) => {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              channel_id: broadcasterId,
+              // Use a consistent key name expected by the DO for namespacing cooldowns
+              channel_login: broadcasterId,
               user_login: chatterLogin,
               cooldown_seconds: channelConfig.cooldown_seconds || 60
             })
@@ -574,8 +661,21 @@ router.post('/eventsub/callback', async (req: Request, env: Env) => {
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (request.method === 'OPTIONS') return json(200, {});
-    return router.handle(request, env, ctx).catch((e: any) => json(500, { error: 'internal', detail: e?.message }));
+    const addCors = (res: Response) => {
+      try {
+        const headers = new Headers(res.headers);
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        headers.set('Access-Control-Allow-Headers', 'Content-Type, X-Signature');
+        return new Response(res.body, { status: res.status, headers });
+      } catch {
+        return res;
+      }
+    };
+
+    if (request.method === 'OPTIONS') return addCors(json(200, {}));
+    const res = await router.handle(request, env, ctx).catch((e: any) => json(500, { error: 'internal', detail: e?.message }));
+    return addCors(res);
   },
 };
 
@@ -595,8 +695,8 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    const q = `SELECT channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
-               FROM twitch_bot_channels
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+               FROM twitch_bot_users
                WHERE bot_enabled = 1`;
     const res = await env.DB.prepare(q).all();
     const rows = res?.results || [];
@@ -619,8 +719,8 @@ async function getUserById(env: Env, accessToken: string, id: string) {
 
 async function getChannelConfigByTwitchId(env: Env, twitchId: string) {
   try {
-    const q = `SELECT channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
-               FROM twitch_bot_channels WHERE twitch_id = ?`;
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+               FROM twitch_bot_users WHERE twitch_id = ?`;
     const res = await env.DB.prepare(q).bind(twitchId).all();
     const row = res?.results && res.results[0];
     if (row) return row;
@@ -682,7 +782,9 @@ class BotManager {
       const channels = await listEnabledChannels(this.env);
       // Warm cooldown shards for current channels
       for (const ch of channels) {
-        const id = this.env.IRC_SHARD.idFromName(`cooldown:${ch.channel_login}`);
+        // Warm the same shard naming used during EventSub processing. Prefer twitch_id when available.
+        const shardKey = String((ch as any).twitch_id || ch.channel_login);
+        const id = this.env.IRC_SHARD.idFromName(`cooldown:${shardKey}`);
         await this.env.IRC_SHARD.get(id).fetch('https://do/warm', { method: 'POST' });
       }
       return json(200, { ok: true, channels: channels.length });

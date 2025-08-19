@@ -1,9 +1,8 @@
--- Create table for EloWardBot per-channel configuration
-CREATE TABLE IF NOT EXISTS twitch_bot_channels (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  channel_login TEXT UNIQUE NOT NULL,          -- lowercase Twitch login
-  twitch_id TEXT,
-  bot_enabled BOOLEAN DEFAULT 0,
+-- Create table for EloWardBot per-channel configuration (minimal PII)
+CREATE TABLE IF NOT EXISTS twitch_bot_users (
+  twitch_id TEXT PRIMARY KEY,
+  channel_name TEXT,                           -- optional, display only
+  bot_enabled INTEGER DEFAULT 0,
   timeout_seconds INTEGER DEFAULT 30,
   reason_template TEXT DEFAULT "⏱️ {seconds}s timeout: link your EloWard rank at {site}",
   ignore_roles TEXT DEFAULT "broadcaster,moderator,vip",
@@ -12,6 +11,8 @@ CREATE TABLE IF NOT EXISTS twitch_bot_channels (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Helpful index for lookups by login
-CREATE INDEX IF NOT EXISTS idx_bot_channels_login ON twitch_bot_channels(channel_login);
+-- Unique constraint on channel_name to avoid duplicates per username
+-- If a prior unique index name exists, drop it for clarity
+DROP INDEX IF EXISTS uq_bot_users_channel_name;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_users_channel_name ON twitch_bot_users(channel_name);
 
