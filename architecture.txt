@@ -1,0 +1,237 @@
+# EloWard Cloudflare Infrastructure
+
+## 🗑️ Routes Safe for Removal
+**The following routes are no longer used by the migrated EloWardApp extension:**
+- `GET /auth/init` - Replaced by client-side URL building
+- `POST /auth/token` - Replaced by `/auth/complete`
+- `GET /riot/account/{region}` - Replaced by server-side calls
+- `GET /riot/league/entries` - Replaced by server-side calls
+- `GET /riot/league/{platform}/{puuid}` - Replaced by server-side calls  
+- `POST /store-rank` - Replaced by `/auth/complete`
+
+**Migration Status:** ✅ Complete - Extension fully migrated to server-side auth flow
+
+**Note:** `GET /auth/redirect` must be kept as it's required for OAuth callbacks from Riot Games.
+
+## D1 Database Configuration
+- Database Name: eloward
+- Database ID: ef228f37-9c28-43f2-a211-cfddd4188c78
+
+## Tables
+
+### users
+- Purpose: Stores complete Twitch user profile data and app-specific metrics
+- Primary Key: `twitch_id` (TEXT)
+- Columns:
+  - `twitch_id` (TEXT): Twitch user ID (PRIMARY KEY)
+  - `channel_name` (TEXT): Twitch login/username (stored in lowercase)
+  - `display_name` (TEXT): Twitch display name (nullable)
+  - `type` (TEXT): User type (e.g., "", "admin", "global_mod", "staff") (nullable)
+  - `broadcaster_type` (TEXT): Broadcaster type (e.g., "", "affiliate", "partner") (nullable)
+  - `description` (TEXT): User bio/description (nullable)
+  - `profile_image_url` (TEXT): Profile image URL (nullable)
+  - `offline_image_url` (TEXT): Offline banner image URL (nullable)
+  - `view_count` (INTEGER): Total channel view count (default: 0)
+  - `email` (TEXT): Twitch email (nullable)
+  - `twitch_created_at` (TEXT): When Twitch account was created (ISO string) (nullable)
+  - `db_reads` (INTEGER): Counter for all database reads requested for this channel (default: 0)
+  - `successful_lookups` (INTEGER): Counter for successful lookups (viewer found in database) (default: 0)
+  - `channel_active` (BOOLEAN): Whether EloWard is active for this channel (default: 1)
+  - `created_at` (TIMESTAMP): When the user joined EloWard (default: CURRENT_TIMESTAMP)
+  - `updated_at` (TIMESTAMP): When the record was last updated (default: CURRENT_TIMESTAMP)
+
+### subscriptions
+- Purpose: Stores payment and subscription metadata, separate from user profiles
+- Primary Key: `twitch_id` (TEXT)
+- Columns:
+  - `twitch_id` (TEXT): Reference to users.twitch_id (PRIMARY KEY)
+  - `stripe_customer_id` (TEXT): Stripe customer ID (unique, nullable)
+  - `stripe_subscription_id` (TEXT): Stripe subscription ID (unique, nullable)
+  - `subscription_end_date` (TIMESTAMP): When subscription expires (nullable)
+  - `plus_active` (BOOLEAN): Whether EloWard+ features are active (default: 0)
+  - `created_at` (TIMESTAMP): When the subscription was created (default: CURRENT_TIMESTAMP)
+  - `updated_at` (TIMESTAMP): When the record was last updated (default: CURRENT_TIMESTAMP)
+  - **Foreign Key**: `twitch_id` REFERENCES `users(twitch_id)` ON DELETE CASCADE
+
+### lol_ranks
+- Purpose: Stores League of Legends rank data for Twitch viewers
+- Primary Key: `riot_puuid` (TEXT)
+- Columns:
+  - `riot_puuid` (TEXT): Riot player universal unique identifier (PRIMARY KEY)
+  - `twitch_username` (TEXT): Twitch username (NOT NULL)
+  - `riot_id` (TEXT): Riot ID (gameName#tagLine) (nullable)
+  - `rank_tier` (TEXT): Rank tier (e.g., IRON, BRONZE, SILVER) (NOT NULL)
+  - `rank_division` (TEXT): Rank division (e.g., I, II, III, IV) (nullable)
+  - `lp` (INTEGER): League points (default: 0)
+  - `region` (TEXT): Riot API region (e.g., na1, euw1, kr) (nullable)
+  - `last_updated` (INTEGER): Unix timestamp of last update (NOT NULL)
+
+## Worker Architecture
+
+### Service Bindings Structure
+```
+Extension/Web App
+    ↓
+Auth Workers (Token Validation + API Calls)
+    ↓
+Database Workers (Database Operations)
+    ↓
+D1 Database
+```
+
+### Workers and Endpoints
+
+#### Authentication Workers (Handle token validation and external API calls)
+
+**Riot Auth Worker** (`riotauth-worker.ts`)
+- URL: https://eloward-riotauth.unleashai.workers.dev
+- Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`
+- Endpoints:
+  - `POST /auth/complete` - **ACTIVE** Single-call optimized auth (code + twitch_id + region → complete user data)
+  - `POST /riot/refreshrank` - **ACTIVE** Simplified PUUID-only rank refresh
+  - `DELETE /disconnect` - **ACTIVE** Disconnect and clear rank data using PUUID only
+  - `GET /auth/redirect` - **ACTIVE** Handle OAuth redirect (required for OAuth flow)
+  - `GET /auth/init` - **🗑️ CAN REMOVE** No longer used by extension (migrated to client-side URL building)
+  - `POST /auth/token` - **🗑️ CAN REMOVE** No longer used by extension (replaced by /auth/complete)
+  - `GET /riot/account/{region}` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls in /auth/complete)
+  - `GET /riot/league/entries` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls)
+  - `GET /riot/league/{platform}/{puuid}` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls)
+  - `POST /store-rank` - **🗑️ CAN REMOVE** No longer used by extension (replaced by /auth/complete)
+
+**Twitch Auth Worker** (`twitchauth-worker.ts`)
+- URL: https://eloward-twitchauth.unleashai.workers.dev
+- Service Bindings: `USERS_WORKER`
+- Endpoints:
+  - `GET /health` - Health check
+  - `POST /twitch/auth` - **ACTIVE** Consolidated tokenless completion (code → user → register)
+  - `GET /auth/twitch/redirect` - **ACTIVE** Handle OAuth redirect (forward code/state to website)
+  - `POST /auth/twitch/init` - **🗑️ CAN REMOVE** No longer used by extension (client-side URL building)
+  - `POST /auth/twitch/token` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+  - `POST /auth/twitch/token/refresh` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+  - `POST /auth/twitch/validate` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+  - `POST /auth/twitch/user` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+  - `POST /store-user` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+
+#### Database Workers (Handle database operations only)
+
+**Rank Worker** (`rank-worker.js`)
+- URL: https://eloward-ranks.unleashai.workers.dev
+- Database Access: Direct D1 binding
+- Endpoints:
+  - `GET /api/ranks/lol/{username}` - Get rank for specific user
+  - `POST /api/ranks/lol` - Store/update rank data (via service binding from riotauth-worker)
+  - `POST /api/ranks/lol/by-puuid` - **NEW** Get rank data by PUUID (for simplified refresh)
+  - `DELETE /api/ranks/lol` - Delete rank data by PUUID
+
+**Users Worker** (`users-worker.js`)
+- URL: https://eloward-users.unleashai.workers.dev
+- Database Access: Direct D1 binding
+- Endpoints:
+  - `GET /health` - Health check
+  - `POST /channelstatus/verify` - Verify if channel has active subscription
+  - `POST /metrics/db_read` - Increment db_reads counter
+  - `POST /metrics/successful_lookup` - Increment successful_lookups counter
+  - `POST /user/register` - Register/update user data
+  - `POST /user/lookup` - **NEW** Look up channel_name by twitch_id for riot auth
+  - `POST /dashboard/data` - Fetch dashboard data
+  - `POST /channel/active/update` - Update channel active status
+
+#### Utility Workers
+
+**CDN Worker** (`cdn.js`)
+- URL: https://eloward-cdn.unleashai.workers.dev
+- Purpose: Serves rank badge images from R2 storage
+- Endpoints:
+  - `GET /{game}/{filename}` - Serve badge images with caching
+
+**Stripe Worker** (`stripe-worker.js`)
+- URL: https://eloward-stripe.unleashai.workers.dev
+- Purpose: Handles Stripe payments and webhooks
+- Endpoints:
+  - `POST /api/create-checkout-session` - Create payment session
+  - `POST /api/create-portal-session` - Create customer portal session
+  - `POST /api/webhook` - Handle Stripe webhooks
+
+## Data Flow
+
+### Optimized Single-Call Riot Auth Flow (**ENHANCED** - 1 backend call)
+1. Extension → Riot OAuth (with enhanced state containing twitch_id + region)
+2. Riot → riotauth-worker `/auth/redirect` (with code + enhanced state)
+3. riotauth-worker → Complete auth processing (server-side):
+   - Exchanges code for tokens
+   - Gets PUUID from Riot Account API  
+   - Looks up channel_name from users-worker
+   - Fetches rank data from Riot League API
+   - Stores rank data via rank-worker
+4. riotauth-worker → Website redirect (with auth_complete=true)
+5. Website → Extension (via postMessage with success notification)
+
+### Legacy Dual-Call Flow (Fallback when optimization fails)
+1. Extension → riotauth-worker `/auth/complete` (sends code + twitch_id + region)
+2. riotauth-worker → Riot OAuth API (exchanges code for tokens server-side)
+3. riotauth-worker → Riot Account API (gets PUUID using token)
+4. riotauth-worker → users-worker `/user/lookup` (gets channel_name from twitch_id)
+5. riotauth-worker → Riot League API (fetches initial rank data)
+6. riotauth-worker → rank-worker `/api/ranks/lol` (stores rank data)
+7. riotauth-worker → Extension (returns complete user data, no tokens)
+
+### Legacy Initial Rank Setup Flow (**🗑️ CAN REMOVE** - no longer used)
+**Uses deprecated endpoints: `/auth/init`, `/auth/token`, `/store-rank`**
+**Extension has been migrated to use `/auth/complete` flow**
+1. Extension → riotauth-worker (validates Riot & Twitch tokens)
+2. riotauth-worker → twitchauth-worker (validates Twitch user)
+3. riotauth-worker → rank-worker (stores rank data)
+4. rank-worker → D1 Database
+
+### Simplified Rank Refresh Flow
+1. Extension → riotauth-worker `/riot/refreshrank` (sends only PUUID)
+2. riotauth-worker → rank-worker `/api/ranks/lol/by-puuid` (looks up user data)
+3. riotauth-worker → Riot API (fetches current rank using server API key)
+4. riotauth-worker → rank-worker `/api/ranks/lol` (updates rank data)
+5. rank-worker → D1 Database
+
+### User Data Flow
+1. Extension → twitchauth-worker (validates Twitch token)
+2. twitchauth-worker → users-worker (stores user data)
+3. users-worker → D1 Database
+
+### Security Features
+- All client-side code only communicates with auth workers
+- Auth workers validate tokens before database operations (initial setup)
+- Database workers only accept requests from auth workers (via service bindings)
+- No direct client-to-database access
+- Token validation prevents unauthorized data manipulation
+- **ENHANCED**: Optimized single-call auth reduces backend calls from 2 to 1
+- **ENHANCED**: Enhanced state parameter with base64url encoding for security
+- **ENHANCED**: Backward compatibility with legacy state formats
+- **ENHANCED**: Graceful fallback to dual-call flow if optimization fails
+- **ENHANCED**: Server-side-only token handling reduces exposure surface
+- **ENHANCED**: Simplified refresh flow eliminates client-side token management
+- **ENHANCED**: Server-side API key usage reduces token exposure and refresh complexity
+- **ENHANCED**: PUUID-only refresh requires existing database entry (prevents unauthorized access)
+
+## Deprecations (Kept for Backward Compatibility)
+- Riot Auth Worker: `GET /auth/init`, `POST /auth/token`, `GET /riot/account/{region}`, `GET /riot/league/entries`, `GET /riot/league/{platform}/{puuid}`, `POST /store-rank` — not used by current clients.
+- Twitch Auth Worker: `POST /auth/twitch/init`, `POST /auth/twitch/token`, `POST /auth/twitch/token/refresh`, `POST /auth/twitch/validate`, `POST /auth/twitch/user` — superseded by `POST /twitch/auth`. Keep for older clients; safe to remove when no longer needed.
+
+## Database Indexes
+
+### users table
+- PRIMARY KEY: `twitch_id`
+- INDEX: `channel_name` (for username lookups)
+- INDEX: `channel_active` (for active channel queries)
+- INDEX: `email` (for email lookups)
+- INDEX: `broadcaster_type` (for broadcaster type queries)
+
+### subscriptions table
+- PRIMARY KEY: `twitch_id`
+- INDEX: `stripe_customer_id` (for Stripe lookups)
+- INDEX: `stripe_subscription_id` (for Stripe lookups)
+- INDEX: `plus_active` (for active subscription queries)
+- INDEX: `subscription_end_date` (for expiration queries)
+
+### lol_ranks table
+- PRIMARY KEY: `riot_puuid`
+- INDEX: `twitch_username` (for username lookups)
+- INDEX: `riot_id` (for Riot ID lookups)
+- NOTE: `region` column stores Riot API region identifiers (e.g., na1, euw1, kr)
