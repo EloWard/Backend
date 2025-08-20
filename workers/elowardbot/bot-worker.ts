@@ -319,54 +319,7 @@ router.get('/bot/config/:login', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/config/:login', async (req: Request, env: Env) => {
-  const bodyText = await req.text();
-  const ok = await hmacValid(env, bodyText, req.headers.get('X-Signature'));
-  if (!ok) return json(401, { error: 'invalid signature' });
-  try {
-    const login = ((req as any).params?.login) || new URL(req.url).pathname.split('/').pop();
-    const patch = JSON.parse(bodyText || '{}');
-    const cfg = await upsertChannelConfig(env, String(login), patch);
-    // Instruct DO to reload
-    const id = env.BOT_MANAGER.idFromName('manager');
-    await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
-    return json(200, cfg);
-  } catch (e: any) {
-    return json(500, { error: e?.message || 'error' });
-  }
-});
-
-router.post('/bot/enable', async (req: Request, env: Env) => {
-  const bodyText = await req.text();
-  const ok = await hmacValid(env, bodyText, req.headers.get('X-Signature'));
-  if (!ok) return json(401, { error: 'invalid signature' });
-  try {
-    const { channel_login } = JSON.parse(bodyText || '{}');
-    if (!channel_login) return json(400, { error: 'channel_login required' });
-    const cfg = await upsertChannelConfig(env, channel_login, { bot_enabled: 1 });
-    const id = env.BOT_MANAGER.idFromName('manager');
-    await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
-    return json(200, cfg);
-  } catch (e: any) {
-    return json(500, { error: e?.message || 'error' });
-  }
-});
-
-router.post('/bot/disable', async (req: Request, env: Env) => {
-  const bodyText = await req.text();
-  const ok = await hmacValid(env, bodyText, req.headers.get('X-Signature'));
-  if (!ok) return json(401, { error: 'invalid signature' });
-  try {
-    const { channel_login } = JSON.parse(bodyText || '{}');
-    if (!channel_login) return json(400, { error: 'channel_login required' });
-    const cfg = await upsertChannelConfig(env, channel_login, { bot_enabled: 0 });
-    const id = env.BOT_MANAGER.idFromName('manager');
-    await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
-    return json(200, cfg);
-  } catch (e: any) {
-    return json(500, { error: e?.message || 'error' });
-  }
-});
+// Removed legacy HMAC write endpoints. All DB writes now require X-Internal-Auth via *_internal routes or occur during OAuth callback.
 
 // Public endpoints authenticated by Twitch user token (frontend-friendly)
 // Removed legacy twitch_token endpoints in favor of internal write-key paths and OAuth auto-enable.
