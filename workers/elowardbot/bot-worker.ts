@@ -242,7 +242,7 @@ async function hmacValid(env: Env, bodyText: string, signatureHeader: string | n
 }
 
 async function getChannelConfig(env: Env, channel_login: string) {
-  const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+  const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
              FROM twitch_bot_users WHERE channel_name = ?`;
   try {
     const stmt: any = env.DB.prepare(q).bind(channel_login.toLowerCase());
@@ -393,7 +393,7 @@ async function resolveLoginFromInput(env: Env, twitch_id?: string, channel_login
   return null;
 }
 
-router.post('/bot/enable_internal', async (req: Request, env: Env) => {
+router.post('/bot/enable_internal', async (req: Request, env: Env, ctx: ExecutionContext) => {
   if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
     const body = await req.json().catch(() => ({}));
@@ -404,7 +404,7 @@ router.post('/bot/enable_internal', async (req: Request, env: Env) => {
     const cfg = await upsertChannelConfig(env, resolved.login, { bot_enabled: 1, twitch_id });
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
-      await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
+      ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
     } catch {}
     return json(200, cfg);
   } catch (e: any) {
@@ -412,7 +412,7 @@ router.post('/bot/enable_internal', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/disable_internal', async (req: Request, env: Env) => {
+router.post('/bot/disable_internal', async (req: Request, env: Env, ctx: ExecutionContext) => {
   if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
     const body = await req.json().catch(() => ({}));
@@ -423,7 +423,7 @@ router.post('/bot/disable_internal', async (req: Request, env: Env) => {
     const cfg = await upsertChannelConfig(env, resolved.login, { bot_enabled: 0, twitch_id });
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
-      await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
+      ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
     } catch {}
     return json(200, cfg);
   } catch (e: any) {
@@ -431,7 +431,7 @@ router.post('/bot/disable_internal', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/config_internal', async (req: Request, env: Env) => {
+router.post('/bot/config_internal', async (req: Request, env: Env, ctx: ExecutionContext) => {
   if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
   try {
     const body = await req.json().catch(() => ({}));
@@ -448,7 +448,7 @@ router.post('/bot/config_internal', async (req: Request, env: Env) => {
     const cfg = await upsertChannelConfig(env, resolved.login, patch);
     try {
       const id = env.BOT_MANAGER.idFromName('manager');
-      await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
+      ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
     } catch {}
     return json(200, cfg);
   } catch (e: any) {
@@ -611,18 +611,33 @@ router.post('/eventsub/callback', async (req: Request, env: Env) => {
       } catch {}
       if (!channelConfig || !channelConfig.bot_enabled) return json(200, { ok: true });
 
-      // Check EloWard rank DB
-      let hasRank = false;
+      // Check EloWard rank DB & enforce mode
+      let shouldTimeout = false;
       try {
         const rankReq = new Request(`https://ranks-worker/api/ranks/lol/${encodeURIComponent(chatterLogin)}`);
         const rankRes = await env.RANK_WORKER.fetch(rankReq);
-        if (rankRes.ok) {
-          const rank = await rankRes.json();
-          hasRank = !!rank && !!rank.rank_tier; // your ranks worker contract
+        let rank: any = null;
+        if (rankRes.ok) rank = await rankRes.json();
+
+        const mode = (channelConfig.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
+        if (mode === 'has_rank') {
+          shouldTimeout = !(rank && rank.rank_tier);
+        } else {
+          // min_rank: compare chatter rank vs min threshold
+          const threshold = {
+            tier: String(channelConfig.min_rank_tier || '').toUpperCase(),
+            division: Number(channelConfig.min_rank_division || 0)
+          };
+          if (!threshold.tier) {
+            // fallback to has_rank if misconfigured
+            shouldTimeout = !(rank && rank.rank_tier);
+          } else {
+            shouldTimeout = !meetsMinRank(rank, threshold);
+          }
         }
       } catch {}
 
-      if (!hasRank) {
+      if (shouldTimeout) {
         // Per-user cooldown via Durable Object
         try {
           const shardId = env.IRC_SHARD.idFromName(`cooldown:${broadcasterId}`);
@@ -691,11 +706,14 @@ type ChannelConfig = {
   reason_template: string;
   ignore_roles: string;
   cooldown_seconds: number;
+  enforcement_mode?: 'has_rank' | 'min_rank';
+  min_rank_tier?: string | null;
+  min_rank_division?: number | null;
 };
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
                WHERE bot_enabled = 1`;
     const res = await env.DB.prepare(q).all();
@@ -719,7 +737,7 @@ async function getUserById(env: Env, accessToken: string, id: string) {
 
 async function getChannelConfigByTwitchId(env: Env, twitchId: string) {
   try {
-    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users WHERE twitch_id = ?`;
     const res = await env.DB.prepare(q).bind(twitchId).all();
     const row = res?.results && res.results[0];
@@ -742,6 +760,33 @@ function resolveReasonTemplate(env: Env, channelConfig: any, chatterLogin: strin
     .replace('{seconds}', String(seconds))
     .replace('{site}', site)
     .replace('{user}', chatterLogin);
+}
+
+// Rank comparison helpers
+const RANK_ORDER = [
+  'IRON','BRONZE','SILVER','GOLD','PLATINUM','EMERALD','DIAMOND','MASTER','GRANDMASTER','CHALLENGER'
+] as const;
+function normalizeTier(t: any): string {
+  return String(t || '').toUpperCase();
+}
+function divisionToNumber(div: any): number {
+  const n = Number(div);
+  if (!isFinite(n) || n < 1) return 4; // default worst
+  return Math.max(1, Math.min(4, n));
+}
+function meetsMinRank(userRank: any, threshold: { tier: string; division: number }): boolean {
+  if (!userRank || !userRank.rank_tier) return false;
+  const userTier = normalizeTier(userRank.rank_tier);
+  const userDiv = divisionToNumber(userRank.rank_division);
+  const thrTier = normalizeTier(threshold.tier);
+  const thrDiv = divisionToNumber(threshold.division);
+  const userIdx = RANK_ORDER.indexOf(userTier as any);
+  const thrIdx = RANK_ORDER.indexOf(thrTier as any);
+  if (userIdx < 0 || thrIdx < 0) return false;
+  if (userIdx > thrIdx) return true; // strictly higher tier
+  if (userIdx < thrIdx) return false; // strictly lower tier
+  // same tier: lower division number is higher (I=1 > IV=4)
+  return userDiv <= thrDiv;
 }
 
 async function getBotUserAndToken(env: Env): Promise<{ access: string; refresh?: string; expires_at?: number; user?: { id: string; login: string } } | null> {
