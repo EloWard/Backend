@@ -69,10 +69,6 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleDashboardData(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
-      } else if (url.pathname.includes('/dashboard/data_id')) {
-        response = request.method === 'POST'
-          ? await handleDashboardDataById(request, env, corsHeaders)
-          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/user/register')) {
         if (request.method === 'POST') {
           // Require internal auth for write of Twitch users
@@ -89,10 +85,6 @@ const usersWorker = {
       } else if (url.pathname.includes('/channel/active/update')) {
         response = request.method === 'POST'
           ? await handleChannelActiveUpdate(request, env, corsHeaders)
-          : new Response('Method Not Allowed', { status: 405 });
-      } else if (url.pathname.includes('/channel/active/update_id')) {
-        response = request.method === 'POST'
-          ? await handleChannelActiveUpdateById(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/user/lookup')) {
         response = request.method === 'POST'
@@ -381,33 +373,6 @@ async function handleDashboardData(request, env, corsHeaders) {
   }
 }
 
-async function handleDashboardDataById(request, env, corsHeaders) {
-  try {
-    const body = await parseRequestBody(request);
-    const twitchId = body.twitch_id;
-    if (!twitchId) {
-      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
-    }
-    const q = `SELECT db_reads, successful_lookups, channel_active, email, display_name, channel_name
-               FROM \`users\` WHERE twitch_id = ? LIMIT 1`;
-    const result = await env.DB.prepare(q).bind(String(twitchId)).first();
-    if (!result) return createErrorResponse(404, 'User not found', null, corsHeaders);
-    let badgeDisplayRate = '-';
-    if (result.db_reads > 0) badgeDisplayRate = Math.round((result.successful_lookups / result.db_reads) * 100);
-    return new Response(JSON.stringify({
-      db_reads: result.db_reads,
-      successful_lookups: result.successful_lookups,
-      badge_display_rate: badgeDisplayRate,
-      channel_active: result.channel_active,
-      email: result.email,
-      display_name: result.display_name,
-      channel_name: result.channel_name
-    }), { status: 200, headers: corsHeaders });
-  } catch (e) {
-    return createErrorResponse(500, 'Failed to fetch dashboard data by id', e?.message, corsHeaders);
-  }
-}
-
 /**
  * Handles updating the channel_active status for a channel
  */
@@ -461,31 +426,6 @@ async function handleChannelActiveUpdate(request, env, corsHeaders) {
       error.message === 'Invalid JSON' ? null : error.message,
       corsHeaders
     );
-  }
-}
-
-async function handleChannelActiveUpdateById(request, env, corsHeaders) {
-  try {
-    const body = await parseRequestBody(request);
-    const { twitch_id, channel_active } = body;
-    if (!twitch_id) return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
-    if (typeof channel_active !== 'boolean' && channel_active !== 0 && channel_active !== 1) {
-      return createErrorResponse(400, 'channel_active must be a boolean or 0/1');
-    }
-    const providedInternal = request.headers.get('X-Internal-Auth');
-    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
-    if (!expectedInternal || providedInternal !== expectedInternal) {
-      return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
-    }
-    const activeValue = channel_active === true || channel_active === 1 ? 1 : 0;
-    const q = `UPDATE \`users\` SET channel_active = ?, updated_at = CURRENT_TIMESTAMP WHERE twitch_id = ?`;
-    const res = await env.DB.prepare(q).bind(activeValue, String(twitch_id)).run();
-    if (res.meta?.changes === 0) {
-      return createErrorResponse(404, 'User not found or no changes made', null, corsHeaders);
-    }
-    return new Response(JSON.stringify({ success: true, channel_active: activeValue }), { status: 200, headers: corsHeaders });
-  } catch (e) {
-    return createErrorResponse(500, 'Failed to update channel active', e?.message, corsHeaders);
   }
 }
 

@@ -308,13 +308,18 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
   return await getChannelConfig(env, login);
 }
 
-// Removed login-based config endpoint; use id-based endpoint for stability.
-
-router.get('/bot/config_id/:id', async (req: Request, env: Env) => {
+router.get('/bot/config/:login', async (req: Request, env: Env) => {
   try {
-    const tid = ((req as any).params?.id) || new URL(req.url).pathname.split('/').pop();
-    if (!tid) return json(400, { error: 'missing id' });
-    const cfg = await getChannelConfigByTwitchId(env, String(tid));
+    const login = ((req as any).params?.login) || new URL(req.url).pathname.split('/').pop();
+    let cfg = await getChannelConfig(env, String(login));
+    if (!cfg) {
+      // Fallback: resolve twitch_id by login, then load by id in case channel_name is missing in DB
+      try {
+        const app = await getAppAccessToken(env);
+        const u = await getUserByLogin(env, app, String(login));
+        if (u?.id) cfg = await getChannelConfigByTwitchId(env, String(u.id));
+      } catch {}
+    }
     if (!cfg) return json(404, { error: 'not found' });
     return json(200, cfg);
   } catch (e: any) {

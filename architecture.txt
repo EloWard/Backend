@@ -9,6 +9,17 @@
 - `GET /riot/league/{platform}/{puuid}` - Replaced by server-side calls  
 - `POST /store-rank` - Replaced by `/auth/complete`
 
+Additional Twitch routes safe for removal (kept temporarily for legacy clients):
+- `POST /auth/twitch/init` - Client-side URL building is used
+- `POST /auth/twitch/token` - Superseded by consolidated `/twitch/auth`
+- `POST /auth/twitch/token/refresh` - Superseded by consolidated `/twitch/auth`
+- `POST /auth/twitch/validate` - Superseded by consolidated `/twitch/auth`
+- `POST /auth/twitch/user` - Superseded by consolidated `/twitch/auth`
+- `POST /store-user` - Superseded by consolidated `/twitch/auth`
+
+EloWard Bot (control plane) routes safe for removal:
+- `GET /bot/config/{login}` - Removed; use `GET /bot/config_id/{twitch_id}` instead
+
 **Migration Status:** ✅ Complete - Extension fully migrated to server-side auth flow
 
 **Note:** `GET /auth/redirect` must be kept as it's required for OAuth callbacks from Riot Games.
@@ -133,8 +144,10 @@ D1 Database
   - `POST /metrics/successful_lookup` - Increment successful_lookups counter
   - `POST /user/register` - Register/update user data
   - `POST /user/lookup` - **NEW** Look up channel_name by twitch_id for riot auth
-  - `POST /dashboard/data` - Fetch dashboard data
-  - `POST /channel/active/update` - Update channel active status
+  - `POST /dashboard/data` - Fetch dashboard data (login-based)
+  - `POST /dashboard/data_id` - **NEW** Fetch dashboard data by Twitch ID
+  - `POST /channel/active/update` - Update channel active status (login-based; legacy)
+  - `POST /channel/active/update_id` - **NEW** Update channel active status by Twitch ID (preferred)
 
 #### Utility Workers
 
@@ -151,6 +164,22 @@ D1 Database
   - `POST /api/create-checkout-session` - Create payment session
   - `POST /api/create-portal-session` - Create customer portal session
   - `POST /api/webhook` - Handle Stripe webhooks
+
+#### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
+- URL: https://eloward-bot.unleashai.workers.dev
+- Purpose: Moderation bot control plane: OAuth, EventSub ingestion, Helix timeouts, cooldowns
+- Durable Objects: `BotManager`, `IrcShard` (cooldown shard)
+- KV: `BOT_KV` for EloWardBot tokens
+- Endpoints:
+  - `GET /health` - Health check
+  - `GET /bot/config_id/:id` - **ACTIVE** Fetch config by Twitch ID
+  - `POST /bot/enable_internal` - **ACTIVE** Enable bot for a channel (requires `X-Internal-Auth`)
+  - `POST /bot/disable_internal` - **ACTIVE** Disable bot (requires `X-Internal-Auth`)
+  - `POST /bot/config_internal` - **ACTIVE** Update settings (timeout/cooldown/reason) (requires `X-Internal-Auth`)
+  - `POST /eventsub/subscribe` - **ACTIVE** Create `channel.chat.message` EventSub subscription (app access token)
+  - `POST /eventsub/callback` - **ACTIVE** EventSub webhook receiver (HMAC-verified)
+  - `POST /irc/start` / `POST /irc/reload` - **ACTIVE** Warm cooldown shards via Durable Objects
+  - `GET /bot/config/{login}` - **🗑️ REMOVED** Login-based config endpoint (use `config_id`)
 
 ## Data Flow
 
@@ -190,9 +219,19 @@ D1 Database
 4. riotauth-worker → rank-worker `/api/ranks/lol` (updates rank data)
 5. rank-worker → D1 Database
 
+### EloWard Bot Moderation Flow (EventSub-driven)
+1. Website dashboard → Bot worker OAuth (`/oauth/start?actor=bot`) to connect EloWardBot; tokens stored in KV
+2. Streamer connects (`/oauth/start?actor=broadcaster`) → auto-enable bot + subscribe EventSub
+3. Twitch → Bot worker `/eventsub/callback` with `channel.chat.message` notifications
+4. Bot worker → Load channel config from D1 (`twitch_bot_users`) by `twitch_id`
+5. Bot worker → Check Ranks service `GET /api/ranks/lol/{username}` via service binding
+6. If enforcement requires: consult cooldown DO (`/cooldown/check`) with shard `cooldown:{twitch_id}`
+7. If allowed: call Helix `moderation/bans` with EloWardBot token to timeout user
+8. No IRC connection is used; EventSub is the authoritative ingestion path
+
 ### User Data Flow
-1. Extension → twitchauth-worker (validates Twitch token)
-2. twitchauth-worker → users-worker (stores user data)
+1. Extension → twitchauth-worker (exchanges code server-side, no tokens returned to client)
+2. twitchauth-worker → users-worker (registers/updates user profile via internal auth)
 3. users-worker → D1 Database
 
 ### Security Features
@@ -213,6 +252,8 @@ D1 Database
 ## Deprecations (Kept for Backward Compatibility)
 - Riot Auth Worker: `GET /auth/init`, `POST /auth/token`, `GET /riot/account/{region}`, `GET /riot/league/entries`, `GET /riot/league/{platform}/{puuid}`, `POST /store-rank` — not used by current clients.
 - Twitch Auth Worker: `POST /auth/twitch/init`, `POST /auth/twitch/token`, `POST /auth/twitch/token/refresh`, `POST /auth/twitch/validate`, `POST /auth/twitch/user` — superseded by `POST /twitch/auth`. Keep for older clients; safe to remove when no longer needed.
+- Users Worker: name-based `POST /channel/active/update` remains for legacy; prefer ID-based `POST /channel/active/update_id` and `POST /dashboard/data_id`.
+- Bot Worker: `GET /bot/config/{login}` removed; use `GET /bot/config_id/{twitch_id}`.
 
 ## Database Indexes
 
