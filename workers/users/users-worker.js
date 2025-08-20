@@ -65,6 +65,10 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleIncrementSuccessfulLookups(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
+      } else if (url.pathname.includes('/dashboard/data_id')) {
+        response = request.method === 'POST'
+          ? await handleDashboardDataById(request, env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/dashboard/data')) {
         response = request.method === 'POST'
           ? await handleDashboardData(request, env, corsHeaders)
@@ -82,6 +86,10 @@ const usersWorker = {
         } else {
           response = new Response('Method Not Allowed', { status: 405 });
         }
+      } else if (url.pathname.includes('/channel/active/update_id')) {
+        response = request.method === 'POST'
+          ? await handleChannelActiveUpdateById(request, env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/channel/active/update')) {
         response = request.method === 'POST'
           ? await handleChannelActiveUpdate(request, env, corsHeaders)
@@ -131,7 +139,7 @@ function getCorsHeaders(request) {
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Internal-Auth',
     'Access-Control-Max-Age': '86400',
   };
 }
@@ -153,8 +161,7 @@ async function handleChannelStatusVerify(request, env, corsHeaders) {
     const result = await env.DB.prepare(query).bind(channelName).first();
     
     return new Response(JSON.stringify({ 
-      active: result ? !!result.channel_active : true,
-      channel_name: body.channel_name 
+      active: result ? !!result.channel_active : true
     }), { 
       status: 200,
       headers: corsHeaders
@@ -356,7 +363,6 @@ async function handleDashboardData(request, env, corsHeaders) {
       successful_lookups: result.successful_lookups,
       badge_display_rate: badgeDisplayRate,
       channel_active: result.channel_active,
-      email: result.email,
       display_name: result.display_name
     }), { 
       status: 200,
@@ -364,6 +370,54 @@ async function handleDashboardData(request, env, corsHeaders) {
     });
   } catch (error) {
     console.error('Error fetching dashboard data:', error);
+    return createErrorResponse(
+      error.message === 'Invalid JSON' ? 400 : 500,
+      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to fetch dashboard data',
+      error.message === 'Invalid JSON' ? null : error.message,
+      corsHeaders
+    );
+  }
+}
+
+/**
+ * Handles dashboard data retrieval by twitch_id
+ */
+async function handleDashboardDataById(request, env, corsHeaders) {
+  try {
+    const body = await parseRequestBody(request);
+    const { twitch_id } = body || {};
+    if (!twitch_id) {
+      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+
+    const query = `
+      SELECT db_reads, successful_lookups, channel_active, email, display_name
+      FROM \`users\` WHERE twitch_id = ? LIMIT 1
+    `;
+
+    const result = await env.DB.prepare(query).bind(twitch_id).first();
+
+    if (!result) {
+      return createErrorResponse(404, 'Channel not found or not active', null, corsHeaders);
+    }
+
+    let badgeDisplayRate = '-';
+    if (result.db_reads > 0) {
+      badgeDisplayRate = Math.round((result.successful_lookups / result.db_reads) * 100);
+    }
+
+    return new Response(JSON.stringify({
+      db_reads: result.db_reads,
+      successful_lookups: result.successful_lookups,
+      badge_display_rate: badgeDisplayRate,
+      channel_active: result.channel_active,
+      display_name: result.display_name
+    }), {
+      status: 200,
+      headers: corsHeaders
+    });
+  } catch (error) {
+    console.error('Error fetching dashboard data by id:', error);
     return createErrorResponse(
       error.message === 'Invalid JSON' ? 400 : 500,
       error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to fetch dashboard data',
@@ -430,6 +484,62 @@ async function handleChannelActiveUpdate(request, env, corsHeaders) {
 }
 
 /**
+ * Handles updating the channel_active status for a channel by twitch_id
+ */
+async function handleChannelActiveUpdateById(request, env, corsHeaders) {
+  try {
+    const body = await parseRequestBody(request);
+    const { twitch_id, channel_active } = body;
+
+    if (!twitch_id) {
+      return createErrorResponse(400, 'Missing twitch_id parameter');
+    }
+
+    if (typeof channel_active !== 'boolean' && channel_active !== 0 && channel_active !== 1) {
+      return createErrorResponse(400, 'channel_active must be a boolean or 0/1');
+    }
+
+    // Authorization: internal service-only using secret header
+    const providedInternal = request.headers.get('X-Internal-Auth');
+    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+    if (!expectedInternal || providedInternal !== expectedInternal) {
+      return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
+    }
+
+    const activeValue = channel_active === true || channel_active === 1 ? 1 : 0;
+    const query = `
+      UPDATE \`users\` SET channel_active = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE twitch_id = ?
+    `;
+
+    const result = await env.DB.prepare(query).bind(activeValue, twitch_id).run();
+
+    if (result.meta?.changes === 0) {
+      return createErrorResponse(404, 'Channel not found or no changes made', null, corsHeaders);
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      message: 'Channel active status updated successfully',
+      twitch_id,
+      channel_active: activeValue,
+      changes: result.meta?.changes || 0
+    }), {
+      status: 200,
+      headers: corsHeaders
+    });
+  } catch (error) {
+    console.error('Error updating channel active status by id:', error);
+    return createErrorResponse(
+      error.message === 'Invalid JSON' ? 400 : 500,
+      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to update channel active status',
+      error.message === 'Invalid JSON' ? null : error.message,
+      corsHeaders
+    );
+  }
+}
+
+/**
  * Handles user lookup by twitch_id for riot auth
  */
 async function handleUserLookup(request, env, corsHeaders) {
@@ -439,6 +549,12 @@ async function handleUserLookup(request, env, corsHeaders) {
     
     if (!twitch_id) {
       return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+    // Require internal auth for this lookup to avoid exposing mappings publicly
+    const providedInternal = request.headers.get('X-Internal-Auth');
+    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+    if (!expectedInternal || providedInternal !== expectedInternal) {
+      return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
     }
     
     const query = `

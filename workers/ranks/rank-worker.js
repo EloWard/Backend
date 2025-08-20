@@ -110,7 +110,7 @@ async function storeRank(request, env) {
 async function getRank(username, env) {
   try {
     const result = await env.DB.prepare(
-      "SELECT riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE twitch_username = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE twitch_username = ?"
     ).bind(username).first();
     
     if (!result) {
@@ -156,7 +156,7 @@ async function getRankByPuuid(request, env) {
     }
     
     const result = await env.DB.prepare(
-      "SELECT riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE riot_puuid = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(requestedPuuid).first();
     
     if (!result) {

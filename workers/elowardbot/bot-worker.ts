@@ -308,20 +308,16 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
   return await getChannelConfig(env, login);
 }
 
-router.get('/bot/config/:login', async (req: Request, env: Env) => {
+router.post('/bot/config_id', async (req: Request, env: Env) => {
   try {
-    const login = ((req as any).params?.login) || new URL(req.url).pathname.split('/').pop();
-    let cfg = await getChannelConfig(env, String(login));
-    if (!cfg) {
-      // Fallback: resolve twitch_id by login, then load by id in case channel_name is missing in DB
-      try {
-        const app = await getAppAccessToken(env);
-        const u = await getUserByLogin(env, app, String(login));
-        if (u?.id) cfg = await getChannelConfigByTwitchId(env, String(u.id));
-      } catch {}
-    }
+    const body = await req.json().catch(() => ({} as any));
+    const twitch_id = String(body?.twitch_id || '');
+    if (!twitch_id) return json(400, { error: 'twitch_id required' });
+    const cfg = await getChannelConfigByTwitchId(env, twitch_id);
     if (!cfg) return json(404, { error: 'not found' });
-    return json(200, cfg);
+    // Omit twitch_id from response to avoid exposing it publicly
+    const { twitch_id: _omit, ...safe } = cfg as any;
+    return json(200, safe);
   } catch (e: any) {
     return json(500, { error: e?.message || 'error' });
   }

@@ -33,11 +33,13 @@ See `architecture.txt` for a deeper overview of routes, flows, and database sche
   - Key endpoints:
     - `POST /user/register` – Upsert Twitch profile (internal auth)
     - `POST /user/lookup` – Lookup `channel_name` by `twitch_id`
-    - `POST /dashboard/data` – Dashboard summary for a channel
+    - `POST /dashboard/data_id` – Dashboard summary by Twitch ID (preferred)
+    - `POST /dashboard/data` – Dashboard summary by login (legacy)
     - `POST /metrics/db_read` – Increment read counter
     - `POST /metrics/successful_lookup` – Increment display counter
     - `POST /channelstatus/verify` – Check if a channel is active
-    - `POST /channel/active/update` – Update `channel_active` (internal auth)
+    - `POST /channel/active/update_id` – Update `channel_active` by Twitch ID (preferred; internal auth)
+    - `POST /channel/active/update` – Update `channel_active` by login (legacy; internal auth)
 
 - CDN Worker (`workers/cdn/cdn.js`)
   - Purpose: Serves badge assets from R2 with caching, strict path validation, and CORS.
@@ -55,7 +57,8 @@ See `architecture.txt` for a deeper overview of routes, flows, and database sche
   - Purpose: Moderation bot that interacts with chat based on user ranks: EventSub ingestion.
   - Key endpoints:
     - `GET /health`
-    - `POST /bot/enable_twitch` / `POST /bot/disable_twitch` / `POST /bot/config_twitch`
+    - `POST /bot/config_id` – Fetch config by Twitch ID
+    - `POST /bot/enable_internal` / `POST /bot/disable_internal` / `POST /bot/config_internal`
     - `POST /eventsub/subscribe` – Create chat.message subscription
     - `POST /eventsub/callback` – EventSub webhook receiver
   - Durable Objects: `BotManager`, `IrcShard` for cooldown sharding

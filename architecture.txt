@@ -18,7 +18,7 @@ Additional Twitch routes safe for removal (kept temporarily for legacy clients):
 - `POST /store-user` - Superseded by consolidated `/twitch/auth`
 
 EloWard Bot (control plane) routes safe for removal:
-- `GET /bot/config/{login}` - Removed; use `GET /bot/config_id/{twitch_id}` instead
+- `GET /bot/config/{login}` - Removed; use `POST /bot/config_id` instead
 
 **Migration Status:** ✅ Complete - Extension fully migrated to server-side auth flow
 
@@ -172,7 +172,7 @@ D1 Database
 - KV: `BOT_KV` for EloWardBot tokens
 - Endpoints:
   - `GET /health` - Health check
-  - `GET /bot/config_id/:id` - **ACTIVE** Fetch config by Twitch ID
+  - `POST /bot/config_id` - **ACTIVE** Fetch config by Twitch ID
   - `POST /bot/enable_internal` - **ACTIVE** Enable bot for a channel (requires `X-Internal-Auth`)
   - `POST /bot/disable_internal` - **ACTIVE** Disable bot (requires `X-Internal-Auth`)
   - `POST /bot/config_internal` - **ACTIVE** Update settings (timeout/cooldown/reason) (requires `X-Internal-Auth`)

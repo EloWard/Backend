@@ -23,6 +23,7 @@ interface Env {
   // Secret for internal service-to-service calls to rank-worker (set in wrangler)
   RANK_WRITE_KEY?: string;
   INTERNAL_WRITE_KEY?: string;
+  USERS_WRITE_KEY?: string;
 }
 
 // Define interface for token request
