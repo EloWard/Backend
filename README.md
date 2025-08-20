@@ -54,14 +54,13 @@ See `architecture.txt` for a deeper overview of routes, flows, and database sche
     - `POST /api/webhook` – Raw body verified via Stripe library
 
 - EloWard Bot Worker (`workers/elowardbot/bot-worker.ts`)
-  - Purpose: Moderation bot that interacts with chat based on user ranks: EventSub ingestion.
+  - Purpose: Moderation bot that interacts with chat based on user ranks via IRC-only ingestion.
   - Key endpoints:
     - `GET /health`
     - `POST /bot/config_id` – Fetch config by Twitch ID
     - `POST /bot/enable_internal` / `POST /bot/disable_internal` / `POST /bot/config_internal`
-    - `POST /eventsub/subscribe` – Create chat.message subscription
-    - `POST /eventsub/callback` – EventSub webhook receiver
-  - Durable Objects: `BotManager`, `IrcShard` for cooldown sharding
+    - `POST /irc/start` / `POST /irc/reload` – Bootstrap and reload IRC shards
+  - Durable Objects: `BotManager` (orchestration), `IrcShard` (cooldowns), `IrcClientShard` (IRC WebSocket client)
 
 ## Local Development
 

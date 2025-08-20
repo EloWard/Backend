@@ -1,8 +1,8 @@
 /**
  * EloWard Bot Worker
  * - Handles OAuth for the EloWardBot account (moderation + chat scopes)
- * - Handles broadcaster grant of channel:bot to this app (for EventSub joins)
- * - Subscribes to channel.chat.message via EventSub (webhook transport)
+ * - Handles broadcaster grant of channel:bot to this app
+ * - IRC-only ingestion: Connects to Twitch IRC and enforces via /timeout in chat
  * - Processes chat messages, checks EloWard rank DB, and timeouts if missing
  */
 
@@ -26,7 +26,7 @@ interface Env {
   TWITCH_CLIENT_SECRET: string;
   // Public base URL of this Worker (no trailing slash), e.g. https://eloward-bot.your-account.workers.dev
   WORKER_PUBLIC_URL: string;
-  // HMAC secret for EventSub webhook verification
+  // (Optional) Legacy EventSub secret — no longer used in IRC-only mode
   EVENTSUB_SECRET: string;
   // Optional: KV for tokens and config
   BOT_KV: KVNamespace;
@@ -35,6 +35,8 @@ interface Env {
   // Durable Objects
   BOT_MANAGER: DurableObjectNamespace;
   IRC_SHARD: DurableObjectNamespace;
+  // IRC client shards (Durable Object namespace for IRC connections)
+  IRC_CLIENT?: DurableObjectNamespace;
   // D1 database
   DB: D1Database;
   // Optional site base url for reasons
@@ -46,11 +48,10 @@ interface Env {
 
 const router = Router();
 
-// Scopes
+// Scopes for IRC: chat read/write only
 const BOT_SCOPES = [
-  'user:write:chat',
-  'moderator:manage:banned_users',
-  'moderator:manage:chat_messages',
+  'chat:read',
+  'chat:edit',
 ];
 const BROADCASTER_SCOPES = ['channel:bot'];
 
@@ -58,10 +59,8 @@ const BROADCASTER_SCOPES = ['channel:bot'];
 const AUTH_URL = 'https://id.twitch.tv/oauth2/authorize';
 const TOKEN_URL = 'https://id.twitch.tv/oauth2/token';
 
-// Helix endpoints
+// Helix endpoints (users only; moderation/EventSub removed in IRC-only mode)
 const HELIX_USERS = 'https://api.twitch.tv/helix/users';
-const HELIX_BANS = 'https://api.twitch.tv/helix/moderation/bans';
-const HELIX_EVENTSUB = 'https://api.twitch.tv/helix/eventsub/subscriptions';
 
 // Helpers
 function json(status: number, data: unknown): Response {
@@ -160,46 +159,7 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
 
 // Validates any Twitch user token without requiring matching Client-Id.
 // Returns minimal identity: user_id and login.
-async function getUserFromAnyUserToken(_env: Env, userAccessToken: string) {
-  const res = await fetch('https://id.twitch.tv/oauth2/validate', {
-    headers: { Authorization: `OAuth ${userAccessToken}` },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data?.user_id || !data?.login) {
-    throw new Error('token validate failed');
-  }
-  return { id: String(data.user_id), login: String(data.login), display_name: String(data.login) } as { id: string; login: string; display_name: string };
-}
-
-async function sendTimeout(env: Env, botToken: string, broadcasterId: string, botUserId: string, targetUserId: string, seconds: number, reason: string) {
-  const url = `${HELIX_BANS}?${toQuery({ broadcaster_id: broadcasterId, moderator_id: botUserId })}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${botToken}`,
-      'Client-Id': env.TWITCH_CLIENT_ID,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ data: { user_id: targetUserId, duration: seconds, reason } }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`timeout failed ${res.status}: ${t}`);
-  }
-}
-
-async function verifyEventSubSignature(env: Env, req: Request, bodyText: string) {
-  const id = req.headers.get('Twitch-Eventsub-Message-Id') || '';
-  const ts = req.headers.get('Twitch-Eventsub-Message-Timestamp') || '';
-  const sig = req.headers.get('Twitch-Eventsub-Message-Signature') || '';
-  const msg = id + ts + bodyText;
-  const keyData = new TextEncoder().encode(env.EVENTSUB_SECRET);
-  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sigBuf = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(msg));
-  const hex = [...new Uint8Array(sigBuf)].map(b => b.toString(16).padStart(2, '0')).join('');
-  const expectedSig = `sha256=${hex}`;
-  return expectedSig === sig;
-}
+// EventSub signature verification removed (IRC-only mode)
 
 // CORS preflight
 router.options('*', () => json(200, {}));
@@ -454,25 +414,9 @@ router.get('/oauth/callback', async (req: Request, env: Env) => {
       // Optional: redirect to your dashboard success page
       return new Response(null, { status: 302, headers: { Location: `${env.WORKER_PUBLIC_URL}/oauth/done?actor=bot&login=${user.login}` } });
     } else {
-      // Broadcaster OAuth: auto-enable bot, subscribe EventSub, and warm cooldown shard
+      // Broadcaster OAuth: auto-enable bot and warm shards (IRC-only)
       try {
         await upsertChannelConfig(env, String(user.login).toLowerCase(), { bot_enabled: 1, twitch_id: user.id });
-      } catch {}
-      try {
-        // Subscribe EventSub for this broadcaster
-        const appToken = await getAppAccessToken(env);
-        const callback = `${env.WORKER_PUBLIC_URL}/eventsub/callback`;
-        const payload = {
-          type: 'channel.chat.message',
-          version: '1',
-          condition: { broadcaster_user_id: user.id },
-          transport: { method: 'webhook', callback, secret: env.EVENTSUB_SECRET },
-        };
-        await fetch(HELIX_EVENTSUB, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${appToken}`, 'Client-Id': env.TWITCH_CLIENT_ID, 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
       } catch {}
       try {
         const id = env.BOT_MANAGER.idFromName('manager');
@@ -497,139 +441,7 @@ router.get('/oauth/done', (req: Request) => {
   return new Response(body, { headers: { 'Content-Type': 'text/html' } });
 });
 
-// Create EventSub subscription for a channel (requires channel:bot grant or will count toward join limits)
-router.post('/eventsub/subscribe', async (req: Request, env: Env) => {
-  const body = await req.json().catch(() => ({} as any));
-  const broadcaster_login = body.broadcaster_login as string;
-  if (!broadcaster_login) return json(400, { error: 'broadcaster_login required' });
-  try {
-    const appToken = await getAppAccessToken(env);
-    const user = await getUserByLogin(env, appToken, broadcaster_login);
-    const callback = `${env.WORKER_PUBLIC_URL}/eventsub/callback`;
-    const payload = {
-      type: 'channel.chat.message',
-      version: '1',
-      // Subscribe to all chat messages for the broadcaster. Do not include user_id or you'll filter to a single chatter.
-      condition: { broadcaster_user_id: user.id },
-      transport: {
-        method: 'webhook',
-        callback,
-        secret: env.EVENTSUB_SECRET,
-      },
-    };
-    const res = await fetch(HELIX_EVENTSUB, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${appToken}`, 'Client-Id': env.TWITCH_CLIENT_ID, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) return json(res.status, { error: 'subscribe failed', details: data });
-    return json(200, { success: true, subscription: data });
-  } catch (e: any) {
-    return json(500, { error: e?.message || 'subscribe error' });
-  }
-});
-
-// EventSub webhook receiver
-router.post('/eventsub/callback', async (req: Request, env: Env) => {
-  const bodyText = await req.text();
-  const msgType = req.headers.get('Twitch-Eventsub-Message-Type');
-
-  // Verify signature
-  try {
-    const ok = await verifyEventSubSignature(env, req, bodyText);
-    if (!ok) return new Response('signature mismatch', { status: 403 });
-  } catch {
-    // In dev, allow
-  }
-
-  const payload = JSON.parse(bodyText);
-  if (msgType === 'webhook_callback_verification') {
-    return new Response(payload.challenge, { status: 200 });
-  }
-
-  if (msgType === 'notification') {
-    const evt = payload.event;
-    if (payload.subscription?.type === 'channel.chat.message') {
-      // Extract details
-      const broadcasterId = evt.broadcaster_user_id as string;
-      const chatterId = evt.chatter_user_id as string;
-      const chatterLogin = (evt.chatter_user_login as string || '').toLowerCase();
-
-      // Skip broadcaster/mods/VIPs if tags are present
-      const badges: Array<{ set_id: string; id: string }>|undefined = evt.badges;
-      const isPrivileged = badges?.some(b => ['moderator','broadcaster','vip'].includes(b.set_id)) || false;
-      if (isPrivileged) return json(200, { ok: true });
-
-      // Load channel config
-      let channelConfig: any = null;
-      try {
-        channelConfig = await getChannelConfigByTwitchId(env, broadcasterId);
-      } catch {}
-      if (!channelConfig || !channelConfig.bot_enabled) return json(200, { ok: true });
-
-      // Check EloWard rank DB & enforce mode
-      let shouldTimeout = false;
-      try {
-        const rankReq = new Request(`https://ranks-worker/api/ranks/lol/${encodeURIComponent(chatterLogin)}`);
-        const rankRes = await env.RANK_WORKER.fetch(rankReq);
-        let rank: any = null;
-        if (rankRes.ok) rank = await rankRes.json();
-
-        const mode = (channelConfig.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
-        if (mode === 'has_rank') {
-          shouldTimeout = !(rank && rank.rank_tier);
-        } else {
-          // min_rank: compare chatter rank vs min threshold
-          const threshold = {
-            tier: String(channelConfig.min_rank_tier || '').toUpperCase(),
-            division: Number(channelConfig.min_rank_division || 0)
-          };
-          if (!threshold.tier) {
-            // fallback to has_rank if misconfigured
-            shouldTimeout = !(rank && rank.rank_tier);
-          } else {
-            shouldTimeout = !meetsMinRank(rank, threshold);
-          }
-        }
-      } catch {}
-
-      if (shouldTimeout) {
-        // Per-user cooldown via Durable Object
-        try {
-          const shardId = env.IRC_SHARD.idFromName(`cooldown:${broadcasterId}`);
-          const res = await env.IRC_SHARD.get(shardId).fetch('https://do/cooldown/check', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              // Use a consistent key name expected by the DO for namespacing cooldowns
-              channel_login: broadcasterId,
-              user_login: chatterLogin,
-              cooldown_seconds: channelConfig.cooldown_seconds || 60
-            })
-          });
-          const cd = await res.json();
-          if (cd && cd.allowed === false) {
-            return json(200, { ok: true });
-          }
-        } catch {}
-        // Timeout user via Helix
-        try {
-          const bot = await getBotUserAndToken(env);
-          if (!bot?.access || !bot?.user?.id) throw new Error('bot not connected');
-          const reason = resolveReasonTemplate(env, channelConfig, chatterLogin);
-          const duration = channelConfig.timeout_seconds || 30;
-          await sendTimeout(env, bot.access, broadcasterId, bot.user.id, chatterId, duration, reason);
-        } catch (e) {
-          // swallow errors to avoid retries causing spam
-        }
-      }
-    }
-    return json(200, { ok: true });
-  }
-
-  return json(200, { ok: true });
-});
+// EventSub endpoints removed (IRC-only mode)
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -768,7 +580,7 @@ async function getBotUserAndToken(env: Env): Promise<{ access: string; refresh?:
   }
 }
 
-// (IRC helpers were removed; EventSub is the authoritative ingestion path.)
+// IRC client is implemented via Durable Object IrcClientShard; no EventSub ingestion.
 
 class BotManager {
   state: DurableObjectState;
@@ -784,12 +596,38 @@ class BotManager {
       const channels = await listEnabledChannels(this.env);
       // Warm cooldown shards for current channels
       for (const ch of channels) {
-        // Warm the same shard naming used during EventSub processing. Prefer twitch_id when available.
         const shardKey = String((ch as any).twitch_id || ch.channel_login);
         const id = this.env.IRC_SHARD.idFromName(`cooldown:${shardKey}`);
         await this.env.IRC_SHARD.get(id).fetch('https://do/warm', { method: 'POST' });
       }
-      return json(200, { ok: true, channels: channels.length });
+
+      // Start IRC client shards (IRC-only mode)
+      if (!this.env.IRC_CLIENT) {
+        return json(200, { ok: true, channels: channels.length, note: 'IRC_CLIENT binding not configured; only cooldown DO warmed.' });
+      }
+
+      const shardSize = 50; // target channels per shard
+      const total = channels.length;
+      const shardCount = Math.max(1, Math.min(10, Math.ceil(total / shardSize)));
+
+      // Build assignments
+      const assignments: Array<{ shard: number; channels: any[] }> = Array.from({ length: shardCount }, (_, i) => ({ shard: i, channels: [] }));
+      channels.forEach((ch, idx) => {
+        const shard = idx % shardCount;
+        assignments[shard].channels.push(ch);
+      });
+
+      // Dispatch assignments to shards
+      await Promise.all(assignments.map(async (a) => {
+        const id = this.env.IRC_CLIENT!.idFromName(`irc:${a.shard}`);
+        await this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channels: a.channels }),
+        });
+      }));
+
+      return json(200, { ok: true, channels: channels.length, shards: shardCount });
     }
     return json(404, { error: 'not found' });
   }
@@ -826,5 +664,228 @@ class IrcShard {
 }
 
 export { BotManager, IrcShard };
+
+// IRC Client Durable Object: maintains WebSocket to Twitch IRC and enforces via /timeout
+class IrcClientShard {
+  state: DurableObjectState;
+  env: Env;
+  ws: any | null = null;
+  connecting = false;
+  assignedChannels: Array<{ channel_login: string; twitch_id?: string | null }> = [];
+  channelSet: Set<string> = new Set();
+  channelIdByLogin: Map<string, string> = new Map();
+  lastJoinAt = 0;
+  joinIntervalMs = 1000; // conservative join pacing
+  rateLimitSleepMs = 700; // basic pacing for commands
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    if (req.method === 'POST' && url.pathname === '/assign') {
+      const body = await req.json().catch(() => ({}));
+      const list = Array.isArray(body.channels) ? body.channels : [];
+      this.assignedChannels = list.map((c: any) => ({ channel_login: String(c.channel_login).toLowerCase(), twitch_id: (c as any).twitch_id || null }));
+      this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+      this.channelIdByLogin.clear();
+      for (const c of this.assignedChannels) if (c.twitch_id) this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
+      await this.state.storage.put('assigned', this.assignedChannels);
+      // Connect or refresh joins
+      await this.ensureConnectedAndJoined();
+      return json(200, { ok: true, assigned: this.assignedChannels.length });
+    }
+    if (req.method === 'POST' && url.pathname === '/reload') {
+      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
+      if (stored) {
+        this.assignedChannels = stored as any[];
+        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+        this.channelIdByLogin.clear();
+        for (const c of this.assignedChannels) if ((c as any).twitch_id) this.channelIdByLogin.set((c as any).channel_login, String((c as any).twitch_id));
+      }
+      await this.ensureConnectedAndJoined();
+      return json(200, { ok: true, assigned: this.assignedChannels.length });
+    }
+    return json(404, { error: 'not found' });
+  }
+
+  async ensureConnectedAndJoined() {
+    if (!this.ws || this.ws.readyState !== 1) {
+      await this.connectIrc();
+    }
+    await this.joinAssigned();
+  }
+
+  async connectIrc() {
+    if (this.connecting) return;
+    this.connecting = true;
+    try {
+      const bot = await getBotUserAndToken(this.env);
+      if (!bot?.access || !bot?.user?.login) {
+        this.connecting = false;
+        return;
+      }
+      const login = String(bot.user.login).toLowerCase();
+      const token = bot.access;
+      // @ts-ignore - WebSocket is available in Workers runtime
+      const socket: any = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      this.ws = socket;
+      socket.onopen = () => {
+        this.sendRaw(`PASS oauth:${token}`);
+        this.sendRaw(`NICK ${login}`);
+        this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands');
+      };
+      socket.onmessage = (evt: any) => this.handleIrcMessage(String(evt.data || ''));
+      socket.onclose = () => this.scheduleReconnect();
+      socket.onerror = () => this.scheduleReconnect();
+    } catch {
+      this.scheduleReconnect();
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  scheduleReconnect() {
+    this.ws = null;
+    setTimeout(() => this.connectIrc(), 3_000 + Math.floor(Math.random() * 4_000));
+  }
+
+  sendRaw(line: string) {
+    try { if (this.ws && this.ws.readyState === 1) this.ws.send(line); } catch {}
+  }
+
+  async joinAssigned() {
+    for (const chan of Array.from(this.channelSet)) {
+      const now = Date.now();
+      if (now - this.lastJoinAt < this.joinIntervalMs) await this.sleep(this.joinIntervalMs - (now - this.lastJoinAt));
+      this.sendRaw(`JOIN ${chan}`);
+      this.lastJoinAt = Date.now();
+    }
+  }
+
+  async handleIrcMessage(raw: string) {
+    const lines = raw.split('\r\n');
+    for (const line of lines) {
+      if (!line) continue;
+      if (line.startsWith('PING ')) {
+        this.sendRaw(line.replace('PING', 'PONG'));
+        continue;
+      }
+      const msg = this.parseIrc(line);
+      if (!msg) continue;
+      if (msg.command === 'PRIVMSG') {
+        const channel = msg.params?.[0] || '';
+        const text = msg.params?.[1] || '';
+        const login = (msg.prefix?.split('!')[0] || '').toLowerCase();
+        const chanLogin = channel.startsWith('#') ? channel.slice(1).toLowerCase() : channel.toLowerCase();
+        if (!this.channelSet.has(`#${chanLogin}`)) continue;
+
+        // Skip privileged roles using tags
+        const badges = this.getBadgeSet(msg.tags?.badges || '');
+        if (badges.has('broadcaster') || badges.has('moderator') || badges.has('vip')) continue;
+
+        // Enforce rules
+        try {
+          const cfg = await getChannelConfig(this.env, chanLogin);
+          if (!cfg || !cfg.bot_enabled) continue;
+
+          let shouldTimeout = false;
+          try {
+            const rankReq = new Request(`https://ranks-worker/api/ranks/lol/${encodeURIComponent(login)}`);
+            const rankRes = await this.env.RANK_WORKER.fetch(rankReq);
+            let rank: any = null;
+            if (rankRes.ok) rank = await rankRes.json();
+            const mode = (cfg.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
+            if (mode === 'has_rank') {
+              shouldTimeout = !(rank && rank.rank_tier);
+            } else {
+              const threshold = {
+                tier: String(cfg.min_rank_tier || '').toUpperCase(),
+                division: Number(cfg.min_rank_division || 0),
+              };
+              shouldTimeout = threshold.tier ? !meetsMinRank(rank, threshold) : !(rank && rank.rank_tier);
+            }
+          } catch {}
+
+          if (!shouldTimeout) continue;
+
+          // Check cooldown
+          try {
+            const channelId = this.channelIdByLogin.get(chanLogin) || chanLogin;
+            const shardId = this.env.IRC_SHARD.idFromName(`cooldown:${channelId}`);
+            const res = await this.env.IRC_SHARD.get(shardId).fetch('https://do/cooldown/check', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ channel_login: channelId, user_login: login, cooldown_seconds: cfg.cooldown_seconds || 60 }),
+            });
+            const cd = await res.json();
+            if (cd && cd.allowed === false) continue;
+          } catch {}
+
+          // Send timeout via IRC command
+          const duration = cfg.timeout_seconds || 30;
+          const reason = resolveReasonTemplate(this.env, cfg, login);
+          await this.sleep(this.rateLimitSleepMs);
+          this.sendRaw(`PRIVMSG #${chanLogin} :/timeout ${login} ${duration} ${reason}`);
+        } catch {
+          // swallow
+        }
+      }
+    }
+  }
+
+  parseIrc(line: string): { tags?: Record<string, string>; prefix?: string; command: string; params: string[] } | null {
+    let rest = line;
+    const msg: any = { params: [] };
+    if (rest.startsWith('@')) {
+      const sp = rest.indexOf(' ');
+      const rawTags = rest.slice(1, sp);
+      rest = rest.slice(sp + 1);
+      msg.tags = {};
+      for (const part of rawTags.split(';')) {
+        const [k, v] = part.split('=');
+        msg.tags[k] = v || '';
+      }
+    }
+    if (rest.startsWith(':')) {
+      const sp = rest.indexOf(' ');
+      msg.prefix = rest.slice(1, sp);
+      rest = rest.slice(sp + 1);
+    }
+    const sp = rest.indexOf(' ');
+    if (sp === -1) return null;
+    msg.command = rest.slice(0, sp);
+    rest = rest.slice(sp + 1);
+    if (rest.startsWith(':')) {
+      msg.params = [rest.slice(1)];
+    } else {
+      const parts: string[] = [];
+      while (rest) {
+        if (rest.startsWith(':')) { parts.push(rest.slice(1)); break; }
+        const idx = rest.indexOf(' ');
+        if (idx === -1) { parts.push(rest); break; }
+        parts.push(rest.slice(0, idx));
+        rest = rest.slice(idx + 1);
+      }
+      msg.params = parts;
+    }
+    return msg;
+  }
+
+  getBadgeSet(badgesStr: string): Set<string> {
+    const s = new Set<string>();
+    String(badgesStr || '').split(',').forEach((b) => {
+      const name = b.split('/')[0];
+      if (name) s.add(name);
+    });
+    return s;
+  }
+
+  sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
+}
+
+export { IrcClientShard };
 
 

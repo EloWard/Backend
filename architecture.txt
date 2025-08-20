@@ -167,8 +167,8 @@ D1 Database
 
 #### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
 - URL: https://eloward-bot.unleashai.workers.dev
-- Purpose: Moderation bot control plane: OAuth, EventSub ingestion, Helix timeouts, cooldowns
-- Durable Objects: `BotManager`, `IrcShard` (cooldown shard)
+- Purpose: Moderation bot control plane: OAuth, IRC ingestion, cooldowns (no EventSub/Helix in default mode)
+- Durable Objects: `BotManager` (orchestrates), `IrcShard` (cooldown), `IrcClientShard` (IRC WebSocket)
 - KV: `BOT_KV` for EloWardBot tokens
 - Endpoints:
   - `GET /health` — Status: Active.
@@ -176,9 +176,7 @@ D1 Database
   - `POST /bot/enable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
   - `POST /bot/disable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
   - `POST /bot/config_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /eventsub/subscribe` — Status: Active (public write). Creates EventSub subscription using app token.
-  - `POST /eventsub/callback` — Status: Active (webhook). HMAC-verified.
-  - `POST /irc/start` / `POST /irc/reload` — Status: Active (internal). Warms DO shards.
+  - `POST /irc/start` / `POST /irc/reload` — Status: Active (internal). Starts/refreshes IRC client shards.
   - `GET /bot/config/{login}` — Status: Deprecated (removed). Use `/bot/config_id`.
 
 ## Data Flow
@@ -219,15 +217,13 @@ D1 Database
 4. riotauth-worker → rank-worker `/api/ranks/lol` (updates rank data)
 5. rank-worker → D1 Database
 
-### EloWard Bot Moderation Flow (EventSub-driven)
+### EloWard Bot Moderation Flow (IRC-only)
 1. Website dashboard → Bot worker OAuth (`/oauth/start?actor=bot`) to connect EloWardBot; tokens stored in KV
-2. Streamer connects (`/oauth/start?actor=broadcaster`) → auto-enable bot + subscribe EventSub
-3. Twitch → Bot worker `/eventsub/callback` with `channel.chat.message` notifications
-4. Bot worker → Load channel config from D1 (`twitch_bot_users`) by `twitch_id`
-5. Bot worker → Check Ranks service `GET /api/ranks/lol/{username}` via service binding
-6. If enforcement requires: consult cooldown DO (`/cooldown/check`) with shard `cooldown:{twitch_id}`
-7. If allowed: call Helix `moderation/bans` with EloWardBot token to timeout user
-8. No IRC connection is used; EventSub is the authoritative ingestion path
+2. Streamer connects (`/oauth/start?actor=broadcaster`) → auto-enable bot
+3. Dashboard internal toggle → `/irc/start` warms cooldowns and assigns channels to IRC client shards
+4. IrcClientShard connects to `wss://irc-ws.chat.twitch.tv` with PASS/NICK, CAP REQ tags/commands
+5. On PRIVMSG: load channel config, check rank via Ranks worker, consult cooldown DO
+6. If required: send `/timeout {user} {seconds} {reason}` as IRC PRIVMSG in-channel
 
 ### User Data Flow
 1. Extension → twitchauth-worker (exchanges code server-side, no tokens returned to client)
