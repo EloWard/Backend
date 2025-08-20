@@ -92,36 +92,36 @@ D1 Database
 
 ### Workers and Endpoints
 
-#### Authentication Workers (Handle token validation and external API calls)
+#### Authentication Workers (token validation and external API calls)
 
 **Riot Auth Worker** (`riotauth-worker.ts`)
 - URL: https://eloward-riotauth.unleashai.workers.dev
 - Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`
 - Endpoints:
-  - `POST /auth/complete` - **ACTIVE** Single-call optimized auth (code + twitch_id + region → complete user data)
-  - `POST /riot/refreshrank` - **ACTIVE** Simplified PUUID-only rank refresh
-  - `DELETE /disconnect` - **ACTIVE** Disconnect and clear rank data using PUUID only
-  - `GET /auth/redirect` - **ACTIVE** Handle OAuth redirect (required for OAuth flow)
-  - `GET /auth/init` - **🗑️ CAN REMOVE** No longer used by extension (migrated to client-side URL building)
-  - `POST /auth/token` - **🗑️ CAN REMOVE** No longer used by extension (replaced by /auth/complete)
-  - `GET /riot/account/{region}` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls in /auth/complete)
-  - `GET /riot/league/entries` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls)
-  - `GET /riot/league/{platform}/{puuid}` - **🗑️ CAN REMOVE** No longer used by extension (replaced by server-side calls)
-  - `POST /store-rank` - **🗑️ CAN REMOVE** No longer used by extension (replaced by /auth/complete)
+  - `POST /auth/complete` — Status: Active. Completes OAuth and stores rank (server-side only).
+  - `POST /riot/refreshrank` — Status: Active. Refreshes rank by PUUID (server-side only; no PUUID returned).
+  - `DELETE /disconnect` — Status: Active. Deletes rank by PUUID (server-side only).
+  - `GET /auth/redirect` — Status: Active. OAuth redirect handler.
+  - `GET /auth/init` — Status: Legacy (safe to remove). Replaced by client-side URL building.
+  - `POST /auth/token` — Status: Legacy (safe to remove). Superseded by `/auth/complete`.
+  - `GET /riot/account/{region}` — Status: Legacy (safe to remove). Superseded by server-side logic.
+  - `GET /riot/league/entries` — Status: Legacy (safe to remove). Superseded by server-side logic.
+  - `GET /riot/league/{platform}/{puuid}` — Status: Legacy (safe to remove). Superseded by server-side logic.
+  - `POST /store-rank` — Status: Legacy (safe to remove). Superseded by `/auth/complete`.
 
 **Twitch Auth Worker** (`twitchauth-worker.ts`)
 - URL: https://eloward-twitchauth.unleashai.workers.dev
 - Service Bindings: `USERS_WORKER`
 - Endpoints:
-  - `GET /health` - Health check
-  - `POST /twitch/auth` - **ACTIVE** Consolidated tokenless completion (code → user → register)
-  - `GET /auth/twitch/redirect` - **ACTIVE** Handle OAuth redirect (forward code/state to website)
-  - `POST /auth/twitch/init` - **🗑️ CAN REMOVE** No longer used by extension (client-side URL building)
-  - `POST /auth/twitch/token` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
-  - `POST /auth/twitch/token/refresh` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
-  - `POST /auth/twitch/validate` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
-  - `POST /auth/twitch/user` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
-  - `POST /store-user` - **🗑️ CAN REMOVE** Replaced by `/twitch/auth`
+  - `GET /health` — Status: Active.
+  - `POST /twitch/auth` — Status: Active. Consolidated (code → user → register). No tokens returned to clients.
+  - `GET /auth/twitch/redirect` — Status: Active. OAuth redirect handler.
+  - `POST /auth/twitch/init` — Status: Legacy (keep for compatibility).
+  - `POST /auth/twitch/token` — Status: Legacy (keep for compatibility).
+  - `POST /auth/twitch/token/refresh` — Status: Legacy (keep for compatibility).
+  - `POST /auth/twitch/validate` — Status: Legacy (keep for compatibility).
+  - `POST /auth/twitch/user` — Status: Legacy (keep for compatibility).
+  - `POST /store-user` — Status: Legacy (safe to remove).
 
 #### Database Workers (Handle database operations only)
 
@@ -129,25 +129,25 @@ D1 Database
 - URL: https://eloward-ranks.unleashai.workers.dev
 - Database Access: Direct D1 binding
 - Endpoints:
-  - `GET /api/ranks/lol/{username}` - Get rank for specific user
-  - `POST /api/ranks/lol` - Store/update rank data (via service binding from riotauth-worker)
-  - `POST /api/ranks/lol/by-puuid` - **NEW** Get rank data by PUUID (for simplified refresh)
-  - `DELETE /api/ranks/lol` - Delete rank data by PUUID
+  - `GET /api/ranks/lol/{username}` — Status: Active (public read). Returns sanitized fields; no PUUID.
+  - `POST /api/ranks/lol` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `POST /api/ranks/lol/by-puuid` — Status: Active (read). Returns sanitized fields; no PUUID. Consider restricting to internal use.
+  - `DELETE /api/ranks/lol` — Status: Active (internal delete). Requires `X-Internal-Auth`.
 
 **Users Worker** (`users-worker.js`)
 - URL: https://eloward-users.unleashai.workers.dev
 - Database Access: Direct D1 binding
 - Endpoints:
-  - `GET /health` - Health check
-  - `POST /channelstatus/verify` - Verify if channel has active subscription
-  - `POST /metrics/db_read` - Increment db_reads counter
-  - `POST /metrics/successful_lookup` - Increment successful_lookups counter
-  - `POST /user/register` - Register/update user data
-  - `POST /user/lookup` - **NEW** Look up channel_name by twitch_id for riot auth
-  - `POST /dashboard/data` - Fetch dashboard data (login-based)
-  - `POST /dashboard/data_id` - **NEW** Fetch dashboard data by Twitch ID
-  - `POST /channel/active/update` - Update channel active status (login-based; legacy)
-  - `POST /channel/active/update_id` - **NEW** Update channel active status by Twitch ID (preferred)
+  - `GET /health` — Status: Active.
+  - `POST /channelstatus/verify` — Status: Active (public read). Returns `{ active }` only.
+  - `POST /metrics/db_read` — Status: Active (public write).
+  - `POST /metrics/successful_lookup` — Status: Active (public write).
+  - `POST /user/register` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `POST /user/lookup` — Status: Active (internal read). Requires `X-Internal-Auth`.
+  - `POST /dashboard/data` — Status: Legacy (public read). Login-based; sanitized fields only.
+  - `POST /dashboard/data_id` — Status: Active (public read). ID-based; sanitized fields only.
+  - `POST /channel/active/update` — Status: Legacy (internal write). Login-based; requires `X-Internal-Auth`.
+  - `POST /channel/active/update_id` — Status: Active (internal write). ID-based; requires `X-Internal-Auth`.
 
 #### Utility Workers
 
@@ -155,15 +155,15 @@ D1 Database
 - URL: https://eloward-cdn.unleashai.workers.dev
 - Purpose: Serves rank badge images from R2 storage
 - Endpoints:
-  - `GET /{game}/{filename}` - Serve badge images with caching
+  - `GET /{game}/{filename}` — Status: Active (public read). Static assets with long-lived caching.
 
 **Stripe Worker** (`stripe-worker.js`)
 - URL: https://eloward-stripe.unleashai.workers.dev
 - Purpose: Handles Stripe payments and webhooks
 - Endpoints:
-  - `POST /api/create-checkout-session` - Create payment session
-  - `POST /api/create-portal-session` - Create customer portal session
-  - `POST /api/webhook` - Handle Stripe webhooks
+  - `POST /api/create-checkout-session` — Status: Active (public write).
+  - `POST /api/create-portal-session` — Status: Active (public write).
+  - `POST /api/webhook` — Status: Active (webhook; raw body verification).
 
 #### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
 - URL: https://eloward-bot.unleashai.workers.dev
@@ -171,15 +171,15 @@ D1 Database
 - Durable Objects: `BotManager`, `IrcShard` (cooldown shard)
 - KV: `BOT_KV` for EloWardBot tokens
 - Endpoints:
-  - `GET /health` - Health check
-  - `POST /bot/config_id` - **ACTIVE** Fetch config by Twitch ID
-  - `POST /bot/enable_internal` - **ACTIVE** Enable bot for a channel (requires `X-Internal-Auth`)
-  - `POST /bot/disable_internal` - **ACTIVE** Disable bot (requires `X-Internal-Auth`)
-  - `POST /bot/config_internal` - **ACTIVE** Update settings (timeout/cooldown/reason) (requires `X-Internal-Auth`)
-  - `POST /eventsub/subscribe` - **ACTIVE** Create `channel.chat.message` EventSub subscription (app access token)
-  - `POST /eventsub/callback` - **ACTIVE** EventSub webhook receiver (HMAC-verified)
-  - `POST /irc/start` / `POST /irc/reload` - **ACTIVE** Warm cooldown shards via Durable Objects
-  - `GET /bot/config/{login}` - **🗑️ REMOVED** Login-based config endpoint (use `config_id`)
+  - `GET /health` — Status: Active.
+  - `POST /bot/config_id` — Status: Active (public read). Returns sanitized config; omits `twitch_id`.
+  - `POST /bot/enable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `POST /bot/disable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `POST /bot/config_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `POST /eventsub/subscribe` — Status: Active (public write). Creates EventSub subscription using app token.
+  - `POST /eventsub/callback` — Status: Active (webhook). HMAC-verified.
+  - `POST /irc/start` / `POST /irc/reload` — Status: Active (internal). Warms DO shards.
+  - `GET /bot/config/{login}` — Status: Deprecated (removed). Use `/bot/config_id`.
 
 ## Data Flow
 
