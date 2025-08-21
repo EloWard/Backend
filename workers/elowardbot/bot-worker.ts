@@ -34,7 +34,7 @@ interface Env {
   RANK_WORKER: Fetcher;
   // Durable Objects
   BOT_MANAGER: DurableObjectNamespace;
-  IRC_SHARD: DurableObjectNamespace;
+  // Removed cooldown shard; no per-user cooldown
   // IRC client shards (Durable Object namespace for IRC connections)
   IRC_CLIENT?: DurableObjectNamespace;
   // D1 database
@@ -202,7 +202,7 @@ async function hmacValid(env: Env, bodyText: string, signatureHeader: string | n
 }
 
 async function getChannelConfig(env: Env, channel_login: string) {
-  const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
+  const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
              FROM twitch_bot_users WHERE channel_name = ?`;
   try {
     const stmt: any = env.DB.prepare(q).bind(channel_login.toLowerCase());
@@ -240,7 +240,6 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
     timeout_seconds = COALESCE(?, timeout_seconds),
     reason_template = COALESCE(?, reason_template),
     ignore_roles = COALESCE(?, ignore_roles),
-    cooldown_seconds = COALESCE(?, cooldown_seconds),
     updated_at = CURRENT_TIMESTAMP
     WHERE twitch_id = ?`;
   const result = await env.DB.prepare(upd).bind(
@@ -249,20 +248,18 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
     v(patch.timeout_seconds),
     v(patch.reason_template),
     v(patch.ignore_roles),
-    v(patch.cooldown_seconds),
     twitchId
   ).run();
   if ((result as any)?.meta?.changes === 0) {
-    const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds)
-                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "⏱️ {seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"), COALESCE(?, 60))`;
+    const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles)
+                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "⏱️ {seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"))`;
     await env.DB.prepare(ins).bind(
       twitchId,
       login,
       to01(patch.bot_enabled),
       v(patch.timeout_seconds),
       v(patch.reason_template),
-      v(patch.ignore_roles),
-      v(patch.cooldown_seconds)
+      v(patch.ignore_roles)
     ).run();
   }
   return await getChannelConfig(env, login);
@@ -359,7 +356,7 @@ router.post('/bot/config_internal', async (req: Request, env: Env, ctx: Executio
     const patch: any = {};
     if (typeof body.timeout_seconds === 'number') patch.timeout_seconds = body.timeout_seconds;
     if (typeof body.reason_template === 'string') patch.reason_template = body.reason_template;
-    if (typeof body.cooldown_seconds === 'number') patch.cooldown_seconds = body.cooldown_seconds;
+    // cooldown removed
     if (typeof body.bot_enabled === 'number' || typeof body.bot_enabled === 'boolean') patch.bot_enabled = body.bot_enabled;
     if (twitch_id) patch.twitch_id = twitch_id;
     const cfg = await upsertChannelConfig(env, resolved.login, patch);
@@ -482,7 +479,7 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
                WHERE bot_enabled = 1`;
     const res = await env.DB.prepare(q).all();
@@ -506,7 +503,7 @@ async function getUserById(env: Env, accessToken: string, id: string) {
 
 async function getChannelConfigByTwitchId(env: Env, twitchId: string) {
   try {
-    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, cooldown_seconds, enforcement_mode, min_rank_tier, min_rank_division
+    const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users WHERE twitch_id = ?`;
     const res = await env.DB.prepare(q).bind(twitchId).all();
     const row = res?.results && res.results[0];
@@ -548,7 +545,7 @@ function meetsMinRank(userRank: any, threshold: { tier: string; division: number
   const userTier = normalizeTier(userRank.rank_tier);
   const userDiv = divisionToNumber(userRank.rank_division);
   const thrTier = normalizeTier(threshold.tier);
-  const thrDiv = divisionToNumber(threshold.division);
+  const thrDiv = romanOrNumberToDivision(threshold.division);
   const userIdx = RANK_ORDER.indexOf(userTier as any);
   const thrIdx = RANK_ORDER.indexOf(thrTier as any);
   if (userIdx < 0 || thrIdx < 0) return false;
@@ -556,6 +553,17 @@ function meetsMinRank(userRank: any, threshold: { tier: string; division: number
   if (userIdx < thrIdx) return false; // strictly lower tier
   // same tier: lower division number is higher (I=1 > IV=4)
   return userDiv <= thrDiv;
+}
+
+function romanOrNumberToDivision(div: any): number {
+  if (typeof div === 'string') {
+    const upper = div.toUpperCase();
+    if (upper === 'I') return 1;
+    if (upper === 'II') return 2;
+    if (upper === 'III') return 3;
+    if (upper === 'IV') return 4;
+  }
+  return divisionToNumber(div);
 }
 
 async function getBotUserAndToken(env: Env): Promise<{ access: string; refresh?: string; expires_at?: number; user?: { id: string; login: string } } | null> {
@@ -594,16 +602,9 @@ class BotManager {
     const url = new URL(req.url);
     if (req.method === 'POST' && (url.pathname === '/start' || url.pathname === '/reload')) {
       const channels = await listEnabledChannels(this.env);
-      // Warm cooldown shards for current channels
-      for (const ch of channels) {
-        const shardKey = String((ch as any).twitch_id || ch.channel_login);
-        const id = this.env.IRC_SHARD.idFromName(`cooldown:${shardKey}`);
-        await this.env.IRC_SHARD.get(id).fetch('https://do/warm', { method: 'POST' });
-      }
-
       // Start IRC client shards (IRC-only mode)
       if (!this.env.IRC_CLIENT) {
-        return json(200, { ok: true, channels: channels.length, note: 'IRC_CLIENT binding not configured; only cooldown DO warmed.' });
+        return json(200, { ok: true, channels: channels.length, note: 'IRC_CLIENT binding not configured.' });
       }
 
       const shardSize = 50; // target channels per shard
@@ -633,37 +634,7 @@ class BotManager {
   }
 }
 
-class IrcShard {
-  state: DurableObjectState;
-  env: Env;
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-  }
-
-  async fetch(req: Request): Promise<Response> {
-    const url = new URL(req.url);
-    if (req.method === 'POST' && url.pathname === '/warm') {
-      // no-op, ensures DO instance exists
-      return json(200, { ok: true });
-    }
-    if (req.method === 'POST' && url.pathname === '/cooldown/check') {
-      const body = await req.json().catch(() => ({}));
-      const key = `${String(body.channel_login || '')}|${String(body.user_login || '')}`;
-      const cooldownMs = Math.max(0, (Number(body.cooldown_seconds) || 60) * 1000);
-      const last = (await this.state.storage.get(key)) as number | undefined;
-      const now = Date.now();
-      if (last && now - last < cooldownMs) {
-        return json(200, { allowed: false, last });
-      }
-      await this.state.storage.put(key, now);
-      return json(200, { allowed: true, last: last || 0 });
-    }
-    return json(404, { error: 'not found' });
-  }
-}
-
-export { BotManager, IrcShard };
+export { BotManager };
 
 // IRC Client Durable Object: maintains WebSocket to Twitch IRC and enforces via /timeout
 class IrcClientShard {
@@ -810,19 +781,6 @@ class IrcClientShard {
           } catch {}
 
           if (!shouldTimeout) continue;
-
-          // Check cooldown
-          try {
-            const channelId = this.channelIdByLogin.get(chanLogin) || chanLogin;
-            const shardId = this.env.IRC_SHARD.idFromName(`cooldown:${channelId}`);
-            const res = await this.env.IRC_SHARD.get(shardId).fetch('https://do/cooldown/check', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ channel_login: channelId, user_login: login, cooldown_seconds: cfg.cooldown_seconds || 60 }),
-            });
-            const cd = await res.json();
-            if (cd && cd.allowed === false) continue;
-          } catch {}
 
           // Send timeout via IRC command
           const duration = cfg.timeout_seconds || 30;
