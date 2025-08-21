@@ -545,7 +545,9 @@ function meetsMinRank(userRank: any, threshold: { tier: string; division: number
   const userTier = normalizeTier(userRank.rank_tier);
   const userDiv = divisionToNumber(userRank.rank_division);
   const thrTier = normalizeTier(threshold.tier);
-  const thrDiv = romanOrNumberToDivision(threshold.division);
+  const thrDiv = (thrTier === 'MASTER' || thrTier === 'GRANDMASTER' || thrTier === 'CHALLENGER')
+    ? 1
+    : romanOrNumberToDivision(threshold.division);
   const userIdx = RANK_ORDER.indexOf(userTier as any);
   const thrIdx = RANK_ORDER.indexOf(thrTier as any);
   if (userIdx < 0 || thrIdx < 0) return false;
