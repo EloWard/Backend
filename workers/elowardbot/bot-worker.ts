@@ -258,7 +258,7 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
   ).run();
   if ((result as any)?.meta?.changes === 0) {
     const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division)
-                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "{seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"), COALESCE(?, 'has_rank'), COALESCE(?, NULL), COALESCE(?, NULL))`;
+                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}"), COALESCE(?, "broadcaster,moderator,vip"), COALESCE(?, 'has_rank'), COALESCE(?, NULL), COALESCE(?, NULL))`;
     await env.DB.prepare(ins).bind(
       twitchId,
       login,
@@ -561,7 +561,7 @@ async function getChannelConfigByTwitchId(env: Env, twitchId: string) {
 function resolveReasonTemplate(env: Env, channelConfig: any, chatterLogin: string): string {
   const site = env.SITE_BASE_URL || 'https://www.eloward.com';
   const seconds = channelConfig?.timeout_seconds || 30;
-  const tpl = channelConfig?.reason_template || 'Link your EloWard rank at {site}';
+  const tpl = channelConfig?.reason_template || '{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}';
   return String(tpl)
     .replace('{seconds}', String(seconds))
     .replace('{site}', site)
