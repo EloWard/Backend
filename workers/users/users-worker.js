@@ -69,10 +69,9 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleDashboardDataById(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
+      // Removed legacy name-based dashboard endpoint
       } else if (url.pathname.includes('/dashboard/data')) {
-        response = request.method === 'POST'
-          ? await handleDashboardData(request, env, corsHeaders)
-          : new Response('Method Not Allowed', { status: 405 });
+        response = new Response('Not Found', { status: 404 });
       } else if (url.pathname.includes('/user/register')) {
         if (request.method === 'POST') {
           // Require internal auth for write of Twitch users
@@ -90,10 +89,9 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleChannelActiveUpdateById(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
+      // Removed legacy name-based channel active update endpoint
       } else if (url.pathname.includes('/channel/active/update')) {
-        response = request.method === 'POST'
-          ? await handleChannelActiveUpdate(request, env, corsHeaders)
-          : new Response('Method Not Allowed', { status: 405 });
+        response = new Response('Not Found', { status: 404 });
       } else if (url.pathname.includes('/user/lookup')) {
         response = request.method === 'POST'
           ? await handleUserLookup(request, env, corsHeaders)
@@ -336,48 +334,7 @@ async function handleUserRegistration(request, env, corsHeaders) {
 /**
  * Handles dashboard data retrieval for a channel
  */
-async function handleDashboardData(request, env, corsHeaders) {
-  try {
-    const body = await parseRequestBody(request);
-    const channelName = validateChannelName(body.channel_name);
-    
-    const query = `
-      SELECT db_reads, successful_lookups, channel_active, display_name
-      FROM \`users\` WHERE channel_name = ? LIMIT 1
-    `;
-    
-    const result = await env.DB.prepare(query).bind(channelName).first();
-    
-    if (!result) {
-      return createErrorResponse(404, 'Channel not found or not active', null, corsHeaders);
-    }
-    
-    // Calculate badge display percentage
-    let badgeDisplayRate = '-';
-    if (result.db_reads > 0) {
-      badgeDisplayRate = Math.round((result.successful_lookups / result.db_reads) * 100);
-    }
-    
-    return new Response(JSON.stringify({ 
-      db_reads: result.db_reads,
-      successful_lookups: result.successful_lookups,
-      badge_display_rate: badgeDisplayRate,
-      channel_active: result.channel_active,
-      display_name: result.display_name
-    }), { 
-      status: 200,
-      headers: corsHeaders
-    });
-  } catch (error) {
-    console.error('Error fetching dashboard data:', error);
-    return createErrorResponse(
-      error.message === 'Invalid JSON' ? 400 : 500,
-      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to fetch dashboard data',
-      error.message === 'Invalid JSON' ? null : error.message,
-      corsHeaders
-    );
-  }
-}
+// Removed legacy handleDashboardData
 
 /**
  * Handles dashboard data retrieval by twitch_id
@@ -430,58 +387,7 @@ async function handleDashboardDataById(request, env, corsHeaders) {
 /**
  * Handles updating the channel_active status for a channel
  */
-async function handleChannelActiveUpdate(request, env, corsHeaders) {
-  try {
-    const body = await parseRequestBody(request);
-    const { channel_name, channel_active } = body;
-    
-    if (!channel_name) {
-      return createErrorResponse(400, 'Missing channel_name parameter');
-    }
-    
-    if (typeof channel_active !== 'boolean' && channel_active !== 0 && channel_active !== 1) {
-      return createErrorResponse(400, 'channel_active must be a boolean or 0/1');
-    }
-    
-    // Authorization: internal service-only using secret header
-    const providedInternal = request.headers.get('X-Internal-Auth');
-    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
-    if (!expectedInternal || providedInternal !== expectedInternal) {
-      return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
-    }
-    
-    const activeValue = channel_active === true || channel_active === 1 ? 1 : 0;
-    const query = `
-      UPDATE \`users\` SET channel_active = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE channel_name = ?
-    `;
-    
-    const result = await env.DB.prepare(query).bind(activeValue, channel_name.toLowerCase()).run();
-    
-    if (result.meta?.changes === 0) {
-      return createErrorResponse(404, 'Channel not found or no changes made', null, corsHeaders);
-    }
-    
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: 'Channel active status updated successfully',
-      channel_name,
-      channel_active: activeValue,
-      changes: result.meta?.changes || 0
-    }), { 
-      status: 200,
-      headers: corsHeaders
-    });
-  } catch (error) {
-    console.error('Error updating channel active status:', error);
-    return createErrorResponse(
-      error.message === 'Invalid JSON' ? 400 : 500,
-      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to update channel active status',
-      error.message === 'Invalid JSON' ? null : error.message,
-      corsHeaders
-    );
-  }
-}
+// Removed legacy handleChannelActiveUpdate
 
 /**
  * Handles updating the channel_active status for a channel by twitch_id

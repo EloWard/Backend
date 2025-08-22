@@ -1,28 +1,7 @@
 # EloWard Cloudflare Infrastructure
 
-## 🗑️ Routes Safe for Removal
-**The following routes are no longer used by the migrated EloWardApp extension:**
-- `GET /auth/init` - Replaced by client-side URL building
-- `POST /auth/token` - Replaced by `/auth/complete`
-- `GET /riot/account/{region}` - Replaced by server-side calls
-- `GET /riot/league/entries` - Replaced by server-side calls
-- `GET /riot/league/{platform}/{puuid}` - Replaced by server-side calls  
-- `POST /store-rank` - Replaced by `/auth/complete`
-
-Additional Twitch routes safe for removal (kept temporarily for legacy clients):
-- `POST /auth/twitch/init` - Client-side URL building is used
-- `POST /auth/twitch/token` - Superseded by consolidated `/twitch/auth`
-- `POST /auth/twitch/token/refresh` - Superseded by consolidated `/twitch/auth`
-- `POST /auth/twitch/validate` - Superseded by consolidated `/twitch/auth`
-- `POST /auth/twitch/user` - Superseded by consolidated `/twitch/auth`
-- `POST /store-user` - Superseded by consolidated `/twitch/auth`
-
-EloWard Bot (control plane) routes safe for removal:
-- `GET /bot/config/{login}` - Removed; use `POST /bot/config_id` instead
-
-**Migration Status:** ✅ Complete - Extension fully migrated to server-side auth flow
-
-**Note:** `GET /auth/redirect` must be kept as it's required for OAuth callbacks from Riot Games.
+## Status
+The extension and site use only the active endpoints listed below.
 
 ## D1 Database Configuration
 - Database Name: eloward
@@ -90,7 +69,7 @@ Database Workers (Database Operations)
 D1 Database
 ```
 
-### Workers and Endpoints
+### Workers and Endpoints (active)
 
 #### Authentication Workers (token validation and external API calls)
 
@@ -102,12 +81,6 @@ D1 Database
   - `POST /riot/refreshrank` — Status: Active. Refreshes rank by PUUID (server-side only; no PUUID returned).
   - `DELETE /disconnect` — Status: Active. Deletes rank by PUUID (server-side only).
   - `GET /auth/redirect` — Status: Active. OAuth redirect handler.
-  - `GET /auth/init` — Status: Legacy (safe to remove). Replaced by client-side URL building.
-  - `POST /auth/token` — Status: Legacy (safe to remove). Superseded by `/auth/complete`.
-  - `GET /riot/account/{region}` — Status: Legacy (safe to remove). Superseded by server-side logic.
-  - `GET /riot/league/entries` — Status: Legacy (safe to remove). Superseded by server-side logic.
-  - `GET /riot/league/{platform}/{puuid}` — Status: Legacy (safe to remove). Superseded by server-side logic.
-  - `POST /store-rank` — Status: Legacy (safe to remove). Superseded by `/auth/complete`.
 
 **Twitch Auth Worker** (`twitchauth-worker.ts`)
 - URL: https://eloward-twitchauth.unleashai.workers.dev
@@ -116,12 +89,6 @@ D1 Database
   - `GET /health` — Status: Active.
   - `POST /twitch/auth` — Status: Active. Consolidated (code → user → register). No tokens returned to clients.
   - `GET /auth/twitch/redirect` — Status: Active. OAuth redirect handler.
-  - `POST /auth/twitch/init` — Status: Legacy (keep for compatibility).
-  - `POST /auth/twitch/token` — Status: Legacy (keep for compatibility).
-  - `POST /auth/twitch/token/refresh` — Status: Legacy (keep for compatibility).
-  - `POST /auth/twitch/validate` — Status: Legacy (keep for compatibility).
-  - `POST /auth/twitch/user` — Status: Legacy (keep for compatibility).
-  - `POST /store-user` — Status: Legacy (safe to remove).
 
 #### Database Workers (Handle database operations only)
 
@@ -144,9 +111,7 @@ D1 Database
   - `POST /metrics/successful_lookup` — Status: Active (public write).
   - `POST /user/register` — Status: Active (internal write). Requires `X-Internal-Auth`.
   - `POST /user/lookup` — Status: Active (internal read). Requires `X-Internal-Auth`.
-  - `POST /dashboard/data` — Status: Legacy (public read). Login-based; sanitized fields only.
   - `POST /dashboard/data_id` — Status: Active (public read). ID-based; sanitized fields only.
-  - `POST /channel/active/update` — Status: Legacy (internal write). Login-based; requires `X-Internal-Auth`.
   - `POST /channel/active/update_id` — Status: Active (internal write). ID-based; requires `X-Internal-Auth`.
 
 #### Utility Workers
@@ -193,22 +158,14 @@ D1 Database
 4. riotauth-worker → Website redirect (with auth_complete=true)
 5. Website → Extension (via postMessage with success notification)
 
-### Legacy Dual-Call Flow (Fallback when optimization fails)
-1. Extension → riotauth-worker `/auth/complete` (sends code + twitch_id + region)
-2. riotauth-worker → Riot OAuth API (exchanges code for tokens server-side)
-3. riotauth-worker → Riot Account API (gets PUUID using token)
-4. riotauth-worker → users-worker `/user/lookup` (gets channel_name from twitch_id)
-5. riotauth-worker → Riot League API (fetches initial rank data)
-6. riotauth-worker → rank-worker `/api/ranks/lol` (stores rank data)
-7. riotauth-worker → Extension (returns complete user data, no tokens)
+### Server-side Auth Flow (single call)
+1. Extension → `/auth/redirect`
+2. RiotAuth worker completes code exchange, fetches PUUID + rank, stores via Rank worker
+3. Website notifies extension
 
-### Legacy Initial Rank Setup Flow (**🗑️ CAN REMOVE** - no longer used)
-**Uses deprecated endpoints: `/auth/init`, `/auth/token`, `/store-rank`**
-**Extension has been migrated to use `/auth/complete` flow**
-1. Extension → riotauth-worker (validates Riot & Twitch tokens)
-2. riotauth-worker → twitchauth-worker (validates Twitch user)
-3. riotauth-worker → rank-worker (stores rank data)
-4. rank-worker → D1 Database
+### Rank Refresh Flow
+1. Extension → `/riot/refreshrank` (PUUID-only)
+2. RiotAuth → Rank worker lookup → Riot API → Rank worker update
 
 ### Simplified Rank Refresh Flow
 1. Extension → riotauth-worker `/riot/refreshrank` (sends only PUUID)
@@ -245,11 +202,7 @@ D1 Database
 - **ENHANCED**: Server-side API key usage reduces token exposure and refresh complexity
 - **ENHANCED**: PUUID-only refresh requires existing database entry (prevents unauthorized access)
 
-## Deprecations (Kept for Backward Compatibility)
-- Riot Auth Worker: `GET /auth/init`, `POST /auth/token`, `GET /riot/account/{region}`, `GET /riot/league/entries`, `GET /riot/league/{platform}/{puuid}`, `POST /store-rank` — not used by current clients.
-- Twitch Auth Worker: `POST /auth/twitch/init`, `POST /auth/twitch/token`, `POST /auth/twitch/token/refresh`, `POST /auth/twitch/validate`, `POST /auth/twitch/user` — superseded by `POST /twitch/auth`. Keep for older clients; safe to remove when no longer needed.
-- Users Worker: name-based `POST /channel/active/update` remains for legacy; prefer ID-based `POST /channel/active/update_id` and `POST /dashboard/data_id`.
-- Bot Worker: `GET /bot/config/{login}` removed; use `GET /bot/config_id/{twitch_id}`.
+##
 
 ## Database Indexes
 
