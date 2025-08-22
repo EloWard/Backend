@@ -223,15 +223,14 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
       return corsResponse(usersWorkerResponse.status, { error: 'user_register_failed', error_description: tx });
     }
 
-    // 4) Return minimal user info to client (no tokens)
+    // 4) Return minimal user info to client (no tokens, no email)
     return corsResponse(200, {
       success: true,
       user_data: {
         id: twitchUser.id,
         login: twitchUser.login,
         display_name: twitchUser.display_name,
-        profile_image_url: twitchUser.profile_image_url,
-        email: (twitchUser as any)?.email || null,
+        profile_image_url: twitchUser.profile_image_url
       },
     });
   } catch (error: any) {

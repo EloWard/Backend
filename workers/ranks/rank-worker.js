@@ -41,6 +41,9 @@ const worker = {
     }
     
     if (path === "/api/ranks/lol/by-puuid" && request.method === "POST") {
+      if (!authorizeInternal()) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: corsHeaders });
+      }
       return getRankByPuuid(request, env);
     }
     

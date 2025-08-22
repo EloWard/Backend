@@ -417,7 +417,7 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
     // Step 3: Look up channel_name from users table using twitch_id
     const getUserRequest = new Request('https://users-worker/user/lookup', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Auth': (env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY || '') },
       body: JSON.stringify({ twitch_id })
     });
 
@@ -825,6 +825,7 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'X-Internal-Auth': (env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
       },
       body: JSON.stringify({ puuid })
     });

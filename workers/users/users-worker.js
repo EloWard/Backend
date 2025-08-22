@@ -342,7 +342,7 @@ async function handleDashboardData(request, env, corsHeaders) {
     const channelName = validateChannelName(body.channel_name);
     
     const query = `
-      SELECT db_reads, successful_lookups, channel_active, email, display_name
+      SELECT db_reads, successful_lookups, channel_active, display_name
       FROM \`users\` WHERE channel_name = ? LIMIT 1
     `;
     
@@ -391,7 +391,7 @@ async function handleDashboardDataById(request, env, corsHeaders) {
     }
 
     const query = `
-      SELECT db_reads, successful_lookups, channel_active, email, display_name
+      SELECT db_reads, successful_lookups, channel_active, display_name
       FROM \`users\` WHERE twitch_id = ? LIMIT 1
     `;
 
