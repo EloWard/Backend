@@ -240,6 +240,9 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
     timeout_seconds = COALESCE(?, timeout_seconds),
     reason_template = COALESCE(?, reason_template),
     ignore_roles = COALESCE(?, ignore_roles),
+    enforcement_mode = COALESCE(?, enforcement_mode),
+    min_rank_tier = COALESCE(?, min_rank_tier),
+    min_rank_division = COALESCE(?, min_rank_division),
     updated_at = CURRENT_TIMESTAMP
     WHERE twitch_id = ?`;
   const result = await env.DB.prepare(upd).bind(
@@ -248,18 +251,24 @@ async function upsertChannelConfig(env: Env, channel_login: string, patch: any) 
     v(patch.timeout_seconds),
     v(patch.reason_template),
     v(patch.ignore_roles),
+    v(patch.enforcement_mode),
+    v(patch.min_rank_tier),
+    v(patch.min_rank_division),
     twitchId
   ).run();
   if ((result as any)?.meta?.changes === 0) {
-    const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles)
-                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "⏱️ {seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"))`;
+    const ins = `INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division)
+                 VALUES (?, ?, COALESCE(?, 0), COALESCE(?, 30), COALESCE(?, "{seconds}s timeout: link your EloWard rank at {site}"), COALESCE(?, "broadcaster,moderator,vip"), COALESCE(?, 'has_rank'), COALESCE(?, NULL), COALESCE(?, NULL))`;
     await env.DB.prepare(ins).bind(
       twitchId,
       login,
       to01(patch.bot_enabled),
       v(patch.timeout_seconds),
       v(patch.reason_template),
-      v(patch.ignore_roles)
+      v(patch.ignore_roles),
+      v(patch.enforcement_mode),
+      v(patch.min_rank_tier),
+      v(patch.min_rank_division)
     ).run();
   }
   return await getChannelConfig(env, login);
@@ -275,6 +284,31 @@ router.post('/bot/config_id', async (req: Request, env: Env) => {
     // Omit twitch_id from response to avoid exposing it publicly
     const { twitch_id: _omit, ...safe } = cfg as any;
     return json(200, safe);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
+// Dashboard initialization: combine channel_active (users worker can provide separately) with bot config
+// For now, this endpoint returns only bot config and a derived `bot_active` boolean;
+// callers can merge with Users service data for channel_active.
+router.post('/dashboard/init', async (req: Request, env: Env) => {
+  try {
+    const body = await req.json().catch(() => ({} as any));
+    const twitch_id = String(body?.twitch_id || '');
+    if (!twitch_id) return json(400, { error: 'twitch_id required' });
+    const cfg = await getChannelConfigByTwitchId(env, twitch_id);
+    const bot = cfg ? ({
+      channel_login: (cfg as any).channel_login,
+      bot_enabled: !!(cfg as any).bot_enabled,
+      timeout_seconds: (cfg as any).timeout_seconds,
+      reason_template: (cfg as any).reason_template,
+      ignore_roles: (cfg as any).ignore_roles,
+      enforcement_mode: (cfg as any).enforcement_mode || 'has_rank',
+      min_rank_tier: (cfg as any).min_rank_tier || null,
+      min_rank_division: (cfg as any).min_rank_division ?? null
+    }) : null;
+    return json(200, { bot_active: !!(cfg && (cfg as any).bot_enabled), bot_config: bot });
   } catch (e: any) {
     return json(500, { error: e?.message || 'error' });
   }
@@ -358,6 +392,12 @@ router.post('/bot/config_internal', async (req: Request, env: Env, ctx: Executio
     if (typeof body.reason_template === 'string') patch.reason_template = body.reason_template;
     // cooldown removed
     if (typeof body.bot_enabled === 'number' || typeof body.bot_enabled === 'boolean') patch.bot_enabled = body.bot_enabled;
+    if (typeof body.enforcement_mode === 'string') patch.enforcement_mode = String(body.enforcement_mode);
+    if (body.min_rank_tier !== undefined) patch.min_rank_tier = body.min_rank_tier == null ? null : String(body.min_rank_tier);
+    if (body.min_rank_division !== undefined) {
+      const d = body.min_rank_division;
+      patch.min_rank_division = d == null ? null : (typeof d === 'string' ? romanOrNumberToDivision(d) : Number(d));
+    }
     if (twitch_id) patch.twitch_id = twitch_id;
     const cfg = await upsertChannelConfig(env, resolved.login, patch);
     try {
