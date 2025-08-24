@@ -167,25 +167,23 @@ router.options('*', () => json(200, {}));
 router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }));
 
 // Start / reload IRC via Durable Objects
-router.post('/irc/start', async (_req: Request, env: Env) => {
+router.post('/irc/start', async (_req: Request, env: Env, ctx: ExecutionContext) => {
   try {
     console.log('[Bot] /irc/start called');
     const id = env.BOT_MANAGER.idFromName('manager');
-    const res = await env.BOT_MANAGER.get(id).fetch('https://do/start', { method: 'POST' });
-    const data = await res.json().catch(() => ({}));
-    return json(res.status, data);
+    ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/start', { method: 'POST' }));
+    return json(202, { accepted: true });
   } catch (e: any) {
     return json(500, { error: e?.message || 'start failed' });
   }
 });
 
-router.post('/irc/reload', async (_req: Request, env: Env) => {
+router.post('/irc/reload', async (_req: Request, env: Env, ctx: ExecutionContext) => {
   try {
     console.log('[Bot] /irc/reload called');
     const id = env.BOT_MANAGER.idFromName('manager');
-    const res = await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
-    const data = await res.json().catch(() => ({}));
-    return json(res.status, data);
+    ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
+    return json(202, { accepted: true });
   } catch (e: any) {
     return json(500, { error: e?.message || 'reload failed' });
   }
@@ -655,6 +653,11 @@ class BotManager {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    // keep warm
+    if (typeof this.state.setAlarm === 'function') {
+      const next = Date.now() + 60_000 * 5; // every 5 minutes
+      try { this.state.setAlarm!(next); } catch {}
+    }
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -692,6 +695,10 @@ class BotManager {
       console.log('[BotManager] Assigned channels to shards', { total, shardCount });
       return json(200, { ok: true, channels: channels.length, shards: shardCount });
     }
+    if (req.method === 'POST' && url.pathname === '/alarm') {
+      // noop warm
+      return json(200, { ok: true });
+    }
     return json(404, { error: 'not found' });
   }
 }
@@ -711,12 +718,17 @@ class IrcClientShard {
   channelSet: Set<string> = new Set();
   channelIdByLogin: Map<string, string> = new Map();
   lastJoinAt = 0;
-  joinIntervalMs = 1000; // conservative join pacing
+  joinIntervalMs = 400; // faster join pacing to reduce startup delay
   rateLimitSleepMs = 700; // basic pacing for commands
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    // keep warm
+    if (typeof this.state.setAlarm === 'function') {
+      const next = Date.now() + 60_000 * 5; // every 5 minutes
+      try { this.state.setAlarm!(next); } catch {}
+    }
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -756,6 +768,10 @@ class IrcClientShard {
         hasSocket: !!this.ws && (this.ws as any).readyState,
       };
       return json(200, state);
+    }
+    if (req.method === 'POST' && url.pathname === '/alarm') {
+      // noop warm
+      return json(200, { ok: true });
     }
     return json(404, { error: 'not found' });
   }
@@ -873,6 +889,7 @@ class IrcClientShard {
         const login = (msg.prefix?.split('!')[0] || '').toLowerCase();
         const chanLogin = channel.startsWith('#') ? channel.slice(1).toLowerCase() : channel.toLowerCase();
         if (!this.channelSet.has(`#${chanLogin}`)) continue;
+        console.log('[IRC] PRIVMSG', { channel: `#${chanLogin}`, user: login });
 
         // Skip privileged roles using tags
         const badges = this.getBadgeSet(msg.tags?.badges || '');
@@ -885,10 +902,15 @@ class IrcClientShard {
 
           let shouldTimeout = false;
           try {
-            const rankReq = new Request(`https://ranks-worker/api/ranks/lol/${encodeURIComponent(login)}`);
+            const rankReq = new Request(`https://internal/api/ranks/lol/${encodeURIComponent(login)}`);
             const rankRes = await this.env.RANK_WORKER.fetch(rankReq);
             let rank: any = null;
-            if (rankRes.ok) rank = await rankRes.json();
+            if (rankRes.ok) {
+              rank = await rankRes.json();
+              console.log('[Rank] found', { user: login, tier: rank?.rank_tier, division: rank?.rank_division });
+            } else {
+              console.log('[Rank] not found or error', { user: login, status: rankRes.status });
+            }
             const mode = (cfg.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
             if (mode === 'has_rank') {
               shouldTimeout = !(rank && rank.rank_tier);
@@ -899,6 +921,7 @@ class IrcClientShard {
               };
               shouldTimeout = threshold.tier ? !meetsMinRank(rank, threshold) : !(rank && rank.rank_tier);
             }
+            console.log('[Enforce] decision', { channel: chanLogin, user: login, mode, shouldTimeout });
           } catch {}
 
           if (!shouldTimeout) continue;
