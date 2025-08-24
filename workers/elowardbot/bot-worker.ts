@@ -169,6 +169,7 @@ router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }))
 // Start / reload IRC via Durable Objects
 router.post('/irc/start', async (_req: Request, env: Env) => {
   try {
+    console.log('[Bot] /irc/start called');
     const id = env.BOT_MANAGER.idFromName('manager');
     const res = await env.BOT_MANAGER.get(id).fetch('https://do/start', { method: 'POST' });
     const data = await res.json().catch(() => ({}));
@@ -180,12 +181,28 @@ router.post('/irc/start', async (_req: Request, env: Env) => {
 
 router.post('/irc/reload', async (_req: Request, env: Env) => {
   try {
+    console.log('[Bot] /irc/reload called');
     const id = env.BOT_MANAGER.idFromName('manager');
     const res = await env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' });
     const data = await res.json().catch(() => ({}));
     return json(res.status, data);
   } catch (e: any) {
     return json(500, { error: e?.message || 'reload failed' });
+  }
+});
+
+// Quick shard state probe: /irc/state?shard=0
+router.get('/irc/state', async (req: Request, env: Env) => {
+  try {
+    const u = new URL(req.url);
+    const shard = Number(u.searchParams.get('shard') || '0') || 0;
+    if (!env.IRC_CLIENT) return json(200, { ok: false, note: 'IRC_CLIENT binding not configured' });
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/state');
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'state failed' });
   }
 });
 
@@ -646,6 +663,7 @@ class BotManager {
       const channels = await listEnabledChannels(this.env);
       // Start IRC client shards (IRC-only mode)
       if (!this.env.IRC_CLIENT) {
+        console.warn('[BotManager] IRC_CLIENT binding not configured. Channels:', channels.length);
         return json(200, { ok: true, channels: channels.length, note: 'IRC_CLIENT binding not configured.' });
       }
 
@@ -663,6 +681,7 @@ class BotManager {
       // Dispatch assignments to shards
       await Promise.all(assignments.map(async (a) => {
         const id = this.env.IRC_CLIENT!.idFromName(`irc:${a.shard}`);
+        console.log('[BotManager] dispatch /assign', { shard: a.shard, count: a.channels.length });
         await this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -670,6 +689,7 @@ class BotManager {
         });
       }));
 
+      console.log('[BotManager] Assigned channels to shards', { total, shardCount });
       return json(200, { ok: true, channels: channels.length, shards: shardCount });
     }
     return json(404, { error: 'not found' });
@@ -684,6 +704,9 @@ class IrcClientShard {
   env: Env;
   ws: any | null = null;
   connecting = false;
+  ready = false;
+  didInitialJoin = false;
+  botLogin: string | null = null;
   assignedChannels: Array<{ channel_login: string; twitch_id?: string | null }> = [];
   channelSet: Set<string> = new Set();
   channelIdByLogin: Map<string, string> = new Map();
@@ -707,6 +730,7 @@ class IrcClientShard {
       for (const c of this.assignedChannels) if (c.twitch_id) this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
       await this.state.storage.put('assigned', this.assignedChannels);
       // Connect or refresh joins
+      console.log('[IRC] /assign received', { assigned: this.assignedChannels.length });
       await this.ensureConnectedAndJoined();
       return json(200, { ok: true, assigned: this.assignedChannels.length });
     }
@@ -718,8 +742,20 @@ class IrcClientShard {
         this.channelIdByLogin.clear();
         for (const c of this.assignedChannels) if ((c as any).twitch_id) this.channelIdByLogin.set((c as any).channel_login, String((c as any).twitch_id));
       }
+      console.log('[IRC] /reload received', { assigned: this.assignedChannels.length });
       await this.ensureConnectedAndJoined();
       return json(200, { ok: true, assigned: this.assignedChannels.length });
+    }
+    if (url.pathname === '/state') {
+      const state = {
+        assigned: this.assignedChannels.length,
+        channels: Array.from(this.channelSet).slice(0, 10),
+        connecting: this.connecting,
+        ready: this.ready,
+        didInitialJoin: this.didInitialJoin,
+        hasSocket: !!this.ws && (this.ws as any).readyState,
+      };
+      return json(200, state);
     }
     return json(404, { error: 'not found' });
   }
@@ -746,13 +782,17 @@ class IrcClientShard {
       const socket: any = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
       this.ws = socket;
       socket.onopen = () => {
+        this.ready = false;
+        this.didInitialJoin = false;
+        this.botLogin = login;
+        console.log('[IRC] socket open. Logging in as', login);
         this.sendRaw(`PASS oauth:${token}`);
         this.sendRaw(`NICK ${login}`);
-        this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands');
+        this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
       };
       socket.onmessage = (evt: any) => this.handleIrcMessage(String(evt.data || ''));
-      socket.onclose = () => this.scheduleReconnect();
-      socket.onerror = () => this.scheduleReconnect();
+      socket.onclose = () => { console.warn('[IRC] socket closed.'); this.scheduleReconnect(); };
+      socket.onerror = () => { console.error('[IRC] socket error.'); this.scheduleReconnect(); };
     } catch {
       this.scheduleReconnect();
     } finally {
@@ -762,6 +802,9 @@ class IrcClientShard {
 
   scheduleReconnect() {
     this.ws = null;
+    this.ready = false;
+    this.didInitialJoin = false;
+    console.warn('[IRC] scheduling reconnect');
     setTimeout(() => this.connectIrc(), 3_000 + Math.floor(Math.random() * 4_000));
   }
 
@@ -770,9 +813,11 @@ class IrcClientShard {
   }
 
   async joinAssigned() {
+    if (!this.ws || this.ws.readyState !== 1 || !this.ready) return;
     for (const chan of Array.from(this.channelSet)) {
       const now = Date.now();
       if (now - this.lastJoinAt < this.joinIntervalMs) await this.sleep(this.joinIntervalMs - (now - this.lastJoinAt));
+      console.log('[IRC] JOIN', chan);
       this.sendRaw(`JOIN ${chan}`);
       this.lastJoinAt = Date.now();
     }
@@ -788,6 +833,40 @@ class IrcClientShard {
       }
       const msg = this.parseIrc(line);
       if (!msg) continue;
+      // Mark ready on welcome or global user state, then join channels once
+      if (msg.command === '001' || msg.command === 'GLOBALUSERSTATE') {
+        if (!this.ready) {
+          this.ready = true;
+          console.log('[IRC] ready. Will join channels:', this.channelSet.size);
+          if (!this.didInitialJoin) {
+            await this.joinAssigned();
+            this.didInitialJoin = true;
+          }
+        }
+        continue;
+      }
+      if (msg.command === 'CAP') {
+        // Example: :tmi.twitch.tv CAP * ACK :twitch.tv/membership
+        console.log('[IRC] CAP', msg.params?.join(' '));
+        continue;
+      }
+      if (msg.command === 'NOTICE') {
+        console.warn('[IRC] NOTICE', msg.params?.join(' '));
+        continue;
+      }
+      if (msg.command === 'RECONNECT') {
+        this.scheduleReconnect();
+        continue;
+      }
+      if (msg.command === 'JOIN') {
+        // Log our own joins for verification
+        try {
+          const who = (msg.prefix?.split('!')[0] || '').toLowerCase();
+          const chan = (msg.params?.[0] || '').toLowerCase();
+          if (who && this.botLogin && who === this.botLogin) console.log('[IRC] joined', chan);
+        } catch {}
+        continue;
+      }
       if (msg.command === 'PRIVMSG') {
         const channel = msg.params?.[0] || '';
         const text = msg.params?.[1] || '';
@@ -828,7 +907,8 @@ class IrcClientShard {
           const duration = cfg.timeout_seconds || 30;
           const reason = resolveReasonTemplate(this.env, cfg, login);
           await this.sleep(this.rateLimitSleepMs);
-          this.sendRaw(`PRIVMSG #${chanLogin} :/timeout ${login} ${duration} ${reason}`);
+          console.log('[Enforce] timeout', { channel: chanLogin, user: login, duration });
+          this.sendRaw(`PRIVMSG #${chanLogin} :.timeout ${login} ${duration} ${reason}`);
         } catch {
           // swallow
         }
