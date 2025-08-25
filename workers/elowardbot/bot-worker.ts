@@ -783,6 +783,7 @@ class IrcClientShard {
   joinIntervalMs = 400; // faster join pacing to reduce startup delay
   rateLimitSleepMs = 700; // basic pacing for commands
   keepaliveInterval: any = null; // WebSocket keepalive
+  modChannels: Set<string> = new Set(); // Channels where bot has mod permissions
 
   constructor(state: DurableObjectState, env: Env) {
     console.log('[IrcClient] constructor start:', Date.now());
@@ -827,6 +828,7 @@ class IrcClientShard {
       const state = {
         assigned: this.assignedChannels.length,
         channels: Array.from(this.channelSet).slice(0, 10),
+        modChannels: Array.from(this.modChannels).slice(0, 10),
         connecting: this.connecting,
         ready: this.ready,
         didInitialJoin: this.didInitialJoin,
@@ -1031,6 +1033,20 @@ class IrcClientShard {
         console.log('[IRC] CAP', msg.params?.join(' '));
         continue;
       }
+      if (msg.command === 'USERSTATE' && msg.params?.[0]) {
+        // Track our mod status in channels  
+        const channel = msg.params[0];
+        const isMod = msg.tags?.mod === '1' || msg.tags?.badges?.includes('moderator');
+        console.log('[IRC] USERSTATE', { channel, isMod, mod: msg.tags?.mod, badges: msg.tags?.badges });
+        if (isMod) {
+          this.modChannels.add(channel);
+          console.log('[IRC] Bot has mod permissions in', channel);
+        } else {
+          this.modChannels.delete(channel);
+          console.log('[IRC] Bot lacks mod permissions in', channel, '- will ignore messages');
+        }
+        continue;
+      }
       if (msg.command === 'NOTICE') {
         console.warn('[IRC] NOTICE', msg.params?.join(' '));
         continue;
@@ -1066,6 +1082,13 @@ class IrcClientShard {
           console.log('[IRC] PRIVMSG ignored - not in assigned channels');
           continue;
         }
+        
+        // Skip if bot lacks mod permissions in this channel
+        if (!this.modChannels.has(`#${chanLogin}`)) {
+          console.log('[IRC] PRIVMSG ignored - bot lacks mod permissions in', `#${chanLogin}`);
+          continue;
+        }
+        
         console.log('[IRC] PRIVMSG processing', { channel: `#${chanLogin}`, user: login, message });
 
         // Skip privileged roles using tags
