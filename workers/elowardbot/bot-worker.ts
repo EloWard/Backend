@@ -195,7 +195,7 @@ router.get('/irc/state', async (req: Request, env: Env) => {
     const u = new URL(req.url);
     const shard = Number(u.searchParams.get('shard') || '0') || 0;
     if (!env.IRC_CLIENT) return json(200, { ok: false, note: 'IRC_CLIENT binding not configured' });
-    const id = env.IRC_CLIENT.idFromName(`irc_v2:${shard}`);
+    const id = env.IRC_CLIENT.idFromName(`irc_v3:${shard}`);
     const res = await env.IRC_CLIENT.get(id).fetch('https://do/state');
     const data = await res.json().catch(() => ({}));
     return json(res.status, data);
@@ -729,7 +729,7 @@ class BotManager {
       console.log('[BotManager] dispatching to shards...', dispatchStartTime);
       const dispatchPromises = assignments.map(async (a) => {
         const shardStartTime = Date.now();
-        const id = this.env.IRC_CLIENT!.idFromName(`irc_v2:${a.shard}`);
+        const id = this.env.IRC_CLIENT!.idFromName(`irc_v3:${a.shard}`);
         console.log('[BotManager] dispatch /assign', { shard: a.shard, count: a.channels.length, time: shardStartTime });
         
         const assignPromise = this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
@@ -808,8 +808,10 @@ class IrcClientShard {
       for (const c of this.assignedChannels) if (c.twitch_id) this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
       await this.state.storage.put('assigned', this.assignedChannels);
       // Connect or refresh joins (non-blocking)
-      console.log('[IRC] /assign received', { assigned: this.assignedChannels.length });
+      const assignTime = Date.now();
+      console.log('[IRC] /assign received', { assigned: this.assignedChannels.length, time: assignTime });
       this.ensureConnectedAndJoined().catch(e => console.error('[IRC] connection failed during assign:', e));
+      console.log('[IRC] /assign response sent', { time: Date.now() - assignTime });
       return json(200, { ok: true, assigned: this.assignedChannels.length });
     }
     if (req.method === 'POST' && url.pathname === '/reload') {
@@ -820,8 +822,10 @@ class IrcClientShard {
         this.channelIdByLogin.clear();
         for (const c of this.assignedChannels) if ((c as any).twitch_id) this.channelIdByLogin.set((c as any).channel_login, String((c as any).twitch_id));
       }
-      console.log('[IRC] /reload received', { assigned: this.assignedChannels.length });
+      const reloadTime = Date.now();
+      console.log('[IRC] /reload received', { assigned: this.assignedChannels.length, time: reloadTime });
       this.ensureConnectedAndJoined().catch(e => console.error('[IRC] connection failed during reload:', e));
+      console.log('[IRC] /reload response sent', { time: Date.now() - reloadTime });
       return json(200, { ok: true, assigned: this.assignedChannels.length });
     }
     if (url.pathname === '/state') {
@@ -844,8 +848,17 @@ class IrcClientShard {
   }
 
   async ensureConnectedAndJoined() {
+    console.log('[IRC] ensureConnectedAndJoined called', { 
+      hasWs: !!this.ws, 
+      readyState: this.ws?.readyState, 
+      ready: this.ready,
+      channels: this.assignedChannels.length
+    });
     if (!this.ws || this.ws.readyState !== 1) {
+      console.log('[IRC] need to connect - no websocket or not open');
       await this.connectIrc();
+    } else {
+      console.log('[IRC] websocket already connected');
     }
     await this.joinAssigned();
   }
