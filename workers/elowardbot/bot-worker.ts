@@ -195,7 +195,7 @@ router.get('/irc/state', async (req: Request, env: Env) => {
     const u = new URL(req.url);
     const shard = Number(u.searchParams.get('shard') || '0') || 0;
     if (!env.IRC_CLIENT) return json(200, { ok: false, note: 'IRC_CLIENT binding not configured' });
-    const id = env.IRC_CLIENT.idFromName(`irc_v3:${shard}`);
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
     const res = await env.IRC_CLIENT.get(id).fetch('https://do/state');
     const data = await res.json().catch(() => ({}));
     return json(res.status, data);
@@ -729,7 +729,7 @@ class BotManager {
       console.log('[BotManager] dispatching to shards...', dispatchStartTime);
       const dispatchPromises = assignments.map(async (a) => {
         const shardStartTime = Date.now();
-        const id = this.env.IRC_CLIENT!.idFromName(`irc_v3:${a.shard}`);
+        const id = this.env.IRC_CLIENT!.idFromName(`irc:${a.shard}`);
         console.log('[BotManager] dispatch /assign', { shard: a.shard, count: a.channels.length, time: shardStartTime });
         
         const assignPromise = this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
