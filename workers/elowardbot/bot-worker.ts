@@ -546,9 +546,10 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
+    // TESTING: Only load yomata1 channel
     const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
-               WHERE bot_enabled = 1`;
+               WHERE bot_enabled = 1 AND channel_name = 'yomata1'`;
     const res = await env.DB.prepare(q).all();
     const rows = res?.results || [];
     return rows as ChannelConfig[];
@@ -714,9 +715,7 @@ class BotManager {
         const dbEndTime = Date.now();
         console.log('[BotManager] loaded channels', { count: channels.length, dbTime: dbEndTime - dbStartTime });
         
-        // **DIAGNOSTIC MODE**: Only connect to yomata1 for 1006 disconnect testing
-        channels = channels.filter(ch => ch.channel_login === 'yomata1');
-        console.log('[BotManager] DIAGNOSTIC MODE - only yomata1:', { count: channels.length });
+        // Database already filtered to yomata1 only for testing
       } catch (e) {
         console.error('[BotManager] channel loading failed/timeout:', e);
         channels = []; // fail gracefully, allow restart to try again
@@ -946,10 +945,15 @@ class IrcClientShard {
       socket.onmessage = (evt: any) => {
         const msgData = String(evt.data || '');
         const connectionTime = Date.now() - this.connectionStartTime;
-        // Only log PRIVMSG and PING/PONG for critical debugging
-        if (msgData.includes('PRIVMSG') || msgData.includes('PING') || msgData.includes('PONG')) {
-          log(`[IRC] critical message at ${Math.floor(connectionTime/1000)}s:`, msgData.substring(0, 100));
+        
+        // **DIAGNOSTIC**: Log ALL messages for complete visibility
+        log(`[IRC] RAW MESSAGE at ${Math.floor(connectionTime/1000)}s:`, msgData);
+        
+        // **TEST 2**: Verify we receive ANY IRC messages
+        if (msgData.includes('PRIVMSG')) {
+          log('🔴 [TEST 2] PRIVMSG DETECTED - SUCCESS!', msgData);
         }
+        
         this.handleIrcMessage(msgData);
       };
       
@@ -1040,7 +1044,6 @@ class IrcClientShard {
   }
 
   async handleIrcMessage(raw: string) {
-    const msgStartTime = Date.now();
     const lines = raw.split('\r\n');
     log(`[IRC] processing ${lines.length} lines`);
     for (const line of lines) {
@@ -1092,16 +1095,16 @@ class IrcClientShard {
         continue;
       }
       if (msg.command === 'USERSTATE' && msg.params?.[0]) {
-        // Track our mod status in channels  
+        // **TEST 4**: Verify mod permission detection
         const channel = msg.params[0];
         const isMod = msg.tags?.mod === '1' || msg.tags?.badges?.includes('moderator');
-        console.log('[IRC] USERSTATE', { channel, isMod, mod: msg.tags?.mod, badges: msg.tags?.badges });
+        log('🔵 [TEST 4] MOD PERMISSION CHECK', { channel, isMod, mod: msg.tags?.mod, badges: msg.tags?.badges });
         if (isMod) {
           this.modChannels.add(channel);
-          console.log('[IRC] Bot has mod permissions in', channel);
+          log('🟢 [TEST 4] BOT HAS MOD PERMISSIONS', channel);
         } else {
           this.modChannels.delete(channel);
-          console.log('[IRC] Bot lacks mod permissions in', channel, '- will ignore messages');
+          log('🔴 [TEST 4] BOT LACKS MOD PERMISSIONS', { channel, message: 'will ignore messages' });
         }
         continue;
       }
@@ -1114,15 +1117,21 @@ class IrcClientShard {
         continue;
       }
       if (msg.command === 'JOIN') {
-        // Log our own joins for verification
+        // **TEST 1**: Log ALL joins (bot and users) for verification
         try {
           const who = (msg.prefix?.split('!')[0] || '').toLowerCase();
           const chan = (msg.params?.[0] || '').toLowerCase();
-          if (who && this.botLogin && who === this.botLogin) console.log('[IRC] joined', chan);
+          log(`[IRC] JOIN detected: ${who} joined ${chan}`);
+          if (who && this.botLogin && who === this.botLogin) {
+            log(`🟢 [TEST 1] BOT SUCCESSFULLY JOINED ${chan}!`);
+          }
         } catch {}
         continue;
       }
       if (msg.command === 'PRIVMSG') {
+        // **TEST 3**: Verify PRIVMSG parsing and detection
+        log('🟡 [TEST 3] PRIVMSG PARSING SUCCESS', { command: msg.command, paramsCount: msg.params?.length });
+        
         const privmsgStartTime = Date.now();
         const channel = msg.params?.[0] || '';
         const message = msg.params?.[1] || '';
@@ -1198,15 +1207,21 @@ class IrcClientShard {
 
           if (!shouldTimeout) continue;
 
+          // **TEST 5**: Verify message processing pipeline
+          log('🟠 [TEST 5] TIMEOUT COMMAND TRIGGERED', { channel: chanLogin, user: login, shouldTimeout });
+
           // Send timeout via IRC command
           const timeoutStartTime = Date.now();
           const duration = cfg.timeout_seconds || 30;
           const reason = resolveReasonTemplate(this.env, cfg, login);
           await this.sleep(this.rateLimitSleepMs);
           
+          const timeoutExecuteTime = Date.now() - timeoutStartTime;
           const totalProcessTime = Date.now() - privmsgStartTime;
-          log(`[Enforce] timeout after ${totalProcessTime}ms total`, { channel: chanLogin, user: login, duration });
-          this.sendRaw(`PRIVMSG #${chanLogin} :.timeout ${login} ${duration} ${reason}`);
+          log(`[Enforce] timeout sent in ${timeoutExecuteTime}ms, total ${totalProcessTime}ms`, { channel: chanLogin, user: login, duration });
+          const timeoutCommand = `PRIVMSG #${chanLogin} :.timeout ${login} ${duration} ${reason}`;
+          log(`[Enforce] sending timeout command:`, timeoutCommand);
+          this.sendRaw(timeoutCommand);
         } catch (e) {
           log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
         }
