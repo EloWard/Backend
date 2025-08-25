@@ -75,6 +75,18 @@ function json(status: number, data: unknown): Response {
   });
 }
 
+function timestamp(): string {
+  return new Date().toISOString();
+}
+
+function log(message: string, data?: any) {
+  if (data) {
+    console.log(`[${timestamp()}] ${message}`, data);
+  } else {
+    console.log(`[${timestamp()}] ${message}`);
+  }
+}
+
 function toQuery(params: Record<string, string | number | boolean>): string {
   const sp = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) sp.set(k, String(v));
@@ -180,7 +192,7 @@ router.post('/irc/start', async (_req: Request, env: Env, ctx: ExecutionContext)
 
 router.post('/irc/reload', async (_req: Request, env: Env, ctx: ExecutionContext) => {
   try {
-    console.log('[Bot] /irc/reload called');
+    log('[Bot] /irc/reload called');
     const id = env.BOT_MANAGER.idFromName('manager');
     ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
     return json(202, { accepted: true });
@@ -671,7 +683,7 @@ class BotManager {
   state: DurableObjectState;
   env: Env;
   constructor(state: DurableObjectState, env: Env) {
-    console.log('[BotManager] constructor start:', Date.now());
+    log('[BotManager] constructor start');
     this.state = state;
     this.env = env;
     // keep warm more aggressively
@@ -679,7 +691,7 @@ class BotManager {
       const next = Date.now() + 60_000 * 2; // every 2 minutes for better performance  
       try { this.state.setAlarm!(next); } catch {}
     }
-    console.log('[BotManager] constructor end:', Date.now());
+    log('[BotManager] constructor end');
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -701,6 +713,10 @@ class BotManager {
         channels = await Promise.race([channelsPromise, timeoutPromise]);
         const dbEndTime = Date.now();
         console.log('[BotManager] loaded channels', { count: channels.length, dbTime: dbEndTime - dbStartTime });
+        
+        // **DIAGNOSTIC MODE**: Only connect to yomata1 for 1006 disconnect testing
+        channels = channels.filter(ch => ch.channel_login === 'yomata1');
+        console.log('[BotManager] DIAGNOSTIC MODE - only yomata1:', { count: channels.length });
       } catch (e) {
         console.error('[BotManager] channel loading failed/timeout:', e);
         channels = []; // fail gracefully, allow restart to try again
@@ -784,9 +800,10 @@ class IrcClientShard {
   rateLimitSleepMs = 700; // basic pacing for commands
   keepaliveInterval: any = null; // WebSocket keepalive
   modChannels: Set<string> = new Set(); // Channels where bot has mod permissions
+  connectionStartTime = 0; // Track connection duration
 
   constructor(state: DurableObjectState, env: Env) {
-    console.log('[IrcClient] constructor start:', Date.now());
+    log('[IrcClient] constructor start');
     this.state = state;
     this.env = env;
     // keep warm more aggressively
@@ -794,7 +811,7 @@ class IrcClientShard {
       const next = Date.now() + 60_000 * 2; // every 2 minutes for better performance  
       try { this.state.setAlarm!(next); } catch {}
     }
-    console.log('[IrcClient] constructor end:', Date.now());
+    log('[IrcClient] constructor end');
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -907,19 +924,20 @@ class IrcClientShard {
       
       socket.onopen = () => {
         const openTime = Date.now();
+        this.connectionStartTime = openTime; // Track connection start
         clearTimeout(connectTimeout);
         this.ready = false;
         this.didInitialJoin = false;
         this.botLogin = login;
-        console.log('[IRC] socket open, authenticating as', { login, openTime: openTime - connectStartTime });
+        log('[IRC] socket open, authenticating', { login, openTime: openTime - connectStartTime });
         
         // Send auth commands immediately with proper format
         const authToken = token.startsWith('oauth:') ? token : `oauth:${token}`;
-        console.log('[IRC] sending auth...', { tokenFormat: authToken.substring(0, 15) + '...' });
+        log('[IRC] sending auth', { tokenFormat: authToken.substring(0, 15) + '...' });
         this.sendRaw(`PASS ${authToken}`);
         this.sendRaw(`NICK ${login}`);
         this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
-        console.log('[IRC] auth commands sent');
+        log('[IRC] auth commands sent');
         
         // Start keepalive to prevent connection timeout  
         this.startKeepalive();
@@ -927,7 +945,11 @@ class IrcClientShard {
       
       socket.onmessage = (evt: any) => {
         const msgData = String(evt.data || '');
-        console.log('[IRC] raw message received:', msgData);
+        const connectionTime = Date.now() - this.connectionStartTime;
+        // Only log PRIVMSG and PING/PONG for critical debugging
+        if (msgData.includes('PRIVMSG') || msgData.includes('PING') || msgData.includes('PONG')) {
+          log(`[IRC] critical message at ${Math.floor(connectionTime/1000)}s:`, msgData.substring(0, 100));
+        }
         this.handleIrcMessage(msgData);
       };
       
@@ -935,14 +957,28 @@ class IrcClientShard {
         clearTimeout(connectTimeout);
         this.stopKeepalive();
         const closeTime = Date.now();
-        console.error('[IRC] socket closed:', { 
+        const connectionDuration = this.connectionStartTime ? closeTime - this.connectionStartTime : 0;
+        
+        log('[IRC] WEBSOCKET DISCONNECTED - CRITICAL', { 
           code: evt.code, 
           reason: evt.reason, 
           wasClean: evt.wasClean,
+          connectionDuration: `${Math.floor(connectionDuration/1000)}s`,
           totalTime: closeTime - connectStartTime,
           ready: this.ready,
-          joined: this.didInitialJoin
+          joined: this.didInitialJoin,
+          channelsJoined: this.channelSet.size
         }); 
+        
+        // Track 1006 disconnections specifically
+        if (evt.code === 1006) {
+          log('[IRC] 1006 DISCONNECT ANALYSIS', {
+            timeConnected: `${Math.floor(connectionDuration/1000)}s`,
+            expectedKeepalive: '30s intervals',
+            likelyCloudflareIssue: connectionDuration < 120000 // Less than 2 minutes
+          });
+        }
+        
         this.scheduleReconnect(); 
       };
       
@@ -975,48 +1011,57 @@ class IrcClientShard {
 
   async joinAssigned() {
     if (!this.ws || this.ws.readyState !== 1 || !this.ready) {
-      console.log('[IRC] not ready for joins:', { hasSocket: !!this.ws, readyState: this.ws?.readyState, ready: this.ready });
+      log('[IRC] not ready for joins', { hasSocket: !!this.ws, readyState: this.ws?.readyState, ready: this.ready });
       return;
     }
     
     const channels = Array.from(this.channelSet);
     if (channels.length === 0) {
-      console.log('[IRC] no channels to join');
+      log('[IRC] no channels to join');
       return;
     }
     
-    console.log('[IRC] joining channels:', { count: channels.length, interval: this.joinIntervalMs });
+    log('[IRC] starting joins', { count: channels.length, interval: this.joinIntervalMs });
+    const joinStartTime = Date.now();
     
     for (const chan of channels) {
       const now = Date.now();
       if (now - this.lastJoinAt < this.joinIntervalMs) {
         await this.sleep(this.joinIntervalMs - (now - this.lastJoinAt));
       }
-      console.log('[IRC] JOIN', chan);
+      const joinTime = Date.now();
+      log(`[IRC] JOIN ${chan} at +${joinTime - joinStartTime}ms`);
       this.sendRaw(`JOIN ${chan}`);
       this.lastJoinAt = Date.now();
     }
     
-    console.log('[IRC] finished joining all channels');
+    const totalJoinTime = Date.now() - joinStartTime;
+    log(`[IRC] finished joining all channels in ${totalJoinTime}ms`);
   }
 
   async handleIrcMessage(raw: string) {
+    const msgStartTime = Date.now();
     const lines = raw.split('\r\n');
-    console.log('[IRC] processing', lines.length, 'lines');
+    log(`[IRC] processing ${lines.length} lines`);
     for (const line of lines) {
       if (!line) continue;
-      console.log('[IRC] processing line:', line);
+      const lineStartTime = Date.now();
+      
       if (line.startsWith('PING ')) {
-        console.log('[IRC] handling PING');
+        log('[IRC] handling PING');
         this.sendRaw(line.replace('PING', 'PONG'));
         continue;
       }
       const msg = this.parseIrc(line);
       if (!msg) {
-        console.log('[IRC] failed to parse line:', line);
+        log('[IRC] failed to parse line', line);
         continue;
       }
-      console.log('[IRC] parsed message:', { command: msg.command, params: msg.params });
+      
+      const lineProcessTime = Date.now() - lineStartTime;
+      if (msg.command === 'PRIVMSG') {
+        log(`[IRC] parsed PRIVMSG in ${lineProcessTime}ms`, { command: msg.command, params: msg.params?.slice(0,1) });
+      }
       // Handle authentication errors first
       if (msg.command === 'NOTICE' && msg.params?.[1]?.includes('Login unsuccessful')) {
         console.error('[IRC] Authentication failed:', msg.params?.[1]);
@@ -1078,31 +1123,33 @@ class IrcClientShard {
         continue;
       }
       if (msg.command === 'PRIVMSG') {
+        const privmsgStartTime = Date.now();
         const channel = msg.params?.[0] || '';
         const message = msg.params?.[1] || '';
         const login = (msg.prefix?.split('!')[0] || '').toLowerCase();
         const chanLogin = channel.startsWith('#') ? channel.slice(1).toLowerCase() : channel.toLowerCase();
-        console.log('[IRC] PRIVMSG received', { 
+        
+        log('[IRC] PRIVMSG received', { 
           channel, 
           chanLogin, 
           user: login, 
           messageLength: message.length,
-          channelSet: Array.from(this.channelSet).slice(0, 3), 
-          hasChannel: this.channelSet.has(`#${chanLogin}`)
+          hasChannel: this.channelSet.has(`#${chanLogin}`),
+          hasMod: this.modChannels.has(`#${chanLogin}`)
         });
         
         if (!this.channelSet.has(`#${chanLogin}`)) {
-          console.log('[IRC] PRIVMSG ignored - not in assigned channels');
+          log('[IRC] PRIVMSG ignored - not in assigned channels');
           continue;
         }
         
         // Skip if bot lacks mod permissions in this channel
         if (!this.modChannels.has(`#${chanLogin}`)) {
-          console.log('[IRC] PRIVMSG ignored - bot lacks mod permissions in', `#${chanLogin}`);
+          log(`[IRC] PRIVMSG ignored - bot lacks mod permissions in ${chanLogin}`);
           continue;
         }
         
-        console.log('[IRC] PRIVMSG processing', { channel: `#${chanLogin}`, user: login, message });
+        log(`[IRC] PRIVMSG processing started for ${login} in ${chanLogin}`);
 
         // Skip privileged roles using tags
         const badges = this.getBadgeSet(msg.tags?.badges || '');
@@ -1110,20 +1157,28 @@ class IrcClientShard {
 
         // Enforce rules
         try {
+          const enforceStartTime = Date.now();
           const cfg = await getChannelConfig(this.env, chanLogin);
-          if (!cfg || !cfg.bot_enabled) continue;
+          if (!cfg || !cfg.bot_enabled) {
+            log(`[IRC] PRIVMSG ignored - bot disabled for ${chanLogin}`);
+            continue;
+          }
 
           let shouldTimeout = false;
           try {
+            const rankStartTime = Date.now();
             const rankReq = new Request(`https://internal/api/ranks/lol/${encodeURIComponent(login)}`);
             const rankRes = await this.env.RANK_WORKER.fetch(rankReq);
+            const rankTime = Date.now() - rankStartTime;
+            
             let rank: any = null;
             if (rankRes.ok) {
               rank = await rankRes.json();
-              console.log('[Rank] found', { user: login, tier: rank?.rank_tier, division: rank?.rank_division });
+              log(`[Rank] found in ${rankTime}ms`, { user: login, tier: rank?.rank_tier, division: rank?.rank_division });
             } else {
-              console.log('[Rank] not found or error', { user: login, status: rankRes.status });
+              log(`[Rank] not found in ${rankTime}ms`, { user: login, status: rankRes.status });
             }
+            
             const mode = (cfg.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
             if (mode === 'has_rank') {
               shouldTimeout = !(rank && rank.rank_tier);
@@ -1134,19 +1189,26 @@ class IrcClientShard {
               };
               shouldTimeout = threshold.tier ? !meetsMinRank(rank, threshold) : !(rank && rank.rank_tier);
             }
-            console.log('[Enforce] decision', { channel: chanLogin, user: login, mode, shouldTimeout });
-          } catch {}
+            
+            const decisionTime = Date.now() - enforceStartTime;
+            log(`[Enforce] decision in ${decisionTime}ms`, { channel: chanLogin, user: login, mode, shouldTimeout });
+          } catch (e) {
+            log('[Rank] lookup failed', { user: login, error: e });
+          }
 
           if (!shouldTimeout) continue;
 
           // Send timeout via IRC command
+          const timeoutStartTime = Date.now();
           const duration = cfg.timeout_seconds || 30;
           const reason = resolveReasonTemplate(this.env, cfg, login);
           await this.sleep(this.rateLimitSleepMs);
-          console.log('[Enforce] timeout', { channel: chanLogin, user: login, duration });
+          
+          const totalProcessTime = Date.now() - privmsgStartTime;
+          log(`[Enforce] timeout after ${totalProcessTime}ms total`, { channel: chanLogin, user: login, duration });
           this.sendRaw(`PRIVMSG #${chanLogin} :.timeout ${login} ${duration} ${reason}`);
-        } catch {
-          // swallow
+        } catch (e) {
+          log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
         }
       }
     }
@@ -1203,13 +1265,16 @@ class IrcClientShard {
 
   startKeepalive() {
     this.stopKeepalive();
-    console.log('[IRC] starting keepalive');
+    log('[IRC] starting aggressive keepalive - every 30s');
     this.keepaliveInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === 1) {
-        console.log('[IRC] sending keepalive PING');
-        this.sendRaw('PING :tmi.twitch.tv');
+        const connectionTime = Date.now() - this.connectionStartTime;
+        log(`[IRC] sending keepalive PING after ${Math.floor(connectionTime/1000)}s connected`);
+        this.sendRaw('PING :keepalive-test');
+      } else {
+        log(`[IRC] keepalive check - websocket not ready`, { readyState: this.ws?.readyState });
       }
-    }, 120000); // 2 minutes
+    }, 30000); // Every 30 seconds for aggressive testing
   }
 
   stopKeepalive() {
