@@ -216,6 +216,27 @@ router.get('/irc/state', async (req: Request, env: Env) => {
   }
 });
 
+// Debug helper: ask shard to send a test message into a channel
+router.post('/irc/debug/say', async (req: Request, env: Env) => {
+  try {
+    if (!env.IRC_CLIENT) return json(400, { error: 'IRC_CLIENT not configured' });
+    const body = await req.json().catch(() => ({} as any));
+    const channel_login = String(body?.channel_login || 'yomata1').toLowerCase();
+    const message = String(body?.message || 'eloward debug: hello');
+    const shard = Number(body?.shard || 0) || 0;
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/debug/say', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_login, message })
+    });
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'debug failed' });
+  }
+});
+
 // -------- Dashboard Config APIs (HMAC protected) --------
 
 async function hmacValid(env: Env, bodyText: string, signatureHeader: string | null): Promise<boolean> {
@@ -859,6 +880,21 @@ class IrcClientShard {
     if (req.method === 'POST' && url.pathname === '/alarm') {
       // noop warm
       return json(200, { ok: true });
+    }
+    if (req.method === 'POST' && url.pathname === '/debug/say') {
+      try {
+        const body = await req.json().catch(() => ({} as any));
+        const channel_login = String(body?.channel_login || '').toLowerCase();
+        const message = String(body?.message || 'eloward debug: hello');
+        if (!channel_login) return json(400, { error: 'channel_login required' });
+        const chan = `#${channel_login}`;
+        const text = message.length > 400 ? message.slice(0, 400) : message;
+        log('[IRC] DEBUG SAY', { chan, length: text.length });
+        this.sendRaw(`PRIVMSG ${chan} :${text}`);
+        return json(200, { ok: true, chan });
+      } catch (e: any) {
+        return json(500, { error: e?.message || 'failed' });
+      }
     }
     return json(404, { error: 'not found' });
   }
