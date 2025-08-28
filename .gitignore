@@ -3,3 +3,4 @@ node_modules/
 .wrangler/
 keys.txt
 .DS_Store
+twitch-chat-bot/
