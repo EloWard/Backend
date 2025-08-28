@@ -266,6 +266,26 @@ router.post('/irc/debug/say', async (req: Request, env: Env) => {
   }
 });
 
+// Debug helper: request NAMES list from IRC for a channel
+router.post('/irc/debug/names', async (req: Request, env: Env) => {
+  try {
+    if (!env.IRC_CLIENT) return json(400, { error: 'IRC_CLIENT not configured' });
+    const body = await req.json().catch(() => ({} as any));
+    const channel_login = String(body?.channel_login || 'yomata1').toLowerCase();
+    const shard = Number(body?.shard || 0) || 0;
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/debug/names', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_login })
+    });
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'debug names failed' });
+  }
+});
+
 // -------- Dashboard Config APIs (HMAC protected) --------
 
 async function hmacValid(env: Env, bodyText: string, signatureHeader: string | null): Promise<boolean> {
@@ -832,6 +852,52 @@ class BotManager {
 
 export { BotManager };
 
+// Implement alarm to periodically (re)assign channels to IRC shards
+// and keep the manager object warm.
+// Cloudflare Durable Objects will call this method if setAlarm() was used.
+// This helps recover after instance restarts without manual /irc/reload.
+//
+// Note: keep it lightweight; we reuse the same logic as in /reload.
+//
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+BotManager.prototype.alarm = async function alarm(this: any) {
+  try {
+    const startTime = Date.now();
+    const channels = await listEnabledChannels(this.env);
+    console.log('[BotManager.alarm] loaded channels', { count: channels.length });
+    if (!this.env.IRC_CLIENT) {
+      console.warn('[BotManager.alarm] IRC_CLIENT not configured');
+    } else {
+      const shardSize = 50;
+      const total = channels.length;
+      const shardCount = Math.max(1, Math.min(10, Math.ceil(total / shardSize)));
+      const assignments: Array<{ shard: number; channels: any[] }> = Array.from({ length: shardCount }, (_, i) => ({ shard: i, channels: [] }));
+      channels.forEach((ch, idx) => assignments[idx % shardCount].channels.push(ch));
+      const dispatchPromises = assignments.map(async (a) => {
+        const id = this.env.IRC_CLIENT!.idFromName(`irc:${a.shard}`);
+        try {
+          await this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ channels: a.channels }),
+          });
+        } catch (e) {
+          console.error('[BotManager.alarm] assign failed', { shard: a.shard, error: String(e) });
+        }
+      });
+      await Promise.allSettled(dispatchPromises);
+    }
+    console.log('[BotManager.alarm] done', { ms: Date.now() - startTime });
+  } catch (e) {
+    console.error('[BotManager.alarm] failed', e);
+  } finally {
+    if (typeof this.state.setAlarm === 'function') {
+      try { this.state.setAlarm(Date.now() + 120_000); } catch {}
+    }
+  }
+};
+
 // IRC Client Durable Object: maintains WebSocket to Twitch IRC and enforces via /timeout
 class IrcClientShard {
   state: DurableObjectState;
@@ -958,6 +1024,19 @@ class IrcClientShard {
         const text = message.length > 400 ? message.slice(0, 400) : message;
         log('[IRC] DEBUG SAY', { chan, length: text.length });
         this.sendRaw(`PRIVMSG ${chan} :${text}`);
+        return json(200, { ok: true, chan });
+      } catch (e: any) {
+        return json(500, { error: e?.message || 'failed' });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/debug/names') {
+      try {
+        const body = await req.json().catch(() => ({} as any));
+        const channel_login = String(body?.channel_login || '').toLowerCase();
+        if (!channel_login) return json(400, { error: 'channel_login required' });
+        const chan = `#${channel_login}`;
+        log('[IRC] DEBUG NAMES', { chan });
+        this.sendRaw(`NAMES ${chan}`);
         return json(200, { ok: true, chan });
       } catch (e: any) {
         return json(500, { error: e?.message || 'failed' });
@@ -1208,6 +1287,30 @@ class IrcClientShard {
         console.log('[IRC] CAP', msg.params?.join(' '));
         continue;
       }
+      if (msg.command === 'ROOMSTATE') {
+        log('[IRC] ROOMSTATE', { params: msg.params, tags: msg.tags });
+        continue;
+      }
+      if (msg.command === '353') { // NAMES reply
+        log('[IRC] 353 (NAMES) received', { params: msg.params?.slice(0, 2) });
+        continue;
+      }
+      if (msg.command === '366') { // End of NAMES
+        log('[IRC] 366 (End of NAMES)', { params: msg.params?.slice(0, 1) });
+        continue;
+      }
+      if (msg.command === 'PART') {
+        log('[IRC] PART detected', { prefix: msg.prefix, params: msg.params });
+        continue;
+      }
+      if (msg.command === 'USERNOTICE') {
+        log('[IRC] USERNOTICE', { params: msg.params, tags: msg.tags });
+        continue;
+      }
+      if (msg.command === 'WHISPER') {
+        log('[IRC] WHISPER', { params: msg.params, tags: msg.tags });
+        continue;
+      }
       if (msg.command === 'USERSTATE' && msg.params?.[0]) {
         // **TEST 4**: Verify mod permission detection
         const channel = msg.params[0];
@@ -1276,7 +1379,12 @@ class IrcClientShard {
 
         // Skip privileged roles using tags
         const badges = this.getBadgeSet(msg.tags?.badges || '');
-        if (badges.has('broadcaster') || badges.has('moderator') || badges.has('vip')) continue;
+        if (badges.has('broadcaster') || badges.has('moderator') || badges.has('vip')) {
+          log('[IRC] PRIVMSG privileged user skipped', { user: login, badges: Array.from(badges) });
+          // For diagnostics, still log the content from privileged users
+          log('[IRC] PRIVMSG privileged content', { user: login, channel: chanLogin, message });
+          continue;
+        }
 
         // Enforce rules
         try {
@@ -1340,6 +1448,8 @@ class IrcClientShard {
           log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
         }
       }
+      // Fallback: log any unhandled command to aid debugging
+      log('[IRC] UNHANDLED', { command: msg.command, params: msg.params?.slice(0, 2) });
     }
   }
 
