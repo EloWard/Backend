@@ -893,7 +893,7 @@ BotManager.prototype.alarm = async function alarm(this: any) {
     console.error('[BotManager.alarm] failed', e);
   } finally {
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm(Date.now() + 120_000); } catch {}
+      try { this.state.setAlarm(Date.now() + 60_000); } catch {}
     }
   }
 };
@@ -927,6 +927,7 @@ class IrcClientShard {
   framesMax = 200;
   lastJoinReassertAt = 0;
   joinReassertIntervalMs = 60_000; // every 60s
+  statusHeartbeatInterval: any = null; // Testing: frequent status logs
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
@@ -934,9 +935,11 @@ class IrcClientShard {
     this.env = env;
     // keep warm more aggressively
     if (typeof this.state.setAlarm === 'function') {
-      const next = Date.now() + 60_000 * 2; // every 2 minutes for better performance  
+      const next = Date.now() + 15_000; // testing: rehydrate quickly
       try { this.state.setAlarm!(next); } catch {}
     }
+    // Testing: start frequent status heartbeat logs
+    this.startStatusHeartbeat();
     log('[IrcClient] constructor end');
   }
 
@@ -1043,6 +1046,32 @@ class IrcClientShard {
       }
     }
     return json(404, { error: 'not found' });
+  }
+
+  // Testing: frequent status heartbeat logs
+  startStatusHeartbeat() {
+    if (this.statusHeartbeatInterval) return;
+    this.statusHeartbeatInterval = setInterval(() => {
+      const now = Date.now();
+      log('[IRC] STATUS', {
+        ready: this.ready,
+        wsReadyState: this.ws?.readyState,
+        assigned: this.assignedChannels.length,
+        channels: Array.from(this.channelSet),
+        modChannels: Array.from(this.modChannels),
+        lastRawMs: this.lastRawAt ? now - this.lastRawAt : null,
+        lastPrivmsgMs: this.lastPrivmsgAt ? now - this.lastPrivmsgAt : null,
+        lastPingMs: this.lastPingAt ? now - this.lastPingAt : null,
+        connectionSec: this.connectionStartTime ? Math.floor((now - this.connectionStartTime)/1000) : null
+      });
+    }, 5_000);
+  }
+
+  stopStatusHeartbeat() {
+    if (this.statusHeartbeatInterval) {
+      try { clearInterval(this.statusHeartbeatInterval); } catch {}
+      this.statusHeartbeatInterval = null;
+    }
   }
 
   async ensureConnectedAndJoined() {
@@ -1532,6 +1561,7 @@ class IrcClientShard {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
     }
+    this.stopStatusHeartbeat();
   }
 }
 
