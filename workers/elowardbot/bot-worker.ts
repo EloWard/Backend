@@ -216,6 +216,35 @@ router.get('/irc/state', async (req: Request, env: Env) => {
   }
 });
 
+router.get('/irc/metrics', async (req: Request, env: Env) => {
+  try {
+    const u = new URL(req.url);
+    const shard = Number(u.searchParams.get('shard') || '0') || 0;
+    if (!env.IRC_CLIENT) return json(200, { ok: false, note: 'IRC_CLIENT binding not configured' });
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/metrics');
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'metrics failed' });
+  }
+});
+
+router.get('/irc/frames', async (req: Request, env: Env) => {
+  try {
+    const u = new URL(req.url);
+    const shard = Number(u.searchParams.get('shard') || '0') || 0;
+    const limit = Number(u.searchParams.get('limit') || '100') || 100;
+    if (!env.IRC_CLIENT) return json(200, { ok: false, note: 'IRC_CLIENT binding not configured' });
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch(`https://do/frames?limit=${encodeURIComponent(String(limit))}`);
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'frames failed' });
+  }
+});
+
 // Debug helper: ask shard to send a test message into a channel
 router.post('/irc/debug/say', async (req: Request, env: Env) => {
   try {
@@ -821,6 +850,17 @@ class IrcClientShard {
   keepaliveInterval: any = null; // WebSocket keepalive
   modChannels: Set<string> = new Set(); // Channels where bot has mod permissions
   connectionStartTime = 0; // Track connection duration
+  // Diagnostics
+  totalRawFrames = 0;
+  totalPrivmsg = 0;
+  totalPing = 0;
+  lastRawAt = 0;
+  lastPrivmsgAt = 0;
+  lastPingAt = 0;
+  framesRing: string[] = [];
+  framesMax = 200;
+  lastJoinReassertAt = 0;
+  joinReassertIntervalMs = 60_000; // every 60s
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
@@ -880,6 +920,33 @@ class IrcClientShard {
     if (req.method === 'POST' && url.pathname === '/alarm') {
       // noop warm
       return json(200, { ok: true });
+    }
+    if (req.method === 'GET' && url.pathname === '/metrics') {
+      return json(200, {
+        assigned: this.assignedChannels.length,
+        channels: Array.from(this.channelSet),
+        modChannels: Array.from(this.modChannels),
+        connecting: this.connecting,
+        ready: this.ready,
+        didInitialJoin: this.didInitialJoin,
+        hasSocket: !!this.ws && (this.ws as any).readyState,
+        counts: {
+          totalRawFrames: this.totalRawFrames,
+          totalPrivmsg: this.totalPrivmsg,
+          totalPing: this.totalPing,
+        },
+        lastSeenMs: {
+          raw: this.lastRawAt ? Date.now() - this.lastRawAt : null,
+          privmsg: this.lastPrivmsgAt ? Date.now() - this.lastPrivmsgAt : null,
+          ping: this.lastPingAt ? Date.now() - this.lastPingAt : null,
+        }
+      });
+    }
+    if (req.method === 'GET' && url.pathname === '/frames') {
+      const u = new URL(req.url);
+      const limit = Math.max(1, Math.min(500, Number(u.searchParams.get('limit') || '100') || 100));
+      const frames = this.framesRing.slice(-limit);
+      return json(200, { framesCount: frames.length, frames });
     }
     if (req.method === 'POST' && url.pathname === '/debug/say') {
       try {
@@ -981,6 +1048,11 @@ class IrcClientShard {
       socket.onmessage = (evt: any) => {
         const msgData = String(evt.data || '');
         const connectionTime = Date.now() - this.connectionStartTime;
+        // Diagnostics
+        this.totalRawFrames += 1;
+        this.lastRawAt = Date.now();
+        if (this.framesRing.length >= this.framesMax) this.framesRing.shift();
+        this.framesRing.push(msgData);
         
         // **DIAGNOSTIC**: Log ALL messages for complete visibility
         log(`[IRC] RAW MESSAGE at ${Math.floor(connectionTime/1000)}s:`, msgData);
@@ -1087,6 +1159,8 @@ class IrcClientShard {
       const lineStartTime = Date.now();
       
       if (line.startsWith('PING ')) {
+        this.totalPing += 1;
+        this.lastPingAt = Date.now();
         log('[IRC] handling PING');
         this.sendRaw(line.replace('PING', 'PONG'));
         continue;
@@ -1099,6 +1173,8 @@ class IrcClientShard {
       
       const lineProcessTime = Date.now() - lineStartTime;
       if (msg.command === 'PRIVMSG') {
+        this.totalPrivmsg += 1;
+        this.lastPrivmsgAt = Date.now();
         log(`[IRC] parsed PRIVMSG in ${lineProcessTime}ms`, { command: msg.command, params: msg.params?.slice(0,1) });
       }
       // Handle authentication errors first
@@ -1123,6 +1199,8 @@ class IrcClientShard {
             this.didInitialJoin = true;
           }
         }
+        // Ensure echo-message capability so we receive our own PRIVMSG (helps testing)
+        this.sendRaw('CAP REQ :twitch.tv/echo-message');
         continue;
       }
       if (msg.command === 'CAP') {
@@ -1322,6 +1400,16 @@ class IrcClientShard {
         const connectionTime = Date.now() - this.connectionStartTime;
         log(`[IRC] sending keepalive PING after ${Math.floor(connectionTime/1000)}s connected`);
         this.sendRaw('PING :keepalive-test');
+        // Reassert JOIN periodically if idle and assigned
+        const now = Date.now();
+        const idleMs = this.lastRawAt ? now - this.lastRawAt : Number.MAX_SAFE_INTEGER;
+        if (idleMs > this.joinReassertIntervalMs && this.channelSet.size > 0 && now - this.lastJoinReassertAt > this.joinReassertIntervalMs) {
+          this.lastJoinReassertAt = now;
+          for (const chan of this.channelSet) {
+            log('[IRC] reassert JOIN', chan);
+            this.sendRaw(`JOIN ${chan}`);
+          }
+        }
       } else {
         log(`[IRC] keepalive check - websocket not ready`, { readyState: this.ws?.readyState });
       }
