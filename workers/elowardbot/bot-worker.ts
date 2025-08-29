@@ -930,6 +930,8 @@ class IrcClientShard {
   statusHeartbeatInterval: any = null; // Testing: frequent status logs
   // Track pending moderation commands for fallback handling
   pendingTimeouts: Map<string, { variant: 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
+  // Trace mode: dump parsed messages
+  traceAll = true;
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
@@ -1019,6 +1021,26 @@ class IrcClientShard {
       const frames = this.framesRing.slice(-limit);
       return json(200, { framesCount: frames.length, frames });
     }
+    // Test endpoints: trigger PING and inject synthetic PRIVMSG for parsing checks
+    if (req.method === 'POST' && url.pathname === '/debug/ping') {
+      this.sendRaw('PING :manual-test');
+      return json(200, { ok: true, sent: 'PING :manual-test' });
+    }
+    if (req.method === 'POST' && url.pathname === '/debug/privmsg') {
+      try {
+        const body = await req.json().catch(() => ({} as any));
+        const channel_login = String(body?.channel_login || 'yomata1').toLowerCase();
+        const user = String(body?.user || 'synthetic_user');
+        const text = String(body?.text || 'synthetic message');
+        const raw = `:${user}!${user}@${user}.tmi.twitch.tv PRIVMSG #${channel_login} :${text}`;
+        // Push directly into handler as if from server
+        log('[IRC] DEBUG INJECT PRIVMSG', { raw });
+        this.handleIrcMessage(raw + '\r\n');
+        return json(200, { ok: true });
+      } catch (e: any) {
+        return json(500, { error: e?.message || 'failed' });
+      }
+    }
     if (req.method === 'POST' && url.pathname === '/debug/say') {
       try {
         const body = await req.json().catch(() => ({} as any));
@@ -1064,7 +1086,8 @@ class IrcClientShard {
         lastRawMs: this.lastRawAt ? now - this.lastRawAt : null,
         lastPrivmsgMs: this.lastPrivmsgAt ? now - this.lastPrivmsgAt : null,
         lastPingMs: this.lastPingAt ? now - this.lastPingAt : null,
-        connectionSec: this.connectionStartTime ? Math.floor((now - this.connectionStartTime)/1000) : null
+        connectionSec: this.connectionStartTime ? Math.floor((now - this.connectionStartTime)/1000) : null,
+        heartbeatIso: new Date(now).toISOString()
       });
     }, 5_000);
   }
@@ -1228,7 +1251,10 @@ class IrcClientShard {
   }
 
   sendRaw(line: string) {
-    try { if (this.ws && this.ws.readyState === 1) this.ws.send(line); } catch {}
+    try {
+      log('[IRC] >> SEND', { readyState: this.ws?.readyState, line });
+      if (this.ws && this.ws.readyState === 1) this.ws.send(line);
+    } catch {}
   }
 
   async joinAssigned() {
@@ -1323,7 +1349,8 @@ class IrcClientShard {
         continue;
       }
       if (msg.command === '353') { // NAMES reply
-        log('[IRC] 353 (NAMES) received', { params: msg.params?.slice(0, 2) });
+        // Params often like: [me, '=', '#channel', 'name list...']
+        log('[IRC] 353 (NAMES) received', { params: msg.params });
         continue;
       }
       if (msg.command === '366') { // End of NAMES
@@ -1505,7 +1532,10 @@ class IrcClientShard {
         }
       }
       // Fallback: log any unhandled command to aid debugging
-      log('[IRC] UNHANDLED', { command: msg.command, params: msg.params?.slice(0, 2) });
+      log('[IRC] UNHANDLED', { command: msg.command, params: msg.params });
+      if (this.traceAll) {
+        try { log('[IRC] TRACE MSG', msg); } catch {}
+      }
     }
   }
 
