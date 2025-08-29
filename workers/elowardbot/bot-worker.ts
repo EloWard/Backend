@@ -928,6 +928,8 @@ class IrcClientShard {
   lastJoinReassertAt = 0;
   joinReassertIntervalMs = 60_000; // every 60s
   statusHeartbeatInterval: any = null; // Testing: frequent status logs
+  // Track pending moderation commands for fallback handling
+  pendingTimeouts: Map<string, { variant: 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
@@ -1355,7 +1357,20 @@ class IrcClientShard {
         continue;
       }
       if (msg.command === 'NOTICE') {
-        console.warn('[IRC] NOTICE', msg.params?.join(' '));
+        const noticeText = msg.params?.join(' ') || '';
+        console.warn('[IRC] NOTICE', noticeText);
+        // Fallback: if unrecognized_cmd arrives shortly after sending .timeout, retry with /timeout
+        if ((msg.tags?.['msg-id'] || '').includes('unrecognized_cmd')) {
+          const now = Date.now();
+          for (const [key, pend] of Array.from(this.pendingTimeouts.entries())) {
+            if (now - pend.sentAt < 2000 && pend.variant === 'dot') {
+              console.warn('[Enforce] timeout command unrecognized, retrying with slash', { user: pend.user, chan: pend.chan });
+              this.pendingTimeouts.set(key, { ...pend, variant: 'slash', sentAt: now });
+              const cmd = `PRIVMSG ${pend.chan} :/timeout ${pend.user} ${pend.duration} ${pend.reason}`;
+              this.sendRaw(cmd);
+            }
+          }
+        }
         continue;
       }
       if (msg.command === 'RECONNECT') {
@@ -1428,15 +1443,23 @@ class IrcClientShard {
           try {
             const rankStartTime = Date.now();
             const rankReq = new Request(`https://internal/api/ranks/lol/${encodeURIComponent(login)}`);
-            const rankRes = await this.env.RANK_WORKER.fetch(rankReq);
+            // Add 800ms timeout to avoid stalled subrequests during spikes
+            const timeoutPromise = new Promise<Response>((_, reject) => setTimeout(() => reject(new Error('rank timeout')), 800));
+            let rankRes: Response | null = null;
+            try {
+              rankRes = await Promise.race([this.env.RANK_WORKER.fetch(rankReq), timeoutPromise]);
+            } catch (e) {
+              log('[Rank] fetch timed out', { user: login });
+            }
             const rankTime = Date.now() - rankStartTime;
-            
             let rank: any = null;
-            if (rankRes.ok) {
+            if (rankRes && rankRes.ok) {
               rank = await rankRes.json();
               log(`[Rank] found in ${rankTime}ms`, { user: login, tier: rank?.rank_tier, division: rank?.rank_division });
-            } else {
+            } else if (rankRes) {
               log(`[Rank] not found in ${rankTime}ms`, { user: login, status: rankRes.status });
+            } else {
+              log('[Rank] no response (timeout)', { user: login, ms: rankTime });
             }
             
             const mode = (cfg.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
@@ -1469,10 +1492,14 @@ class IrcClientShard {
           
           const timeoutExecuteTime = Date.now() - timeoutStartTime;
           const totalProcessTime = Date.now() - privmsgStartTime;
-          log(`[Enforce] timeout sent in ${timeoutExecuteTime}ms, total ${totalProcessTime}ms`, { channel: chanLogin, user: login, duration });
-          const timeoutCommand = `PRIVMSG #${chanLogin} :.timeout ${login} ${duration} ${reason}`;
-          log(`[Enforce] sending timeout command:`, timeoutCommand);
-          this.sendRaw(timeoutCommand);
+          log(`[Enforce] timeout sending in ${timeoutExecuteTime}ms, total ${totalProcessTime}ms`, { channel: chanLogin, user: login, duration });
+          const chan = `#${chanLogin}`;
+          // Try dot variant first
+          const key = `${chan}:${login}`;
+          const dotCmd = `PRIVMSG ${chan} :.timeout ${login} ${duration} ${reason}`;
+          log('[Enforce] sending timeout command (dot)', dotCmd);
+          this.pendingTimeouts.set(key, { variant: 'dot', chan, user: login, duration, reason, sentAt: Date.now() });
+          this.sendRaw(dotCmd);
         } catch (e) {
           log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
         }
