@@ -286,6 +286,38 @@ router.post('/irc/debug/names', async (req: Request, env: Env) => {
   }
 });
 
+// Debug helper: send a PING via live socket (for connection testing)
+router.post('/irc/debug/ping', async (_req: Request, env: Env) => {
+  try {
+    if (!env.IRC_CLIENT) return json(400, { error: 'IRC_CLIENT not configured' });
+    const id = env.IRC_CLIENT.idFromName(`irc:0`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/debug/ping', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'debug ping failed' });
+  }
+});
+
+// Debug helper: inject a synthetic PRIVMSG into the parser (without Twitch delivery)
+router.post('/irc/debug/privmsg', async (req: Request, env: Env) => {
+  try {
+    if (!env.IRC_CLIENT) return json(400, { error: 'IRC_CLIENT not configured' });
+    const body = await req.json().catch(() => ({} as any));
+    const shard = Number(body?.shard || 0) || 0;
+    const id = env.IRC_CLIENT.idFromName(`irc:${shard}`);
+    const res = await env.IRC_CLIENT.get(id).fetch('https://do/debug/privmsg', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_login: body?.channel_login, user: body?.user, text: body?.text })
+    });
+    const data = await res.json().catch(() => ({}));
+    return json(res.status, data);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'debug privmsg failed' });
+  }
+});
+
 // -------- Dashboard Config APIs (HMAC protected) --------
 
 async function hmacValid(env: Env, bodyText: string, signatureHeader: string | null): Promise<boolean> {
