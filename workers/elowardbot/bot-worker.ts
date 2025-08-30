@@ -957,6 +957,10 @@ class IrcClientShard {
       this.channelIdByLogin.clear();
       for (const c of this.assignedChannels) if (c.twitch_id) this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
       await this.state.storage.put('assigned', this.assignedChannels);
+      // ensure alarm is armed
+      if (typeof this.state.setAlarm === 'function') {
+        try { this.state.setAlarm(Date.now() + 15_000); } catch {}
+      }
       // Connect or refresh joins (non-blocking)
       const assignTime = Date.now();
       console.log('[IRC] /assign received', { assigned: this.assignedChannels.length, time: assignTime });
@@ -1070,6 +1074,45 @@ class IrcClientShard {
       }
     }
     return json(404, { error: 'not found' });
+  }
+
+  // Durable Object alarm: fires periodically to keep shard alive and rejoin if needed
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  async alarm() {
+    const now = Date.now();
+    // Log heartbeat with timestamps
+    log('[IRC] ALARM STATUS', {
+      heartbeatIso: new Date(now).toISOString(),
+      ready: this.ready,
+      wsReadyState: this.ws?.readyState,
+      assigned: this.assignedChannels.length,
+      channels: Array.from(this.channelSet),
+      lastRawMs: this.lastRawAt ? now - this.lastRawAt : null,
+      lastPrivmsgMs: this.lastPrivmsgAt ? now - this.lastPrivmsgAt : null,
+      lastPingMs: this.lastPingAt ? now - this.lastPingAt : null
+    });
+
+    // Rehydrate assigned list from storage as a safety net
+    try {
+      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
+      if (stored && (!this.assignedChannels || this.assignedChannels.length === 0)) {
+        this.assignedChannels = stored.map((c: any) => ({ channel_login: String(c.channel_login).toLowerCase(), twitch_id: (c as any).twitch_id || null }));
+        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+      }
+    } catch {}
+
+    // Ensure connection and joins
+    try {
+      await this.ensureConnectedAndJoined();
+    } catch (e) {
+      console.error('[IRC] alarm ensureConnectedAndJoined failed', e);
+    }
+
+    // Re-arm alarm
+    if (typeof this.state.setAlarm === 'function') {
+      try { this.state.setAlarm(Date.now() + 15_000); } catch {}
+    }
   }
 
   // Testing: frequent status heartbeat logs
