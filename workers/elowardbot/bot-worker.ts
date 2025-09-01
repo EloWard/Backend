@@ -648,7 +648,7 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    // TESTING: Only load yomata1 channel
+    // TESTING: only join yomata1
     const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
                WHERE bot_enabled = 1 AND channel_name = 'yomata1'`;
@@ -948,6 +948,7 @@ class IrcClientShard {
   keepaliveInterval: any = null; // WebSocket keepalive
   modChannels: Set<string> = new Set(); // Channels where bot has mod permissions
   connectionStartTime = 0; // Track connection duration
+  reconnectAttempts = 0; // Exponential backoff tracker
   // Diagnostics
   totalRawFrames = 0;
   totalPrivmsg = 0;
@@ -976,6 +977,10 @@ class IrcClientShard {
     }
     // Testing: start frequent status heartbeat logs
     this.startStatusHeartbeat();
+    // Rehydrate assigned channels on cold start / wake so joins persist across hibernation
+    this.rehydrateAssignedFromStorage()
+      .then(() => this.ensureConnectedAndJoined())
+      .catch(e => console.error('[IRC] rehydrate/ensure failed in constructor', e));
     log('[IrcClient] constructor end');
   }
 
@@ -1127,11 +1132,7 @@ class IrcClientShard {
 
     // Rehydrate assigned list from storage as a safety net
     try {
-      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
-      if (stored && (!this.assignedChannels || this.assignedChannels.length === 0)) {
-        this.assignedChannels = stored.map((c: any) => ({ channel_login: String(c.channel_login).toLowerCase(), twitch_id: (c as any).twitch_id || null }));
-        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
-      }
+      await this.rehydrateAssignedFromStorage();
     } catch {}
 
     // Ensure connection and joins
@@ -1239,6 +1240,7 @@ class IrcClientShard {
         this.ready = false;
         this.didInitialJoin = false;
         this.botLogin = login;
+        this.reconnectAttempts = 0; // reset backoff on successful open
         log('[IRC] socket open, authenticating', { login, openTime: openTime - connectStartTime });
         
         // Send auth commands immediately with proper format
@@ -1321,8 +1323,12 @@ class IrcClientShard {
     this.ws = null;
     this.ready = false;
     this.didInitialJoin = false;
-    console.warn('[IRC] scheduling reconnect');
-    setTimeout(() => this.connectIrc(), 3_000 + Math.floor(Math.random() * 4_000));
+    this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 10);
+    const base = 1000; // 1s
+    const jitter = Math.floor(Math.random() * 500);
+    const delay = Math.min(32_000, base * Math.pow(2, this.reconnectAttempts)) + jitter;
+    console.warn('[IRC] scheduling reconnect', { attempts: this.reconnectAttempts, delay });
+    setTimeout(() => this.connectIrc(), delay);
   }
 
   sendRaw(line: string) {
@@ -1694,6 +1700,22 @@ class IrcClientShard {
       this.keepaliveInterval = null;
     }
     this.stopStatusHeartbeat();
+  }
+
+  // Reload assigned channels from storage and rebuild helper maps
+  async rehydrateAssignedFromStorage() {
+    try {
+      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
+      if (stored && Array.isArray(stored)) {
+        this.assignedChannels = stored.map((c: any) => ({ channel_login: String(c.channel_login).toLowerCase(), twitch_id: (c as any).twitch_id || null }));
+        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+        this.channelIdByLogin.clear();
+        for (const c of this.assignedChannels) if ((c as any).twitch_id) this.channelIdByLogin.set((c as any).channel_login, String((c as any).twitch_id));
+        log('[IRC] STATE RELOADED', { assigned: this.assignedChannels.length });
+      }
+    } catch (e) {
+      console.error('[IRC] failed to rehydrate assigned state', e);
+    }
   }
 }
 
