@@ -52,7 +52,7 @@ const router = Router();
 const BOT_SCOPES = [
   'chat:read',
   'chat:edit',
-  'channel:moderate', // Required for timeout/ban via Helix API (replaces deprecated IRC commands)
+  'moderator:manage:banned_users', // Required for timeout/ban via Helix API (replaces deprecated IRC commands)
 ];
 const BROADCASTER_SCOPES = ['channel:bot'];
 
