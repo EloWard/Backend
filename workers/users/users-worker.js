@@ -96,6 +96,10 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleUserLookup(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
+      } else if (url.pathname.includes('/user/riot-fallback')) {
+        response = request.method === 'POST'
+          ? await handleRiotDataFallback(request, env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/health')) {
         response = new Response(JSON.stringify({ status: 'ok' }), {
           headers: { 'Content-Type': 'application/json' }
@@ -486,6 +490,74 @@ async function handleUserLookup(request, env, corsHeaders) {
     return createErrorResponse(
       error.message === 'Invalid JSON' ? 400 : 500,
       error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to lookup user',
+      error.message === 'Invalid JSON' ? null : error.message,
+      corsHeaders
+    );
+  }
+}
+
+/**
+ * Handles riot data fallback lookup by twitch_id
+ * Allows users to retrieve their own riot data if it exists in the database
+ */
+async function handleRiotDataFallback(request, env, corsHeaders) {
+  try {
+    const body = await parseRequestBody(request);
+    const { twitch_id } = body;
+    
+    if (!twitch_id) {
+      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+    
+    // First, get the twitch username from the users table
+    const userQuery = `
+      SELECT channel_name FROM \`users\` 
+      WHERE twitch_id = ?
+      LIMIT 1
+    `;
+    
+    const userResult = await env.DB.prepare(userQuery).bind(twitch_id).first();
+    
+    if (!userResult) {
+      return createErrorResponse(404, 'User not found', null, corsHeaders);
+    }
+    
+    // Now look up riot data using the twitch username
+    const riotQuery = `
+      SELECT riot_puuid, riot_id, rank_tier, rank_division, lp, region
+      FROM lol_ranks 
+      WHERE twitch_username = ?
+      LIMIT 1
+    `;
+    
+    const riotResult = await env.DB.prepare(riotQuery).bind(userResult.channel_name).first();
+    
+    if (!riotResult) {
+      return createErrorResponse(404, 'No riot account found for this user', null, corsHeaders);
+    }
+    
+    // Return the riot data needed by the extension
+    return new Response(JSON.stringify({ 
+      success: true,
+      riot_data: {
+        puuid: riotResult.riot_puuid,
+        riotId: riotResult.riot_id,
+        rankInfo: {
+          tier: riotResult.rank_tier,
+          rank: riotResult.rank_division,
+          leaguePoints: riotResult.lp
+        },
+        region: riotResult.region
+      }
+    }), { 
+      status: 200,
+      headers: corsHeaders
+    });
+  } catch (error) {
+    console.error('Error in riot data fallback lookup:', error);
+    return createErrorResponse(
+      error.message === 'Invalid JSON' ? 400 : 500,
+      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to lookup riot data',
       error.message === 'Invalid JSON' ? null : error.message,
       corsHeaders
     );
