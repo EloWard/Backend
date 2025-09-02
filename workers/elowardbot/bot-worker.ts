@@ -648,15 +648,30 @@ type ChannelConfig = {
 };
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
+  const startTime = Date.now();
+  log('[listEnabledChannels] START');
+  
   try {
     // PRODUCTION: Load all enabled channels (removed test filter)
     const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
                WHERE bot_enabled = 1`;
+    
+    const dbStartTime = Date.now();
     const res = await env.DB.prepare(q).all();
+    const dbDuration = Date.now() - dbStartTime;
+    
     const rows = res?.results || [];
+    log('[listEnabledChannels] END - Success', { 
+      duration: Date.now() - startTime,
+      dbDuration,
+      channelCount: rows.length,
+      channels: rows.map((r: any) => r.channel_login).slice(0, 5) // First 5 channels for debugging
+    });
+    
     return rows as ChannelConfig[];
-  } catch {
+  } catch (e) {
+    log('[listEnabledChannels] END - Error', { duration: Date.now() - startTime, error: String(e) });
     return [];
   }
 }
@@ -740,15 +755,33 @@ function romanOrNumberToDivision(div: any): number {
 }
 
 async function getBotUserAndToken(env: Env): Promise<{ access: string; refresh?: string; expires_at?: number; user?: { id: string; login: string } } | null> {
+  const startTime = Date.now();
+  log('[getBotUserAndToken] START');
+  
   try {
+    const kvStartTime = Date.now();
     const raw = (await env.BOT_KV.get('bot_tokens', 'json')) as any;
-    if (!raw?.tokens?.access_token) return null;
+    log('[getBotUserAndToken] KV fetch completed', { duration: Date.now() - kvStartTime });
+    
+    if (!raw?.tokens?.access_token) {
+      log('[getBotUserAndToken] END - No access token found', { duration: Date.now() - startTime });
+      return null;
+    }
     let access = raw.tokens.access_token as string;
     let refresh = raw.tokens.refresh_token as string | undefined;
     let exp = raw.tokens.expires_at as number | undefined;
     
+    log('[getBotUserAndToken] Token info', { 
+      hasAccess: !!access, 
+      hasRefresh: !!refresh, 
+      expiresAt: exp, 
+      expiresInMinutes: exp ? Math.round((exp - Date.now()) / 60000) : null,
+      needsRefresh: refresh && exp && Date.now() > exp - 60_000
+    });
+    
     // Only refresh if token expires soon and we have refresh token
     if (refresh && exp && Date.now() > exp - 60_000) {
+      log('[getBotUserAndToken] Token needs refresh - starting refresh process');
       try {
         // Add timeout to token refresh to prevent hanging
         const refreshPromise = refreshUserToken(env, refresh);
@@ -767,16 +800,23 @@ async function getBotUserAndToken(env: Env): Promise<{ access: string; refresh?:
           tokens: { access_token: access, refresh_token: refresh, expires_at: exp } 
         })).catch(e => console.error('[Token] KV put failed:', e));
         
-        console.log('[Token] refreshed successfully');
+        log('[getBotUserAndToken] Token refresh successful', { newExpiresInMinutes: Math.round((exp - Date.now()) / 60000) });
       } catch (e) {
-        console.error('[Token] refresh failed, using existing token:', e);
+        log('[getBotUserAndToken] Token refresh failed - using existing token', { error: String(e) });
         // Use existing token even if refresh fails
       }
     }
     
-    return { access, refresh, expires_at: exp, user: raw.user };
+    const result = { access, refresh, expires_at: exp, user: raw.user };
+    log('[getBotUserAndToken] END - Success', { 
+      duration: Date.now() - startTime,
+      hasUser: !!result.user,
+      userLogin: result.user?.login,
+      tokenLength: access?.length
+    });
+    return result;
   } catch (e) {
-    console.error('[Token] getBotUserAndToken failed:', e);
+    log('[getBotUserAndToken] END - Error', { duration: Date.now() - startTime, error: String(e) });
     return null;
   }
 }
@@ -1191,18 +1231,33 @@ class IrcClientShard {
 
   // Timeout user via Helix API (more reliable than IRC commands)
   async timeoutViaHelix(channelLogin: string, userLogin: string, duration: number, reason: string) {
+    const startTime = Date.now();
+    log('[timeoutViaHelix] START', { channelLogin, userLogin, duration, reason });
+    
+    const tokenStartTime = Date.now();
     const bot = await getBotUserAndToken(this.env);
+    log('[timeoutViaHelix] Token fetch completed', { duration: Date.now() - tokenStartTime, hasBot: !!bot });
+    
     if (!bot?.access || !bot?.user?.id) {
-      throw new Error('No bot token available');
+      const error = 'No bot token available';
+      log('[timeoutViaHelix] END - Error (no token)', { duration: Date.now() - startTime, error });
+      throw new Error(error);
     }
 
     // Get channel ID from our stored mapping or fetch it
     const channelId = this.channelIdByLogin.get(channelLogin);
+    log('[timeoutViaHelix] Channel ID lookup', { channelLogin, channelId, hasMapping: !!channelId });
+    
     if (!channelId) {
-      throw new Error(`Channel ID not found for ${channelLogin}`);
+      const error = `Channel ID not found for ${channelLogin}`;
+      log('[timeoutViaHelix] END - Error (no channel ID)', { duration: Date.now() - startTime, error });
+      throw new Error(error);
     }
 
     // Get user ID by username
+    const userLookupStartTime = Date.now();
+    log('[timeoutViaHelix] Looking up user ID', { userLogin });
+    
     const userResp = await fetch(`https://api.twitch.tv/helix/users?login=${userLogin}`, {
       headers: {
         'Authorization': `Bearer ${bot.access}`,
@@ -1210,17 +1265,39 @@ class IrcClientShard {
       },
     });
 
+    const userLookupDuration = Date.now() - userLookupStartTime;
+    log('[timeoutViaHelix] User lookup response', { 
+      duration: userLookupDuration, 
+      status: userResp.status, 
+      ok: userResp.ok 
+    });
+
     if (!userResp.ok) {
-      throw new Error(`Failed to get user ID for ${userLogin}: ${userResp.status}`);
+      const error = `Failed to get user ID for ${userLogin}: ${userResp.status}`;
+      log('[timeoutViaHelix] END - Error (user lookup failed)', { duration: Date.now() - startTime, error });
+      throw new Error(error);
     }
 
     const userData = await userResp.json();
     const userId = userData.data?.[0]?.id;
+    log('[timeoutViaHelix] User data parsed', { userId, hasUser: !!userId });
+    
     if (!userId) {
-      throw new Error(`User ${userLogin} not found`);
+      const error = `User ${userLogin} not found`;
+      log('[timeoutViaHelix] END - Error (user not found)', { duration: Date.now() - startTime, error });
+      throw new Error(error);
     }
 
     // Send timeout via Helix API
+    const timeoutStartTime = Date.now();
+    log('[timeoutViaHelix] Sending timeout request', { 
+      channelId, 
+      moderatorId: bot.user.id, 
+      userId, 
+      duration, 
+      reason 
+    });
+    
     const timeoutResp = await fetch(`https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${channelId}&moderator_id=${bot.user.id}`, {
       method: 'POST',
       headers: {
@@ -1237,12 +1314,33 @@ class IrcClientShard {
       }),
     });
 
+    const timeoutDuration = Date.now() - timeoutStartTime;
+    log('[timeoutViaHelix] Timeout request response', { 
+      duration: timeoutDuration, 
+      status: timeoutResp.status, 
+      ok: timeoutResp.ok 
+    });
+
     if (!timeoutResp.ok) {
       const errorText = await timeoutResp.text();
-      throw new Error(`Helix timeout failed: ${timeoutResp.status} ${errorText}`);
+      const error = `Helix timeout failed: ${timeoutResp.status} ${errorText}`;
+      log('[timeoutViaHelix] END - Error (timeout failed)', { 
+        duration: Date.now() - startTime, 
+        error, 
+        status: timeoutResp.status,
+        errorText 
+      });
+      throw new Error(error);
     }
 
-    return await timeoutResp.json();
+    const result = await timeoutResp.json();
+    log('[timeoutViaHelix] END - Success', { 
+      duration: Date.now() - startTime,
+      totalSteps: 'token->channelId->userId->timeout',
+      result: result
+    });
+    
+    return result;
   }
 
   // CRITICAL FIX: Always reload state from storage to handle hibernation
