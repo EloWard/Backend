@@ -648,10 +648,10 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    // TESTING: Only load yomata1 channel
+    // PRODUCTION: Load all enabled channels (removed test filter)
     const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
-               WHERE bot_enabled = 1 AND channel_name = 'yomata1'`;
+               WHERE bot_enabled = 1`;
     const res = await env.DB.prepare(q).all();
     const rows = res?.results || [];
     return rows as ChannelConfig[];
@@ -964,14 +964,28 @@ class IrcClientShard {
   pendingTimeouts: Map<string, { variant: 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
   // Trace mode: dump parsed messages
   traceAll = true;
+  // Reconnection attempt counter for exponential backoff
+  reconnectAttempts = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
     this.state = state;
     this.env = env;
-    // keep warm more aggressively
+    
+    // CRITICAL: Always reload state from storage on constructor wake-up
+    this.reloadStateFromStorage().then(() => {
+      log('[IrcClient] state reloaded from storage on constructor');
+      // After state reload, ensure connection
+      this.ensureConnectedAndJoined().catch(e => {
+        console.error('[IrcClient] constructor connection failed:', e);
+      });
+    }).catch(e => {
+      console.error('[IrcClient] constructor state reload failed:', e);
+    });
+    
+    // Aggressive anti-hibernation: 5s alarm instead of 15s
     if (typeof this.state.setAlarm === 'function') {
-      const next = Date.now() + 15_000; // testing: rehydrate quickly
+      const next = Date.now() + 5_000; // Reduced from 15s to 5s
       try { this.state.setAlarm!(next); } catch {}
     }
     // Testing: start frequent status heartbeat logs
@@ -1114,7 +1128,7 @@ class IrcClientShard {
   async alarm() {
     const now = Date.now();
     // Log heartbeat with timestamps
-    log('[IRC] ALARM STATUS', {
+    log('[IRC] ALARM FIRED', {
       heartbeatIso: new Date(now).toISOString(),
       ready: this.ready,
       wsReadyState: this.ws?.readyState,
@@ -1125,25 +1139,25 @@ class IrcClientShard {
       lastPingMs: this.lastPingAt ? now - this.lastPingAt : null
     });
 
-    // Rehydrate assigned list from storage as a safety net
-    try {
-      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
-      if (stored && (!this.assignedChannels || this.assignedChannels.length === 0)) {
-        this.assignedChannels = stored.map((c: any) => ({ channel_login: String(c.channel_login).toLowerCase(), twitch_id: (c as any).twitch_id || null }));
-        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
-      }
-    } catch {}
+    // ALWAYS reload state from storage (remove conditional check)
+    await this.reloadStateFromStorage();
 
-    // Ensure connection and joins
+    // Aggressive anti-idle: if no activity for >30s, send harmless command
+    if (this.ready && this.ws?.readyState === 1 && this.lastRawAt && (now - this.lastRawAt) > 30_000) {
+      log('[IRC] ANTI-IDLE: sending harmless PING due to >30s inactivity');
+      this.sendRaw('PING :anti-idle-keepalive');
+    }
+
+    // Ensure connection and joins ALWAYS
     try {
       await this.ensureConnectedAndJoined();
     } catch (e) {
       console.error('[IRC] alarm ensureConnectedAndJoined failed', e);
     }
 
-    // Re-arm alarm
+    // Re-arm alarm with 5s interval (aggressive)
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm(Date.now() + 15_000); } catch {}
+      try { this.state.setAlarm(Date.now() + 5_000); } catch {}
     }
   }
 
@@ -1171,6 +1185,34 @@ class IrcClientShard {
     if (this.statusHeartbeatInterval) {
       try { clearInterval(this.statusHeartbeatInterval); } catch {}
       this.statusHeartbeatInterval = null;
+    }
+  }
+
+  // CRITICAL FIX: Always reload state from storage to handle hibernation
+  async reloadStateFromStorage() {
+    try {
+      const stored = (await this.state.storage.get('assigned')) as any[] | undefined;
+      if (stored && stored.length > 0) {
+        this.assignedChannels = stored.map((c: any) => ({ 
+          channel_login: String(c.channel_login).toLowerCase(), 
+          twitch_id: (c as any).twitch_id || null 
+        }));
+        this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+        this.channelIdByLogin.clear();
+        for (const c of this.assignedChannels) {
+          if ((c as any).twitch_id) {
+            this.channelIdByLogin.set((c as any).channel_login, String((c as any).twitch_id));
+          }
+        }
+        log('[IRC] STATE RELOADED from storage', { 
+          channels: this.assignedChannels.length,
+          channelList: this.assignedChannels.map(c => c.channel_login)
+        });
+      } else {
+        log('[IRC] No stored state found or empty channels');
+      }
+    } catch (e) {
+      console.error('[IRC] Failed to reload state from storage:', e);
     }
   }
 
@@ -1321,8 +1363,20 @@ class IrcClientShard {
     this.ws = null;
     this.ready = false;
     this.didInitialJoin = false;
-    console.warn('[IRC] scheduling reconnect');
-    setTimeout(() => this.connectIrc(), 3_000 + Math.floor(Math.random() * 4_000));
+    this.reconnectAttempts++;
+    
+    // Exponential backoff: 1s * 2^attempts, max 32s
+    const backoffMs = Math.min(32_000, 1_000 * Math.pow(2, this.reconnectAttempts));
+    const jitterMs = Math.floor(Math.random() * 1_000); // Add jitter
+    const totalDelayMs = backoffMs + jitterMs;
+    
+    console.warn('[IRC] scheduling reconnect', { 
+      attempt: this.reconnectAttempts, 
+      backoffMs, 
+      totalDelayMs 
+    });
+    
+    setTimeout(() => this.connectIrc(), totalDelayMs);
   }
 
   sendRaw(line: string) {
@@ -1404,6 +1458,7 @@ class IrcClientShard {
       if (msg.command === '001' || msg.command === 'GLOBALUSERSTATE') {
         if (!this.ready) {
           this.ready = true;
+          this.reconnectAttempts = 0; // Reset reconnection counter on successful connection
           console.log('[IRC] ready. Will join channels:', this.channelSet.size);
           if (!this.didInitialJoin) {
             await this.joinAssigned();
