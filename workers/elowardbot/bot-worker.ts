@@ -1724,62 +1724,125 @@ class IrcClientShard {
           continue;
         }
         
-        log(`[IRC] PRIVMSG processing started for ${login} in ${chanLogin}`);
+        log(`[IRC] PRIVMSG processing started for ${login} in ${chanLogin}`, {
+          messagePreview: message.slice(0, 50),
+          tags: msg.tags,
+          assignedChannels: this.assignedChannels.length,
+          modChannels: Array.from(this.modChannels)
+        });
 
         // Skip privileged roles using tags
+        const badgeCheckStartTime = Date.now();
         const badges = this.getBadgeSet(msg.tags?.badges || '');
+        log('[IRC] Badge check completed', { 
+          duration: Date.now() - badgeCheckStartTime,
+          badges: Array.from(badges),
+          rawBadges: msg.tags?.badges
+        });
+        
         if (badges.has('broadcaster') || badges.has('moderator') || badges.has('vip')) {
-          log('[IRC] PRIVMSG privileged user skipped', { user: login, badges: Array.from(badges) });
+          log('[IRC] PRIVMSG privileged user skipped', { 
+            user: login, 
+            badges: Array.from(badges),
+            reason: 'privileged_role'
+          });
           // For diagnostics, still log the content from privileged users
           log('[IRC] PRIVMSG privileged content', { user: login, channel: chanLogin, message });
           continue;
         }
+        
+        log('[IRC] User passed privilege check - proceeding with enforcement', { user: login });
 
         // Enforce rules
         try {
           const enforceStartTime = Date.now();
+          log('[Enforce] Starting enforcement check', { user: login, channel: chanLogin });
+          
+          const configStartTime = Date.now();
           const cfg = await getChannelConfig(this.env, chanLogin);
+          log('[Enforce] Channel config loaded', { 
+            duration: Date.now() - configStartTime,
+            hasConfig: !!cfg,
+            botEnabled: cfg?.bot_enabled,
+            timeoutSeconds: cfg?.timeout_seconds,
+            enforcementMode: cfg?.enforcement_mode
+          });
+          
           if (!cfg || !cfg.bot_enabled) {
-            log(`[IRC] PRIVMSG ignored - bot disabled for ${chanLogin}`);
+            log(`[Enforce] Enforcement skipped - bot disabled for ${chanLogin}`, { hasConfig: !!cfg, botEnabled: cfg?.bot_enabled });
             continue;
           }
 
           let shouldTimeout = false;
+          log('[Enforce] Starting rank check', { user: login, enforcementMode: cfg.enforcement_mode });
+          
           try {
             const rankStartTime = Date.now();
             const rankReq = new Request(`https://internal/api/ranks/lol/${encodeURIComponent(login)}`);
+            log('[Enforce] Rank API request created', { url: rankReq.url });
+            
             // Add 800ms timeout to avoid stalled subrequests during spikes
             const timeoutPromise = new Promise<Response>((_, reject) => setTimeout(() => reject(new Error('rank timeout')), 800));
             let rankRes: Response | null = null;
             try {
               rankRes = await Promise.race([this.env.RANK_WORKER.fetch(rankReq), timeoutPromise]);
+              log('[Enforce] Rank API response received', { status: rankRes?.status, ok: rankRes?.ok });
             } catch (e) {
-              log('[Rank] fetch timed out', { user: login });
+              log('[Enforce] Rank API fetch timed out', { user: login, error: String(e) });
             }
             const rankTime = Date.now() - rankStartTime;
             let rank: any = null;
             if (rankRes && rankRes.ok) {
               rank = await rankRes.json();
-              log(`[Rank] found in ${rankTime}ms`, { user: login, tier: rank?.rank_tier, division: rank?.rank_division });
+              log(`[Enforce] Rank found in ${rankTime}ms`, { 
+                user: login, 
+                tier: rank?.rank_tier, 
+                division: rank?.rank_division,
+                lp: rank?.lp,
+                region: rank?.region
+              });
             } else if (rankRes) {
-              log(`[Rank] not found in ${rankTime}ms`, { user: login, status: rankRes.status });
+              log(`[Enforce] Rank not found in ${rankTime}ms`, { user: login, status: rankRes.status });
             } else {
-              log('[Rank] no response (timeout)', { user: login, ms: rankTime });
+              log('[Enforce] Rank API no response (timeout)', { user: login, duration: rankTime });
             }
             
             const mode = (cfg.enforcement_mode || 'has_rank') as 'has_rank' | 'min_rank';
+            log('[Enforce] Evaluating enforcement rules', { 
+              mode, 
+              hasRank: !!(rank && rank.rank_tier),
+              userTier: rank?.rank_tier,
+              userDivision: rank?.rank_division,
+              minTier: cfg.min_rank_tier,
+              minDivision: cfg.min_rank_division
+            });
+            
             if (mode === 'has_rank') {
               shouldTimeout = !(rank && rank.rank_tier);
+              log('[Enforce] has_rank mode evaluation', { shouldTimeout, hasRankTier: !!(rank && rank.rank_tier) });
             } else {
               const threshold = {
                 tier: String(cfg.min_rank_tier || '').toUpperCase(),
                 division: Number(cfg.min_rank_division || 0),
               };
-              shouldTimeout = threshold.tier ? !meetsMinRank(rank, threshold) : !(rank && rank.rank_tier);
+              const meetsThreshold = threshold.tier ? meetsMinRank(rank, threshold) : !!(rank && rank.rank_tier);
+              shouldTimeout = !meetsThreshold;
+              log('[Enforce] min_rank mode evaluation', { 
+                shouldTimeout, 
+                threshold, 
+                meetsThreshold,
+                userRank: rank ? `${rank.rank_tier} ${rank.rank_division}` : 'none'
+              });
             }
             
             const decisionTime = Date.now() - enforceStartTime;
-            log(`[Enforce] decision in ${decisionTime}ms`, { channel: chanLogin, user: login, mode, shouldTimeout });
+            log(`[Enforce] Final decision in ${decisionTime}ms`, { 
+              channel: chanLogin, 
+              user: login, 
+              mode, 
+              shouldTimeout,
+              rankCheckDuration: rankTime
+            });
           } catch (e) {
             log('[Rank] lookup failed', { user: login, error: e });
           }
