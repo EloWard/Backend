@@ -48,10 +48,11 @@ interface Env {
 
 const router = Router();
 
-// Scopes for IRC: chat read/write only
+// Scopes for IRC: chat read/write + moderation (IRC commands deprecated Feb 2023)
 const BOT_SCOPES = [
   'chat:read',
   'chat:edit',
+  'channel:moderate', // Required for timeout/ban via Helix API (replaces deprecated IRC commands)
 ];
 const BROADCASTER_SCOPES = ['channel:bot'];
 
@@ -961,7 +962,7 @@ class IrcClientShard {
   joinReassertIntervalMs = 60_000; // every 60s
   statusHeartbeatInterval: any = null; // Testing: frequent status logs
   // Track pending moderation commands for fallback handling
-  pendingTimeouts: Map<string, { variant: 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
+  pendingTimeouts: Map<string, { variant: 'raw' | 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
   // Trace mode: dump parsed messages
   traceAll = true;
   // Reconnection attempt counter for exponential backoff
@@ -1186,6 +1187,62 @@ class IrcClientShard {
       try { clearInterval(this.statusHeartbeatInterval); } catch {}
       this.statusHeartbeatInterval = null;
     }
+  }
+
+  // Timeout user via Helix API (more reliable than IRC commands)
+  async timeoutViaHelix(channelLogin: string, userLogin: string, duration: number, reason: string) {
+    const bot = await getBotUserAndToken(this.env);
+    if (!bot?.access || !bot?.user?.id) {
+      throw new Error('No bot token available');
+    }
+
+    // Get channel ID from our stored mapping or fetch it
+    const channelId = this.channelIdByLogin.get(channelLogin);
+    if (!channelId) {
+      throw new Error(`Channel ID not found for ${channelLogin}`);
+    }
+
+    // Get user ID by username
+    const userResp = await fetch(`https://api.twitch.tv/helix/users?login=${userLogin}`, {
+      headers: {
+        'Authorization': `Bearer ${bot.access}`,
+        'Client-Id': this.env.TWITCH_CLIENT_ID,
+      },
+    });
+
+    if (!userResp.ok) {
+      throw new Error(`Failed to get user ID for ${userLogin}: ${userResp.status}`);
+    }
+
+    const userData = await userResp.json();
+    const userId = userData.data?.[0]?.id;
+    if (!userId) {
+      throw new Error(`User ${userLogin} not found`);
+    }
+
+    // Send timeout via Helix API
+    const timeoutResp = await fetch(`https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${channelId}&moderator_id=${bot.user.id}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${bot.access}`,
+        'Client-Id': this.env.TWITCH_CLIENT_ID,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        data: {
+          user_id: userId,
+          duration: duration,
+          reason: reason,
+        },
+      }),
+    });
+
+    if (!timeoutResp.ok) {
+      const errorText = await timeoutResp.text();
+      throw new Error(`Helix timeout failed: ${timeoutResp.status} ${errorText}`);
+    }
+
+    return await timeoutResp.json();
   }
 
   // CRITICAL FIX: Always reload state from storage to handle hibernation
@@ -1516,17 +1573,10 @@ class IrcClientShard {
       if (msg.command === 'NOTICE') {
         const noticeText = msg.params?.join(' ') || '';
         console.warn('[IRC] NOTICE', noticeText);
-        // Fallback: if unrecognized_cmd arrives shortly after sending .timeout, retry with /timeout
+        // NOTE: IRC moderation commands (.timeout, /timeout) were deprecated by Twitch on Feb 24, 2023
+        // All moderation must now use Helix API - no IRC fallback is possible
         if ((msg.tags?.['msg-id'] || '').includes('unrecognized_cmd')) {
-          const now = Date.now();
-          for (const [key, pend] of Array.from(this.pendingTimeouts.entries())) {
-            if (now - pend.sentAt < 2000 && pend.variant === 'dot') {
-              console.warn('[Enforce] timeout command unrecognized, retrying with slash', { user: pend.user, chan: pend.chan });
-              this.pendingTimeouts.set(key, { ...pend, variant: 'slash', sentAt: now });
-              const cmd = `PRIVMSG ${pend.chan} :/timeout ${pend.user} ${pend.duration} ${pend.reason}`;
-              this.sendRaw(cmd);
-            }
-          }
+          log('[IRC] Ignoring unrecognized_cmd - IRC moderation commands deprecated since Feb 2023');
         }
         continue;
       }
@@ -1651,12 +1701,21 @@ class IrcClientShard {
           const totalProcessTime = Date.now() - privmsgStartTime;
           log(`[Enforce] timeout sending in ${timeoutExecuteTime}ms, total ${totalProcessTime}ms`, { channel: chanLogin, user: login, duration });
           const chan = `#${chanLogin}`;
-          // Try dot variant first
           const key = `${chan}:${login}`;
-          const dotCmd = `PRIVMSG ${chan} :.timeout ${login} ${duration} ${reason}`;
-          log('[Enforce] sending timeout command (dot)', dotCmd);
-          this.pendingTimeouts.set(key, { variant: 'dot', chan, user: login, duration, reason, sentAt: Date.now() });
-          this.sendRaw(dotCmd);
+          
+          // USE HELIX API ONLY (IRC moderation commands deprecated Feb 24, 2023)
+          try {
+            await this.timeoutViaHelix(chanLogin, login, duration, reason);
+            log('[Enforce] ✅ HELIX timeout successful', { channel: chanLogin, user: login, duration });
+          } catch (helixError) {
+            log('[Enforce] ❌ HELIX timeout failed - no fallback available (IRC deprecated)', { 
+              error: String(helixError), 
+              channel: chanLogin, 
+              user: login 
+            });
+            // Note: IRC commands like .timeout and /timeout were deprecated by Twitch on Feb 24, 2023
+            // The only way to timeout users is via Helix API with proper OAuth scopes
+          }
         } catch (e) {
           log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
         }
