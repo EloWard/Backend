@@ -648,10 +648,10 @@ type ChannelConfig = {
 
 async function listEnabledChannels(env: Env): Promise<ChannelConfig[]> {
   try {
-    // TESTING: only join yomata1
+    // Load all enabled channels (test-only filter removed)
     const q = `SELECT channel_name AS channel_login, twitch_id, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode, min_rank_tier, min_rank_division
                FROM twitch_bot_users
-               WHERE bot_enabled = 1 AND channel_name = 'yomata1'`;
+               WHERE bot_enabled = 1`;
     const res = await env.DB.prepare(q).all();
     const rows = res?.results || [];
     return rows as ChannelConfig[];
