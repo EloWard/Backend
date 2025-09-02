@@ -1001,6 +1001,7 @@ class IrcClientShard {
   lastJoinReassertAt = 0;
   joinReassertIntervalMs = 60_000; // every 60s
   statusHeartbeatInterval: any = null; // Testing: frequent status logs
+
   // Track pending moderation commands for fallback handling
   pendingTimeouts: Map<string, { variant: 'raw' | 'dot' | 'slash'; chan: string; user: string; duration: number; reason: string; sentAt: number } > = new Map();
   // Trace mode: dump parsed messages
@@ -1024,9 +1025,9 @@ class IrcClientShard {
       console.error('[IrcClient] constructor state reload failed:', e);
     });
     
-    // Aggressive anti-hibernation: 5s alarm instead of 15s
+    // Normal alarm interval - let hibernation happen naturally
     if (typeof this.state.setAlarm === 'function') {
-      const next = Date.now() + 5_000; // Reduced from 15s to 5s
+      const next = Date.now() + 30_000; // Normal 30s interval
       try { this.state.setAlarm!(next); } catch {}
     }
     // Testing: start frequent status heartbeat logs
@@ -1085,6 +1086,7 @@ class IrcClientShard {
       // noop warm
       return json(200, { ok: true });
     }
+
     if (req.method === 'GET' && url.pathname === '/metrics') {
       return json(200, {
         assigned: this.assignedChannels.length,
@@ -1196,9 +1198,9 @@ class IrcClientShard {
       console.error('[IRC] alarm ensureConnectedAndJoined failed', e);
     }
 
-    // Re-arm alarm with 5s interval (aggressive)
+    // Re-arm alarm with normal 30s interval
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm(Date.now() + 5_000); } catch {}
+      try { this.state.setAlarm(Date.now() + 30_000); } catch {}
     }
   }
 
@@ -1228,6 +1230,8 @@ class IrcClientShard {
       this.statusHeartbeatInterval = null;
     }
   }
+
+  // Remove external keepalive - let hibernation happen naturally
 
   // Timeout user via Helix API (more reliable than IRC commands)
   async timeoutViaHelix(channelLogin: string, userLogin: string, duration: number, reason: string) {
@@ -1661,6 +1665,8 @@ class IrcClientShard {
         log('🔵 [TEST 4] MOD PERMISSION CHECK', { channel, isMod, mod: msg.tags?.mod, badges: msg.tags?.badges });
         if (isMod) {
           this.modChannels.add(channel);
+          // Persist mod status to survive hibernation
+          this.saveStateToStorage();
           log('🟢 [TEST 4] BOT HAS MOD PERMISSIONS', channel);
         } else {
           this.modChannels.delete(channel);
