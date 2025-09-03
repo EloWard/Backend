@@ -1370,8 +1370,26 @@ class IrcClientShard {
       } else {
         log('[IRC] No stored state found or empty channels');
       }
+      
+      // Also reload mod channels state
+      const storedModChannels = (await this.state.storage.get('modChannels')) as string[] | undefined;
+      if (storedModChannels && storedModChannels.length > 0) {
+        this.modChannels = new Set(storedModChannels);
+        log('[IRC] MOD CHANNELS RELOADED from storage', { modChannels: Array.from(this.modChannels) });
+      }
     } catch (e) {
       console.error('[IRC] Failed to reload state from storage:', e);
+    }
+  }
+
+  // Save current state to storage to survive hibernation
+  async saveStateToStorage() {
+    try {
+      // Save mod channels state
+      await this.state.storage.put('modChannels', Array.from(this.modChannels));
+      log('[IRC] STATE SAVED to storage', { modChannels: Array.from(this.modChannels) });
+    } catch (e) {
+      console.error('[IRC] saveStateToStorage failed:', e);
     }
   }
 
