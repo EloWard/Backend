@@ -202,6 +202,51 @@ router.post('/irc/reload', async (_req: Request, env: Env, ctx: ExecutionContext
   }
 });
 
+// WebSocket endpoint for hibernatable IRC connections
+router.get('/irc/connect', async (req: Request, env: Env) => {
+  log('[Bot] /irc/connect WebSocket upgrade requested');
+  
+  if (!env.IRC_CLIENT) {
+    return json(500, { error: 'IRC_CLIENT not configured' });
+  }
+
+  // Check if this is a WebSocket upgrade request
+  const upgradeHeader = req.headers.get('Upgrade');
+  if (upgradeHeader !== 'websocket') {
+    return json(400, { error: 'Expected WebSocket upgrade' });
+  }
+
+  // Create WebSocket pair for hibernatable connection
+  const [client, server] = new (globalThis as any).WebSocketPair();
+
+  // Get the IRC client DO
+  const shardId = new URL(req.url).searchParams.get('shard') || '0';
+  const id = env.IRC_CLIENT.idFromName(`irc:${shardId}`);
+  const stub = env.IRC_CLIENT.get(id);
+
+  // Pass the server WebSocket to the DO for hibernatable handling
+  const response = await stub.fetch('https://do/websocket', {
+    method: 'POST',
+    headers: {
+      'Upgrade': 'websocket',
+      'Connection': 'Upgrade',
+    },
+    // @ts-ignore - WebSocket as body is valid for hibernatable WebSockets
+    body: server,
+  });
+
+  if (!response.ok) {
+    return json(500, { error: 'Failed to establish WebSocket with DO' });
+  }
+
+  // Return the client WebSocket to establish hibernatable connection
+  return new Response(null, {
+    status: 101,
+    // @ts-ignore - WebSocket response is valid for hibernatable connections
+    webSocket: client,
+  });
+});
+
 // Quick shard state probe: /irc/state?shard=0
 router.get('/irc/state', async (req: Request, env: Env) => {
   try {
@@ -890,23 +935,27 @@ class BotManager {
         const id = this.env.IRC_CLIENT!.idFromName(`irc:${a.shard}`);
         console.log('[BotManager] dispatch /assign', { shard: a.shard, count: a.channels.length, time: shardStartTime });
         
-        const assignPromise = this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channels: a.channels }),
-        });
-        
-        // 10s timeout per shard to prevent hanging
-        const timeoutPromise = new Promise<Response>((_, reject) => 
-          setTimeout(() => reject(new Error(`Shard ${a.shard} assign timeout`)), 10000)
-        );
-        
         try {
+          // First assign channels to the shard
+          const assignPromise = this.env.IRC_CLIENT!.get(id).fetch('https://do/assign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ channels: a.channels }),
+          });
+          
+          const timeoutPromise = new Promise<Response>((_, reject) => 
+            setTimeout(() => reject(new Error(`Shard ${a.shard} assign timeout`)), 10000)
+          );
+          
           await Promise.race([assignPromise, timeoutPromise]);
+          
+          // Then establish hibernatable WebSocket connection
+          await this.establishHibernatableConnection(a.shard);
+          
           const shardEndTime = Date.now();
-          console.log(`[BotManager] shard ${a.shard} assignment completed`, { time: shardEndTime - shardStartTime });
+          console.log(`[BotManager] shard ${a.shard} assignment and connection completed`, { time: shardEndTime - shardStartTime });
         } catch (e) {
-          console.error(`[BotManager] shard ${a.shard} assignment failed:`, e);
+          console.error(`[BotManager] shard ${a.shard} setup failed:`, e);
         }
       });
 
@@ -920,6 +969,74 @@ class BotManager {
       return json(200, { ok: true });
     }
     return json(404, { error: 'not found' });
+  }
+
+  // Establish hibernatable WebSocket connection for a shard
+  async establishHibernatableConnection(shardId: number) {
+    try {
+      console.log(`[BotManager] Establishing hibernatable connection for shard ${shardId}`);
+      
+      // Create WebSocket connection to Twitch IRC
+      const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      
+      // Create WebSocket pair for hibernation
+      const [client, server] = new (globalThis as any).WebSocketPair();
+      
+      // Get the shard DO
+      const id = this.env.IRC_CLIENT!.idFromName(`irc:${shardId}`);
+      const stub = this.env.IRC_CLIENT!.get(id);
+      
+      // Pass the server WebSocket to the DO
+      const response = await stub.fetch('https://do/websocket', {
+        method: 'POST',
+        headers: {
+          'Upgrade': 'websocket',
+          'Connection': 'Upgrade',
+        },
+        // @ts-ignore - WebSocket as body is valid for hibernatable connections
+        body: server,
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Failed to establish hibernatable connection: ${response.status}`);
+      }
+      
+      // Connect the client WebSocket to Twitch IRC
+      ws.addEventListener('open', () => {
+        console.log(`[BotManager] Twitch IRC connection established for shard ${shardId}`);
+      });
+      
+      ws.addEventListener('message', (event) => {
+        // Forward messages from Twitch to the hibernatable WebSocket
+        try {
+          client.send(event.data);
+        } catch (e) {
+          console.error(`[BotManager] Failed to forward message to shard ${shardId}:`, e);
+        }
+      });
+      
+      ws.addEventListener('close', () => {
+        console.log(`[BotManager] Twitch IRC connection closed for shard ${shardId}`);
+        try {
+          client.close();
+        } catch {}
+      });
+      
+      // Forward messages from hibernatable WebSocket to Twitch
+      client.addEventListener('message', (event) => {
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(event.data);
+          }
+        } catch (e) {
+          console.error(`[BotManager] Failed to forward message to Twitch for shard ${shardId}:`, e);
+        }
+      });
+      
+      console.log(`[BotManager] Hibernatable connection established for shard ${shardId}`);
+    } catch (e) {
+      console.error(`[BotManager] Failed to establish hibernatable connection for shard ${shardId}:`, e);
+    }
   }
 }
 
@@ -1026,9 +1143,9 @@ class IrcClientShard {
       console.error('[IrcClient] constructor state reload failed:', e);
     });
     
-    // Set a reasonable alarm interval - let hibernation work properly
+    // With hibernatable WebSockets, we can use longer alarm intervals
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm!(Date.now() + 300_000); } catch {} // 5 minute intervals
+      try { this.state.setAlarm!(Date.now() + 3600_000); } catch {} // 1 hour intervals
     }
     // Remove status heartbeat spam
     // this.startStatusHeartbeat();
@@ -1085,6 +1202,36 @@ class IrcClientShard {
     if (req.method === 'POST' && url.pathname === '/alarm') {
       // noop warm
       return json(200, { ok: true });
+    }
+    
+    if (req.method === 'POST' && url.pathname === '/websocket') {
+      // Handle hibernatable WebSocket from main worker
+      const upgradeHeader = req.headers.get('Upgrade');
+      if (upgradeHeader !== 'websocket') {
+        return json(400, { error: 'Expected WebSocket upgrade' });
+      }
+
+      // Accept the hibernatable WebSocket
+      // @ts-ignore - WebSocket body is valid for hibernatable connections
+      const webSocket = req.body;
+      if (!webSocket) {
+        return json(400, { error: 'No WebSocket provided' });
+      }
+
+      try {
+        // Accept the hibernatable WebSocket
+        // @ts-ignore - accept() method exists on hibernatable WebSockets
+        webSocket.accept();
+        log('[IRC] Hibernatable WebSocket accepted from main worker');
+        
+        // Set this as our main WebSocket connection
+        await this.setupHibernatableWebSocket(webSocket);
+        
+        return json(200, { ok: true, hibernatable: true });
+      } catch (e) {
+        log('[IRC] Failed to accept hibernatable WebSocket', { error: String(e) });
+        return json(500, { error: 'Failed to accept WebSocket' });
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/metrics') {
@@ -1198,9 +1345,9 @@ class IrcClientShard {
       console.error('[IRC] alarm ensureConnectedAndJoined failed', e);
     }
 
-    // Re-arm alarm with reasonable 5-minute interval
+    // Re-arm alarm with 1-hour interval for hibernatable WebSockets
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm(Date.now() + 300_000); } catch {}
+      try { this.state.setAlarm(Date.now() + 3600_000); } catch {}
     }
   }
 
@@ -1231,7 +1378,88 @@ class IrcClientShard {
     }
   }
 
-  // Remove complex hibernation prevention - let WebSocket hibernation work properly
+  // Setup hibernatable WebSocket connection to Twitch IRC
+  async setupHibernatableWebSocket(webSocket: any) {
+    log('[IRC] Setting up hibernatable WebSocket for Twitch IRC');
+    
+    // Close any existing connection
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+    }
+    
+    this.ws = webSocket;
+    this.connecting = true;
+    this.ready = false;
+    this.connectionStartTime = Date.now();
+    
+    // Get bot credentials for IRC authentication
+    const bot = await getBotUserAndToken(this.env);
+    if (!bot?.user?.login || !bot?.access) {
+      log('[IRC] No bot credentials available for hibernatable connection');
+      return;
+    }
+    
+    const login = String(bot.user.login).toLowerCase();
+    const token = bot.access;
+    
+    // Set up WebSocket event handlers
+    webSocket.addEventListener('open', () => {
+      log('[IRC] Hibernatable WebSocket connected to Twitch IRC', { 
+        login, 
+        connectionTime: Date.now() - this.connectionStartTime 
+      });
+      
+      // Authenticate with Twitch IRC
+      const authToken = token.startsWith('oauth:') ? token : `oauth:${token}`;
+      this.sendRaw(`PASS ${authToken}`);
+      this.sendRaw(`NICK ${login}`);
+      this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+      log('[IRC] Hibernatable connection authenticated');
+      
+      this.startKeepalive();
+    });
+    
+    webSocket.addEventListener('message', (event: any) => {
+      const msgData = String(event.data || '');
+      this.handleIrcMessage(msgData);
+    });
+    
+    webSocket.addEventListener('close', (event: any) => {
+      log('[IRC] Hibernatable WebSocket closed', { 
+        code: event.code, 
+        reason: event.reason,
+        wasClean: event.wasClean 
+      });
+      this.handleDisconnection();
+    });
+    
+    webSocket.addEventListener('error', (event: any) => {
+      log('[IRC] Hibernatable WebSocket error', { error: String(event.error || event) });
+      this.handleDisconnection();
+    });
+    
+    // For hibernatable WebSockets, the connection should be established immediately
+    // since it's coming from the main worker
+    log('[IRC] Hibernatable WebSocket setup complete');
+  }
+
+  // Handle WebSocket disconnection
+  handleDisconnection() {
+    log('[IRC] Handling WebSocket disconnection');
+    this.ready = false;
+    this.connecting = false;
+    
+    // Stop keepalive
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
+    
+    // Clear mod channels (will be restored on reconnect)
+    this.modChannels.clear();
+  }
 
   // Timeout user via Helix API (more reliable than IRC commands)
   async timeoutViaHelix(channelLogin: string, userLogin: string, duration: number, reason: string) {
@@ -1813,6 +2041,7 @@ class IrcClientShard {
           }
 
           let shouldTimeout = false;
+          let hasPlus = false;
           log('[Enforce] Starting rank check', { user: login, enforcementMode: cfg.enforcement_mode });
           
           try {
@@ -1833,12 +2062,14 @@ class IrcClientShard {
             let rank: any = null;
             if (rankRes && rankRes.ok) {
               rank = await rankRes.json();
+              hasPlus = rank?.plus_active || false;
               log(`[Enforce] Rank found in ${rankTime}ms`, { 
                 user: login, 
                 tier: rank?.rank_tier, 
                 division: rank?.rank_division,
                 lp: rank?.lp,
-                region: rank?.region
+                region: rank?.region,
+                hasPlus
               });
             } else if (rankRes) {
               log(`[Enforce] Rank not found in ${rankTime}ms`, { user: login, status: rankRes.status });
