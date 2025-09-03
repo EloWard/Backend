@@ -8,7 +8,8 @@ CREATE TABLE lol_ranks (
   rank_division TEXT,
   lp INTEGER DEFAULT 0,
   region TEXT,                        -- Riot API region (e.g., na1, euw1, kr)
-  last_updated INTEGER NOT NULL
+  last_updated INTEGER NOT NULL,
+  plus_active BOOLEAN DEFAULT 0       -- Premium subscription status for badge display (added via migration)
 );
 
 -- Add index for efficient Twitch username lookups (most common search)
