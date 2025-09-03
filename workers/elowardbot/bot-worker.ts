@@ -1008,6 +1008,7 @@ class IrcClientShard {
   traceAll = true;
   // Reconnection attempt counter for exponential backoff
   reconnectAttempts = 0;
+  // Let hibernation work naturally with hibernatable WebSockets
 
   constructor(state: DurableObjectState, env: Env) {
     log('[IrcClient] constructor start');
@@ -1025,13 +1026,12 @@ class IrcClientShard {
       console.error('[IrcClient] constructor state reload failed:', e);
     });
     
-    // Normal alarm interval - let hibernation happen naturally
+    // Set a reasonable alarm interval - let hibernation work properly
     if (typeof this.state.setAlarm === 'function') {
-      const next = Date.now() + 30_000; // Normal 30s interval
-      try { this.state.setAlarm!(next); } catch {}
+      try { this.state.setAlarm!(Date.now() + 300_000); } catch {} // 5 minute intervals
     }
-    // Testing: start frequent status heartbeat logs
-    this.startStatusHeartbeat();
+    // Remove status heartbeat spam
+    // this.startStatusHeartbeat();
     log('[IrcClient] constructor end');
   }
 
@@ -1198,9 +1198,9 @@ class IrcClientShard {
       console.error('[IRC] alarm ensureConnectedAndJoined failed', e);
     }
 
-    // Re-arm alarm with normal 30s interval
+    // Re-arm alarm with reasonable 5-minute interval
     if (typeof this.state.setAlarm === 'function') {
-      try { this.state.setAlarm(Date.now() + 30_000); } catch {}
+      try { this.state.setAlarm(Date.now() + 300_000); } catch {}
     }
   }
 
@@ -1231,7 +1231,7 @@ class IrcClientShard {
     }
   }
 
-  // Remove external keepalive - let hibernation happen naturally
+  // Remove complex hibernation prevention - let WebSocket hibernation work properly
 
   // Timeout user via Helix API (more reliable than IRC commands)
   async timeoutViaHelix(channelLogin: string, userLogin: string, duration: number, reason: string) {
@@ -1440,6 +1440,17 @@ class IrcClientShard {
       
       // @ts-ignore - WebSocket is available in Workers runtime
       const socket: any = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      
+      // Accept hibernatable WebSocket to prevent premature hibernation
+      if (typeof socket.accept === 'function') {
+        try {
+          socket.accept();
+          log('[IRC] Hibernatable WebSocket enabled - proper hibernation handling');
+        } catch (e) {
+          log('[IRC] Hibernatable WebSocket not available, using regular WebSocket', { error: String(e) });
+        }
+      }
+      
       this.ws = socket;
       
       // Add connection timeout
@@ -1755,6 +1766,8 @@ class IrcClientShard {
           modChannels: Array.from(this.modChannels)
         });
 
+        // Let hibernation work naturally with hibernatable WebSockets
+
         // Skip privileged roles using tags
         const badgeCheckStartTime = Date.now();
         const badges = this.getBadgeSet(msg.tags?.badges || '');
@@ -1772,6 +1785,7 @@ class IrcClientShard {
           });
           // For diagnostics, still log the content from privileged users
           log('[IRC] PRIVMSG privileged content', { user: login, channel: chanLogin, message });
+          // No processing tracking needed with hibernatable WebSockets
           continue;
         }
         
@@ -1794,6 +1808,7 @@ class IrcClientShard {
           
           if (!cfg || !cfg.bot_enabled) {
             log(`[Enforce] Enforcement skipped - bot disabled for ${chanLogin}`, { hasConfig: !!cfg, botEnabled: cfg?.bot_enabled });
+            // No processing tracking needed
             continue;
           }
 
@@ -1871,7 +1886,10 @@ class IrcClientShard {
             log('[Rank] lookup failed', { user: login, error: e });
           }
 
-          if (!shouldTimeout) continue;
+          if (!shouldTimeout) {
+            // No processing tracking needed
+            continue;
+          }
 
           // **TEST 5**: Verify message processing pipeline
           log('🟠 [TEST 5] TIMEOUT COMMAND TRIGGERED', { channel: chanLogin, user: login, shouldTimeout });
@@ -1900,9 +1918,12 @@ class IrcClientShard {
             });
             // Note: IRC commands like .timeout and /timeout were deprecated by Twitch on Feb 24, 2023
             // The only way to timeout users is via Helix API with proper OAuth scopes
+          } finally {
+            // No processing tracking needed with hibernatable WebSockets
           }
         } catch (e) {
           log('[Enforce] processing failed', { user: login, channel: chanLogin, error: e });
+          // No processing tracking needed
         }
       }
       // Fallback: log any unhandled command to aid debugging
