@@ -55,6 +55,17 @@ The extension and site use only the active endpoints listed below.
   - `lp` (INTEGER): League points (default: 0)
   - `region` (TEXT): Riot API region (e.g., na1, euw1, kr) (nullable)
   - `last_updated` (INTEGER): Unix timestamp of last update (NOT NULL)
+  - `plus_active` (BOOLEAN): Premium subscription status for badge display (default: 0)
+
+### stripe_events
+- Purpose: Tracks processed Stripe webhook events for idempotency protection
+- Primary Key: `id` (INTEGER AUTOINCREMENT)
+- Columns:
+  - `id` (INTEGER): Auto-incrementing primary key (PRIMARY KEY)
+  - `stripe_event_id` (TEXT): Stripe's event ID for idempotency (UNIQUE NOT NULL)
+  - `event_type` (TEXT): Event type (e.g., invoice.paid, subscription.updated) (NOT NULL)
+  - `processed_at` (INTEGER): Timestamp when event was processed (NOT NULL)
+  - `created_at` (INTEGER): When record was created (default: current timestamp)
 
 ## Worker Architecture
 
@@ -75,7 +86,7 @@ D1 Database
 
 **Riot Auth Worker** (`riotauth-worker.ts`)
 - URL: https://eloward-riotauth.unleashai.workers.dev
-- Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`
+- Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`, `STRIPE_WORKER`
 - Endpoints:
   - `POST /auth/complete` — Status: Active. Completes OAuth and stores rank (server-side only).
   - `POST /riot/refreshrank` — Status: Active. Refreshes rank by PUUID (server-side only; no PUUID returned).
@@ -124,11 +135,15 @@ D1 Database
 
 **Stripe Worker** (`stripe-worker.js`)
 - URL: https://eloward-stripe.unleashai.workers.dev
-- Purpose: Handles Stripe payments and webhooks
+- Purpose: Handles Stripe payments, webhooks, and subscription management
+- Database Access: Direct D1 binding
 - Endpoints:
   - `POST /api/create-checkout-session` — Status: Active (public write).
   - `POST /api/create-portal-session` — Status: Active (public write).
   - `POST /api/webhook` — Status: Active (webhook; raw body verification).
+  - `POST /subscription/status` — Status: Active (public read). Returns subscription status for badge display.
+  - `POST /subscription/upsert` — Status: Active (internal write). Requires `X-Internal-Auth`.
+  - `GET /health?cleanup=true` — Status: Active (maintenance). Optional webhook event cleanup.
 
 #### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
 - URL: https://eloward-bot.unleashai.workers.dev
@@ -225,3 +240,10 @@ D1 Database
 - INDEX: `twitch_username` (for username lookups)
 - INDEX: `riot_id` (for Riot ID lookups)
 - NOTE: `region` column stores Riot API region identifiers (e.g., na1, euw1, kr)
+- NOTE: `plus_active` column synced automatically from subscription changes
+
+### stripe_events table
+- PRIMARY KEY: `id`
+- UNIQUE INDEX: `stripe_event_id` (for idempotency)
+- INDEX: `processed_at` (for cleanup queries)
+- INDEX: `event_type` (for event type filtering)
