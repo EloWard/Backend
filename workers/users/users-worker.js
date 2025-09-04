@@ -524,7 +524,7 @@ async function handleRiotDataFallback(request, env, corsHeaders) {
     
     // Now look up riot data using the twitch username
     const riotQuery = `
-      SELECT riot_puuid, riot_id, rank_tier, rank_division, lp, region
+      SELECT riot_puuid, riot_id, rank_tier, rank_division, lp, region, plus_active
       FROM lol_ranks 
       WHERE twitch_username = ?
       LIMIT 1
@@ -547,7 +547,8 @@ async function handleRiotDataFallback(request, env, corsHeaders) {
           rank: riotResult.rank_division,
           leaguePoints: riotResult.lp
         },
-        region: riotResult.region
+        region: riotResult.region,
+        plus_active: riotResult.plus_active || false
       }
     }), { 
       status: 200,
