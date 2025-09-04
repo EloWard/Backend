@@ -78,19 +78,19 @@ Apply them to your local D1 database using Wrangler.
 
 ## Environment Variables (by worker)
 
-- Riot Auth: `RIOT_CLIENT_ID`, `RIOT_CLIENT_SECRET`, `RIOT_API_KEY`, `RANK_WRITE_KEY|INTERNAL_WRITE_KEY` + service bindings `RANK_WORKER`, `USERS_WORKER`, `TWITCH_AUTH_WORKER`
-- Twitch Auth: `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `USERS_WRITE_KEY|INTERNAL_WRITE_KEY` + service binding `USERS_WORKER`
-- Ranks: `DB` (D1), `RANK_WRITE_KEY|INTERNAL_WRITE_KEY`
-- Users: `DB` (D1), `USERS_WRITE_KEY|INTERNAL_WRITE_KEY`
+- Riot Auth: `RIOT_CLIENT_ID`, `RIOT_CLIENT_SECRET`, `RIOT_API_KEY`, `RANK_WRITE_KEY`, `USERS_WRITE_KEY` + service bindings `RANK_WORKER`, `USERS_WORKER`, `TWITCH_AUTH_WORKER`
+- Twitch Auth: `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `USERS_WRITE_KEY` + service binding `USERS_WORKER`
+- Ranks: `DB` (D1), `RANK_WRITE_KEY`
+- Users: `DB` (D1), `USERS_WRITE_KEY`
 - CDN: `ELOWARD_BADGES` (R2)
 - Stripe: `secret_key`, `WEBHOOK_SECRET`, `price_id`, `DB` (D1)
-- Bot: `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `WORKER_PUBLIC_URL`, `EVENTSUB_SECRET`, `BOT_KV`, `RANK_WORKER`, `DB` (D1) + Durable Objects `BOT_MANAGER`, `IRC_SHARD`
+- Bot: `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `WORKER_PUBLIC_URL`, `EVENTSUB_SECRET`, `BOT_KV`, `RANK_WORKER`, `BOT_WRITE_KEY`, `DB` (D1) + Durable Objects `BOT_MANAGER`, `IRC_SHARD`
 
 See each worker file header for binding specifics.
 
 ## Security
 
-- Write operations require internal auth headers; see `SECURITY.md`.
+- Write operations require service-specific auth headers (e.g., `USERS_WRITE_KEY`, `RANK_WRITE_KEY`, `BOT_WRITE_KEY`).
 - Tokens are not returned to clients from auth workers.
 - Database workers never accept direct public writes.
 

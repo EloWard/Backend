@@ -12,7 +12,7 @@ const worker = {
     // Lightweight internal auth for write operations (POST/DELETE)
     const authorizeInternal = () => {
       const provided = request.headers.get('X-Internal-Auth');
-      const expected = env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+      const expected = env.RANK_WRITE_KEY;
       return Boolean(expected) && provided === expected;
     };
     

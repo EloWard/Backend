@@ -41,9 +41,8 @@ interface Env {
   DB: D1Database;
   // Optional site base url for reasons
   SITE_BASE_URL?: string;
-  // Internal write key for trusted calls from website backend
-  INTERNAL_WRITE_KEY?: string;
-  BOT_WRITE_KEY?: string;
+  // Bot write key for trusted calls from website backend
+  BOT_WRITE_KEY: string;
 }
 
 const router = Router();
@@ -498,7 +497,7 @@ router.post('/dashboard/init', async (req: Request, env: Env) => {
 
 function internalAuthOk(env: Env, req: Request): boolean {
   const provided = req.headers.get('X-Internal-Auth') || '';
-  const expected = (env as any).INTERNAL_WRITE_KEY || (env as any).BOT_WRITE_KEY || '';
+  const expected = (env as any).BOT_WRITE_KEY || '';
   return Boolean(expected) && provided === expected;
 }
 

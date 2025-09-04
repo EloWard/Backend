@@ -21,10 +21,9 @@ interface Env {
   TWITCH_AUTH_WORKER: Fetcher; // Service binding to twitchauth-worker
   USERS_WORKER: Fetcher; // Service binding to users-worker
   STRIPE_WORKER: Fetcher; // Service binding to stripe-worker
-  // Secret for internal service-to-service calls to rank-worker (set in wrangler)
-  RANK_WRITE_KEY?: string;
-  INTERNAL_WRITE_KEY?: string;
-  USERS_WRITE_KEY?: string;
+  // Secret for internal service-to-service calls
+  RANK_WRITE_KEY: string;
+  USERS_WRITE_KEY: string;
 }
 
 // Define interface for token request
@@ -362,7 +361,7 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
     // Step 3: Look up channel_name from users table using twitch_id
     const getUserRequest = new Request('https://users-worker/user/lookup', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Internal-Auth': (env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY || '') },
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Auth': env.USERS_WRITE_KEY },
       body: JSON.stringify({ twitch_id })
     });
 
@@ -429,7 +428,7 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        'X-Internal-Auth': (env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
+        'X-Internal-Auth': env.RANK_WRITE_KEY
       },
       body: JSON.stringify(rankData)
     });
@@ -498,7 +497,7 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Internal-Auth': (env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
+        'X-Internal-Auth': env.RANK_WRITE_KEY
       },
       body: JSON.stringify({ puuid })
     });
@@ -553,7 +552,7 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Internal-Auth': (env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
+        'X-Internal-Auth': env.RANK_WRITE_KEY
       },
       body: JSON.stringify(rankData)
     });
@@ -609,7 +608,7 @@ router.delete('/disconnect', async (request: Request, env: Env) => {
       method: 'DELETE',
       headers: { 
         'Content-Type': 'application/json',
-        'X-Internal-Auth': (env.RANK_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
+        'X-Internal-Auth': env.RANK_WRITE_KEY
       },
       body: JSON.stringify({ puuid })
     });

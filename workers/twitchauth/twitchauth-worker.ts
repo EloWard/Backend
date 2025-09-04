@@ -17,8 +17,7 @@ interface Env {
   TWITCH_CLIENT_ID: string;
   TWITCH_CLIENT_SECRET: string;
   USERS_WORKER: Fetcher; // Service binding to users-worker
-  USERS_WRITE_KEY?: string;
-  INTERNAL_WRITE_KEY?: string;
+  USERS_WRITE_KEY: string;
 }
 
 // Define interface for auth init request
@@ -212,7 +211,7 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        'X-Internal-Auth': (env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY || '')
+        'X-Internal-Auth': env.USERS_WRITE_KEY
       },
       body: JSON.stringify(userDataForStorage),
     });

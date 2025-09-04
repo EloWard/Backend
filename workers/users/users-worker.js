@@ -76,7 +76,7 @@ const usersWorker = {
         if (request.method === 'POST') {
           // Require internal auth for write of Twitch users
           const provided = request.headers.get('X-Internal-Auth');
-          const expected = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+          const expected = env.USERS_WRITE_KEY;
           if (!expected || provided !== expected) {
             response = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
           } else {
@@ -411,7 +411,7 @@ async function handleChannelActiveUpdateById(request, env, corsHeaders) {
 
     // Authorization: internal service-only using secret header
     const providedInternal = request.headers.get('X-Internal-Auth');
-    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+    const expectedInternal = env.USERS_WRITE_KEY;
     if (!expectedInternal || providedInternal !== expectedInternal) {
       return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
     }
@@ -462,7 +462,7 @@ async function handleUserLookup(request, env, corsHeaders) {
     }
     // Require internal auth for this lookup to avoid exposing mappings publicly
     const providedInternal = request.headers.get('X-Internal-Auth');
-    const expectedInternal = env.USERS_WRITE_KEY || env.INTERNAL_WRITE_KEY;
+    const expectedInternal = env.USERS_WRITE_KEY;
     if (!expectedInternal || providedInternal !== expectedInternal) {
       return createErrorResponse(401, 'Unauthorized: missing or invalid internal auth', null, corsHeaders);
     }
