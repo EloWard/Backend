@@ -20,6 +20,7 @@ interface Env {
   RANK_WORKER: Fetcher; // Service binding to rank-worker
   TWITCH_AUTH_WORKER: Fetcher; // Service binding to twitchauth-worker
   USERS_WORKER: Fetcher; // Service binding to users-worker
+  STRIPE_WORKER: Fetcher; // Service binding to stripe-worker
   // Secret for internal service-to-service calls to rank-worker (set in wrangler)
   RANK_WRITE_KEY?: string;
   INTERNAL_WRITE_KEY?: string;
@@ -392,7 +393,26 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
     const leagueData = await leagueResponse.json() as LeagueEntry[];
     const currentRank = leagueData.find(entry => entry.queueType === 'RANKED_SOLO_5x5');
 
-    // Step 5: Store rank data in database (twitch_username field contains channel_name)
+    // Step 5: Check subscription status for plus_active flag
+    let plusActive = false;
+    try {
+      const subRequest = new Request('https://stripe-worker/subscription/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ twitch_id })
+      });
+
+      const subResponse = await env.STRIPE_WORKER.fetch(subRequest);
+      if (subResponse.ok) {
+        const subData = await subResponse.json();
+        plusActive = subData.plus_active || false;
+      }
+    } catch (e) {
+      // Subscription check failed, continue with false
+      console.warn('Subscription status check failed during auth:', e);
+    }
+
+    // Step 6: Store rank data in database with subscription status
     const riotId = `${accountData.gameName}#${accountData.tagLine}`;
     const rankData = {
       riot_puuid: accountData.puuid,
@@ -401,7 +421,8 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
       rank_tier: currentRank ? currentRank.tier : 'UNRANKED',
       rank_division: currentRank ? currentRank.rank : null,
       lp: currentRank ? currentRank.leaguePoints : 0,
-      region: region
+      region: region,
+      plus_active: plusActive
     };
 
     const storeRequest = new Request('https://rank-worker/api/ranks/lol', {
@@ -422,7 +443,7 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
       });
     }
 
-    // Step 6: Return complete user data for frontend
+    // Step 7: Return complete user data for frontend
     return corsResponse(200, {
       status: 'success',
       message: 'Authentication completed successfully',

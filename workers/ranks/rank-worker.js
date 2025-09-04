@@ -72,7 +72,7 @@ function jsonResponse(data, status = 200) {
 
 async function storeRank(request, env) {
   try {
-    const { riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region } = await request.json();
+    const { riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active } = await request.json();
     
     if (!riot_puuid || !twitch_username || !rank_tier) {
       return jsonResponse({ 
@@ -81,27 +81,60 @@ async function storeRank(request, env) {
       }, 400);
     }
     
-    const result = await env.DB.prepare(`
-      INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (riot_puuid) DO UPDATE SET
-        twitch_username = excluded.twitch_username,
-        riot_id = excluded.riot_id,
-        rank_tier = excluded.rank_tier,
-        rank_division = excluded.rank_division,
-        lp = excluded.lp,
-        region = excluded.region,
-        last_updated = excluded.last_updated
-    `).bind(
-      riot_puuid,
-      twitch_username.toLowerCase(),
-      riot_id || null,
-      rank_tier,
-      rank_division || null,
-      lp || 0,
-      region || null,
-      Math.floor(Date.now() / 1000)
-    ).run();
+    // Handle plus_active conditionally - only update if explicitly provided
+    const shouldUpdatePlusActive = plus_active !== undefined;
+    const plusActiveValue = plus_active ? 1 : 0;
+    
+    let result;
+    if (shouldUpdatePlusActive) {
+      // Update plus_active when explicitly provided (e.g., during auth/subscription changes)
+      result = await env.DB.prepare(`
+        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (riot_puuid) DO UPDATE SET
+          twitch_username = excluded.twitch_username,
+          riot_id = excluded.riot_id,
+          rank_tier = excluded.rank_tier,
+          rank_division = excluded.rank_division,
+          lp = excluded.lp,
+          region = excluded.region,
+          plus_active = excluded.plus_active,
+          last_updated = excluded.last_updated
+      `).bind(
+        riot_puuid,
+        twitch_username.toLowerCase(),
+        riot_id || null,
+        rank_tier,
+        rank_division || null,
+        lp || 0,
+        region || null,
+        plusActiveValue,
+        Math.floor(Date.now() / 1000)
+      ).run();
+    } else {
+      // Preserve existing plus_active when not provided (e.g., during rank refresh)
+      result = await env.DB.prepare(`
+        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT (riot_puuid) DO UPDATE SET
+          twitch_username = excluded.twitch_username,
+          riot_id = excluded.riot_id,
+          rank_tier = excluded.rank_tier,
+          rank_division = excluded.rank_division,
+          lp = excluded.lp,
+          region = excluded.region,
+          last_updated = excluded.last_updated
+      `).bind(
+        riot_puuid,
+        twitch_username.toLowerCase(),
+        riot_id || null,
+        rank_tier,
+        rank_division || null,
+        lp || 0,
+        region || null,
+        Math.floor(Date.now() / 1000)
+      ).run();
+    }
     
     return jsonResponse({ 
       success: true, 
@@ -125,7 +158,7 @@ async function storeRank(request, env) {
 async function getRank(username, env) {
   try {
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE twitch_username = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated FROM lol_ranks WHERE twitch_username = ?"
     ).bind(username).first();
     
     if (!result) {
@@ -171,7 +204,7 @@ async function getRankByPuuid(request, env) {
     }
     
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, last_updated FROM lol_ranks WHERE riot_puuid = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(requestedPuuid).first();
     
     if (!result) {

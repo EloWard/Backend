@@ -64,11 +64,50 @@ const stripeWorker = {
       // Initialize Stripe with the secret key from environment variables
       const stripe = new Stripe(env.secret_key);
 
+      // Internal authentication helper
+      const authorizeInternal = () => {
+        const provided = request.headers.get('X-Internal-Auth');
+        const expected = env.INTERNAL_WRITE_KEY;
+        return Boolean(expected) && provided === expected;
+      };
+
       // Route handling for non-webhook routes
       if (url.pathname === '/api/create-checkout-session') {
         response = await handleCreateCheckoutSession(request, env, corsHeaders, stripe);
       } else if (url.pathname === '/api/create-portal-session') {
         response = await handleCreatePortalSession(request, env, corsHeaders, stripe);
+      } else if (url.pathname === '/subscription/status') {
+        if (request.method === 'POST') {
+          response = await handleSubscriptionStatus(request, env, corsHeaders);
+        } else {
+          response = new Response('Method not allowed', { status: 405 });
+        }
+      } else if (url.pathname === '/subscription/upsert') {
+        if (request.method === 'POST') {
+          if (!authorizeInternal()) {
+            response = new Response(JSON.stringify({ error: 'Forbidden' }), { 
+              status: 403, 
+              headers: { 'Content-Type': 'application/json' }
+            });
+          } else {
+            response = await handleSubscriptionUpsert(request, env, corsHeaders);
+          }
+        } else {
+          response = new Response('Method not allowed', { status: 405 });
+        }
+      } else if (url.pathname === '/health') {
+        // Health check endpoint with optional cleanup
+        const doCleanup = url.searchParams.get('cleanup') === 'true';
+        if (doCleanup) {
+          await cleanupOldWebhookEvents(env);
+        }
+        response = new Response(JSON.stringify({ 
+          status: 'ok', 
+          timestamp: new Date().toISOString(),
+          cleanup_performed: doCleanup 
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       } else {
         response = new Response('Not found', { status: 404 });
       }
@@ -210,9 +249,9 @@ async function handleCreatePortalSession(request, env, corsHeaders, stripe) {
   }
 
   try {
-    // Get the Stripe customer ID from the database
+    // Get the Stripe customer ID from the subscriptions table
     const subscribedChannel = await env.DB.prepare(
-      'SELECT stripe_customer_id FROM `users` WHERE twitch_id = ?'
+      'SELECT stripe_customer_id FROM subscriptions WHERE twitch_id = ?'
     ).bind(channelId).first();
 
     if (!subscribedChannel || !subscribedChannel.stripe_customer_id) {
@@ -299,6 +338,32 @@ async function handleWebhook(request, env, stripe) {
     // Log successful webhook receipt
     console.log(`Webhook verified successfully! Event type: ${event.type}, Event ID: ${event.id}`); // Added Event ID
     
+    // Idempotency check - prevent duplicate event processing
+    const eventId = event.id;
+    
+    try {
+      // Check if we've already processed this event
+      const existingEvent = await env.DB.prepare(
+        'SELECT id FROM stripe_events WHERE stripe_event_id = ?'
+      ).bind(eventId).first();
+      
+      if (existingEvent) {
+        console.log(`Webhook event ${eventId} already processed. Skipping.`);
+        return new Response(JSON.stringify({ received: true, duplicate: true }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // Record that we're processing this event
+      await env.DB.prepare(
+        'INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)'
+      ).bind(eventId, event.type).run();
+      
+    } catch (idempotencyError) {
+      console.warn('Idempotency check failed, proceeding with processing:', idempotencyError);
+      // If idempotency check fails, continue processing (better to process twice than not at all)
+    }
+    
     // Create a variable to track which handler was called
     let handlerCalled = null;
     
@@ -360,7 +425,7 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
 
     // Add a small delay to reduce race conditions with other webhooks (invoice.paid might come first)
     // This gives invoice.paid a chance to process before we do
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Increased to 1 second for better sequencing
 
     if (session.mode === 'subscription' && customerId && subscriptionId && channelId && channelName) {
         console.log(`Checkout completed for subscription: ${subscriptionId}, customer: ${customerId}, channel: ${channelName} (ID: ${channelId})`);
@@ -412,63 +477,33 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
         // This ensures we only activate after payment is fully processed
         const isChannelActive = 0; // Always start inactive until payment confirmed via invoice.paid
 
-        // Upsert into the database - but instead of a complex ON CONFLICT query,
-        // we'll first check if the record exists by subscription ID, twitch ID, or customer ID
+        // Use the new subscription upsert endpoint to handle subscription data
         try {
-            // First, try to find the existing record
-            const findBySubscriptionQuery = `
-                SELECT id, channel_active FROM \`users\` 
-                WHERE stripe_subscription_id = ? OR twitch_id = ? OR stripe_customer_id = ?
-                LIMIT 1;
-            `;
-            
-            const existingRecord = await env.DB.prepare(findBySubscriptionQuery)
-                .bind(subscriptionId, channelId, customerId)
-                .first();
-            
-            if (existingRecord) {
-                // Record exists, so update it - but preserve active=1 if already set by invoice.paid
-                // This way we won't deactivate a subscription that's already been activated
-                
-                // First, check if it's already active so we don't overwrite it
-                const currentActive = existingRecord.channel_active || 0;
-                const finalActive = currentActive === 1 ? 1 : isChannelActive; // Keep channel_active=1 if already active
-                
-                const updateQuery = `
-                    UPDATE \`users\` SET
-                        channel_name = ?,
-                        twitch_id = COALESCE(?, twitch_id),
-                        stripe_customer_id = ?,
-                        stripe_subscription_id = ?,
-                                            channel_active = ?,
-                    subscription_end_date = COALESCE(?, subscription_end_date),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            `;
-            
-            await env.DB.prepare(updateQuery)
-                .bind(channelName.toLowerCase(), channelId, customerId, subscriptionId, finalActive, subscriptionEndDate, existingRecord.id)
-                .run();
-            
-            const statusMessage = finalActive === 1 ? 
-                "Preserved existing active status" : 
-                "Set inactive status (waiting for invoice.paid)";
-                
-            console.log(`DB: Updated existing subscription record for ${channelName} (ID: ${channelId}), SubID: ${subscriptionId}. ${statusMessage}`);
-        } else {
-            // No existing record, insert a new one with channel_active=0
-            const insertQuery = `
-                INSERT INTO \`users\` 
-                    (channel_name, twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, channel_active, db_reads, successful_lookups)
-                VALUES (?, ?, ?, ?, ?, ?, 0, 0)
-            `;
-            
-            await env.DB.prepare(insertQuery)
-                .bind(channelName.toLowerCase(), channelId, customerId, subscriptionId, subscriptionEndDate, isChannelActive)
-                    .run();
-                
-                console.log(`DB: Created new subscription record for ${channelName} (ID: ${channelId}), SubID: ${subscriptionId}. Will be activated when payment is confirmed via invoice.paid.`);
+            const subscriptionData = {
+                twitch_id: channelId,
+                stripe_customer_id: customerId,
+                stripe_subscription_id: subscriptionId,
+                subscription_end_date: subscriptionEndDate,
+                plus_active: false // Will be activated by invoice.paid
+            };
+
+            // Call our internal subscription upsert endpoint
+            const upsertResponse = await handleSubscriptionUpsert(
+                new Request('https://internal/subscription/upsert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(subscriptionData)
+                }), 
+                env, 
+                {}
+            );
+
+            if (!upsertResponse.ok) {
+                throw new Error(`Subscription upsert failed: ${upsertResponse.status}`);
             }
+
+            console.log(`DB: Created/updated subscription record for ${channelName} (ID: ${channelId}), SubID: ${subscriptionId}. Will be activated when payment is confirmed via invoice.paid.`);
+            
 
         } catch (dbError) {
             console.error(`Database error during checkout completed for channel ${channelName} (SubID: ${subscriptionId}):`, dbError);
@@ -547,13 +582,15 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
   const customerId = subscription.customer;
   const status = subscription.status;
   
-  // Only deactivate (active=0) for canceled/past_due/unpaid subscriptions
-  const shouldDeactivate = ['canceled', 'past_due', 'unpaid', 'incomplete_expired'].includes(status);
+  // Complete status handling for all Stripe subscription statuses
+  const shouldDeactivate = ['canceled', 'past_due', 'unpaid', 'incomplete_expired', 'paused'].includes(status);
   
-  // Activate (active=1) if Stripe status is 'active'
-  // Note: 'trialing' status from Stripe would also normally be considered active in our system,
-  // but we're not using trials so we only need to check for 'active'
-  const shouldActivate = status === 'active' && !shouldDeactivate;
+  // Activate for active subscriptions and trialing subscriptions (premium during trial)
+  // Also activate for incomplete if it becomes active later via invoice.paid
+  const shouldActivate = ['active', 'trialing'].includes(status) && !shouldDeactivate;
+  
+  // Special handling for incomplete subscriptions - keep current status, let invoice.paid decide
+  const shouldMaintainStatus = ['incomplete'].includes(status);
   
   let subscriptionEndDate = null;
   
@@ -580,121 +617,43 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
       return;
   }
   
-  // Update based on stripe_subscription_id
+  // Use the new subscription upsert endpoint to handle subscription data
   try {
-    // First check if the record exists
-    const findQuery = `
-        SELECT id, channel_active FROM \`users\` 
-        WHERE stripe_subscription_id = ?
-        LIMIT 1
-    `;
-    
-    const existingRecord = await env.DB.prepare(findQuery)
-      .bind(subscriptionId)
-      .first();
-      
-    if (existingRecord) {
-      // The update query depends on whether we're changing active status
-      let updateQuery;
-      let bindings;
-      
-      if (shouldDeactivate) {
-        // If we're deactivating the subscription
-        updateQuery = `
-            UPDATE \`users\` SET 
-                channel_active = 0, 
-                stripe_customer_id = ?,
-                channel_name = COALESCE(?, channel_name),
-                twitch_id = COALESCE(?, twitch_id),
-                subscription_end_date = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        `;
-        bindings = [customerId, channelName, channelId, subscriptionEndDate, existingRecord.id];
-        
-        await env.DB.prepare(updateQuery)
-          .bind(...bindings)
-          .run();
-          
-        console.log(`DB: Set subscription ${subscriptionId} to channel_active=0 due to status: ${status}`);
-      } else if (shouldActivate && existingRecord.channel_active !== 1) {
-        // If status is 'active' and record isn't already active, set channel_active=1
-        updateQuery = `
-            UPDATE \`users\` SET 
-                channel_active = 1,
-                stripe_customer_id = ?,
-                channel_name = COALESCE(?, channel_name),
-                twitch_id = COALESCE(?, twitch_id),
-                subscription_end_date = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        `;
-        bindings = [customerId, channelName, channelId, subscriptionEndDate, existingRecord.id];
-        
-        await env.DB.prepare(updateQuery)
-          .bind(...bindings)
-          .run();
-          
-        console.log(`DB: Set subscription ${subscriptionId} to channel_active=1 from subscription.updated because status is ${status}`);
-      } else {
-        // Otherwise, update info but don't change active status
-        updateQuery = `
-            UPDATE \`subscribed-channels\` SET 
-                stripe_customer_id = ?,
-                channel_name = COALESCE(?, channel_name),
-                twitch_id = COALESCE(?, twitch_id),
-                subscription_end_date = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        `;
-        bindings = [customerId, channelName, channelId, subscriptionEndDate, existingRecord.id];
-        
-        await env.DB.prepare(updateQuery)
-          .bind(...bindings)
-          .run();
-          
-        console.log(`DB: Updated subscription ${subscriptionId} info without changing active status (current channel_active=${existingRecord.channel_active})`);
-      }
-      
-              // Add verification step for subscription active status
-        const verifyQuery = `
-            SELECT channel_active FROM \`users\` 
-            WHERE stripe_subscription_id = ?
-            LIMIT 1
-        `;
-      
-      const verifyResult = await env.DB.prepare(verifyQuery)
-          .bind(subscriptionId)
-          .first();
-          
-      if (verifyResult) {
-          console.log(`VERIFICATION: After subscription.updated, subscription ${subscriptionId} channel_active status is: ${verifyResult.channel_active}`);
-      }
+    let plusActiveValue;
+    if (shouldActivate) {
+      plusActiveValue = true; // Activate for active/trialing subscriptions
+    } else if (shouldDeactivate) {
+      plusActiveValue = false; // Deactivate for failed/canceled subscriptions
     } else {
-      console.warn(`DB: Subscription ${subscriptionId} not found in DB for subscription.updated event. It might not have been fully processed by checkout.session.completed yet.`);
-      
-      // Only create a new record if we have required data
-      if (channelName) {
-        const insertQuery = `
-            INSERT INTO \`users\` 
-                (channel_name, twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, channel_active, db_reads, successful_lookups)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0)
-        `;
-        
-        // Set channel_active=1 directly if Stripe status is 'active'
-        const newChannelActive = shouldActivate ? 1 : 0;
-        
-        await env.DB.prepare(insertQuery)
-          .bind(channelName.toLowerCase(), channelId, customerId, subscriptionId, subscriptionEndDate, newChannelActive)
-          .run();
-          
-        if (shouldActivate) {
-          console.log(`DB: Created new subscription record with channel_active=1 from subscription.updated because status is ${status}`);
-        } else {
-          console.log(`DB: Created new subscription record with channel_active=0 from subscription.updated. Will be activated by invoice.paid.`);
-        }
-      }
+      plusActiveValue = undefined; // Maintain current status (for incomplete, etc.)
     }
+
+    const subscriptionData = {
+      twitch_id: channelId,
+      stripe_customer_id: customerId,
+      stripe_subscription_id: subscriptionId,
+      subscription_end_date: subscriptionEndDate,
+      plus_active: plusActiveValue
+    };
+
+    // Call our internal subscription upsert endpoint
+    const upsertResponse = await handleSubscriptionUpsert(
+      new Request('https://internal/subscription/upsert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subscriptionData)
+      }), 
+      env, 
+      {}
+    );
+
+    if (!upsertResponse.ok) {
+      throw new Error(`Subscription upsert failed: ${upsertResponse.status}`);
+    }
+
+    const action = shouldDeactivate ? 'deactivated' : (shouldActivate ? 'activated' : 'updated');
+    console.log(`DB: Subscription ${subscriptionId} ${action} via subscription.updated (status: ${status})`);
+    
   } catch (dbError) {
     console.error(`Database error during subscription.updated for SubID ${subscriptionId}:`, dbError);
     throw dbError; // Re-throw to trigger webhook retry
@@ -716,19 +675,37 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
     return; // Cannot proceed without subscriptionId
   }
 
-  // Mark subscription as inactive in database based on stripe_subscription_id
+  // Deactivate subscription using the internal API
   try {
-    const query = `
-        UPDATE \`users\` 
-        SET channel_active = 0, updated_at = CURRENT_TIMESTAMP 
-        WHERE stripe_subscription_id = ?;
-    `;
-    const result = await env.DB.prepare(query)
-      .bind(subscriptionId)
-      .run();
+    const subscriptionData = {
+      twitch_id: channelId || null, // May be missing in deletion events
+      stripe_customer_id: customerId || null,
+      stripe_subscription_id: subscriptionId,
+      plus_active: false // Deactivate the subscription
+    };
+
+    // Call our internal subscription upsert endpoint
+    const upsertResponse = await handleSubscriptionUpsert(
+      new Request('https://internal/subscription/upsert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subscriptionData)
+      }), 
+      env, 
+      {}
+    );
+
+    if (!upsertResponse.ok) {
+      console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
+      // Try direct DB update as fallback
+      const directQuery = `UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`;
+      const directResult = await env.DB.prepare(directQuery).bind(subscriptionId).run();
       
-    if (result.meta.changes === 0) {
-      console.warn(`DB: Subscription ${subscriptionId} not found in DB for subscription.deleted event.`);
+      if (directResult.changes === 0) {
+        console.warn(`DB: Subscription ${subscriptionId} not found in DB for subscription.deleted event.`);
+      } else {
+        console.log(`DB: Marked subscription ${subscriptionId} inactive via direct query from subscription.deleted`);
+      }
     } else {
       console.log(`DB: Marked subscription ${subscriptionId} inactive from subscription.deleted`);
     }
@@ -778,86 +755,42 @@ async function handleInvoicePaid(invoice, env, stripe) {
 
     console.log(`ACTIVATION: Invoice paid for subscription: ${subscriptionId}, Cust: ${customerId}, Chan: ${channelName}(${channelId}), Status: ${status}, Renewal Date: ${subscriptionEndDate || 'N/A'}`);
 
-    // --- Database Update --- 
+    // --- Database Update using new subscription system --- 
     try {
-        // First check if the record exists by subscription ID OR customer ID OR channel name
-        // This increases our chance of finding the record if it was created by a different webhook
-        const findQuery = `
-            SELECT id FROM \`users\` 
-            WHERE stripe_subscription_id = ? 
-               OR (stripe_customer_id = ? AND stripe_customer_id IS NOT NULL)
-               OR (channel_name = ? AND channel_name IS NOT NULL)
-            LIMIT 1
-        `;
-        
-        const existingRecord = await env.DB.prepare(findQuery)
-            .bind(subscriptionId, customerId, channelName?.toLowerCase())
-            .first();
-            
-        if (existingRecord) {
-            // Update existing record - ALWAYS SET CHANNEL_ACTIVE=1
-            const updateQuery = `
-                UPDATE \`users\` SET 
-                    channel_active = 1, -- Always activate on invoice.paid
-                    stripe_customer_id = ?,
-                    stripe_subscription_id = ?,
-                    channel_name = COALESCE(?, channel_name),
-                    twitch_id = COALESCE(?, twitch_id),
-                    subscription_end_date = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            `;
-            
-            await env.DB.prepare(updateQuery)
-                .bind(customerId, subscriptionId, channelName, channelId, subscriptionEndDate, existingRecord.id)
-                .run();
-                
-            console.log(`DB: ACTIVATED subscription ${subscriptionId} (channel_active=1) from invoice.paid`);
-        } else if (channelName) {
-            // Insert new record if channelName is available
-            const insertQuery = `
-                INSERT INTO \`users\` 
-                    (channel_name, twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, channel_active, db_reads, successful_lookups)
-                VALUES (?, ?, ?, ?, ?, 1, 0, 0) -- Set channel_active=1 directly
-            `;
-            
-            await env.DB.prepare(insertQuery)
-                .bind(channelName.toLowerCase(), channelId, customerId, subscriptionId, subscriptionEndDate)
-                .run();
-                
-            console.log(`DB: Created and ACTIVATED new record (channel_active=1) for ${channelName} (SubID: ${subscriptionId}) from invoice.paid`);
-        } else {
-            console.error(`DB: Cannot insert record for SubID ${subscriptionId} from invoice.paid because channelName is missing from subscription metadata.`);
+        const subscriptionData = {
+            twitch_id: channelId,
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+            subscription_end_date: subscriptionEndDate,
+            plus_active: true // ACTIVATE the subscription - invoice paid = confirmed payment
+        };
+
+        // Call our internal subscription upsert endpoint to activate the subscription
+        const upsertResponse = await handleSubscriptionUpsert(
+            new Request('https://internal/subscription/upsert', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(subscriptionData)
+            }), 
+            env, 
+            {}
+        );
+
+        if (!upsertResponse.ok) {
+            throw new Error(`Subscription activation failed: ${upsertResponse.status}`);
         }
+
+        console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) from invoice.paid`);
         
-        // Double-check activation status to ensure it's set properly
-        const verifyQuery = `
-            SELECT channel_active FROM \`users\` 
-            WHERE stripe_subscription_id = ?
-            LIMIT 1
-        `;
-        
-        const verifyResult = await env.DB.prepare(verifyQuery)
-            .bind(subscriptionId)
-            .first();
+        // Verify activation in subscriptions table
+        const verifyResult = await env.DB.prepare(
+            'SELECT plus_active FROM subscriptions WHERE stripe_subscription_id = ?'
+        ).bind(subscriptionId).first();
             
         if (verifyResult) {
-            console.log(`VERIFICATION: Subscription ${subscriptionId} channel_active status is now: ${verifyResult.channel_active}`);
-            if (verifyResult.channel_active !== 1) {
-                console.error(`CRITICAL: Subscription ${subscriptionId} should be channel_active=1 but is ${verifyResult.channel_active}!`);
-                // Force update as a last resort
-                const forceActivateQuery = `
-                    UPDATE \`users\` SET 
-                        channel_active = 1,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE stripe_subscription_id = ?
-                `;
-                
-                await env.DB.prepare(forceActivateQuery)
-                    .bind(subscriptionId)
-                    .run();
-                    
-                console.log(`RECOVERY: Forced activation of subscription ${subscriptionId} to channel_active=1`);
+            console.log(`VERIFICATION: Subscription ${subscriptionId} plus_active status is now: ${verifyResult.plus_active}`);
+            if (verifyResult.plus_active !== 1) {
+                console.error(`CRITICAL: Subscription ${subscriptionId} should be plus_active=1 but is ${verifyResult.plus_active}!`);
             }
         }
     } catch(dbError) {
@@ -875,26 +808,31 @@ async function handleInvoicePaid(invoice, env, stripe) {
       console.log(`Failed to retrieve subscription. Using calculated renewal date: ${subscriptionEndDate} for database update`);
       
       try {
-          // Try updating any record with this subscription ID to channel_active=1
-          const updateQuery = `
-              UPDATE \`users\` SET 
-                  subscription_end_date = ?,
-                  channel_active = 1,
-                  updated_at = CURRENT_TIMESTAMP
-              WHERE stripe_subscription_id = ?
-          `;
-          const result = await env.DB.prepare(updateQuery)
-              .bind(subscriptionEndDate, subscriptionId)
-              .run();
-              
-          if (result.meta.changes > 0) {
-              console.log(`DB: ACTIVATED subscription ${subscriptionId} (channel_active=1) using calculated renewal date`);
+          // Try activating using subscription upsert with fallback data
+          const fallbackSubscriptionData = {
+              stripe_subscription_id: subscriptionId,
+              subscription_end_date: subscriptionEndDate,
+              plus_active: true // Activate since payment was confirmed
+          };
+
+          const fallbackResponse = await handleSubscriptionUpsert(
+              new Request('https://internal/subscription/upsert', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(fallbackSubscriptionData)
+              }), 
+              env, 
+              {}
+          );
+
+          if (fallbackResponse.ok) {
+              console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) using calculated renewal date via fallback`);
               return; // Success, exit function
           } else {
-              console.warn(`No record found with subscription ID ${subscriptionId} for fallback activation`);
+              console.warn(`Fallback subscription activation failed for ${subscriptionId}: ${fallbackResponse.status}`);
           }
       } catch (fallbackDbError) {
-          console.error(`Fallback DB update failed for subscription ${subscriptionId}:`, fallbackDbError);
+          console.error(`Fallback subscription activation failed for subscription ${subscriptionId}:`, fallbackDbError);
       }
       
       if (error.type === 'StripeInvalidRequestError') {
@@ -927,19 +865,37 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
     // If status indicates payment issue, mark as inactive in our database
     if (['past_due', 'unpaid', 'incomplete_expired', 'canceled'].includes(status)) { // Added 'canceled' for robustness
       try {
-        const query = `
-            UPDATE \`users\` 
-            SET channel_active = 0, updated_at = CURRENT_TIMESTAMP 
-            WHERE stripe_subscription_id = ?;
-        `;
-        const result = await env.DB.prepare(query)
-          .bind(subscriptionId)
-          .run(); 
-        
-        if (result.meta.changes === 0) {
-          console.warn(`DB: Subscription ${subscriptionId} not found in DB for invoice.payment_failed update.`);
-        } else {
+        const subscriptionData = {
+          twitch_id: channelId,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          plus_active: false // Deactivate due to payment failure
+        };
+
+        // Call our internal subscription upsert endpoint to deactivate
+        const upsertResponse = await handleSubscriptionUpsert(
+          new Request('https://internal/subscription/upsert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(subscriptionData)
+          }), 
+          env, 
+          {}
+        );
+
+        if (upsertResponse.ok) {
           console.log(`DB: Marked subscription ${subscriptionId} inactive due to payment failure/status (${status})`);
+        } else {
+          console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
+          // Try direct DB update as fallback
+          const directQuery = `UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`;
+          const directResult = await env.DB.prepare(directQuery).bind(subscriptionId).run();
+          
+          if (directResult.changes === 0) {
+            console.warn(`DB: Subscription ${subscriptionId} not found in DB for invoice.payment_failed update.`);
+          } else {
+            console.log(`DB: Marked subscription ${subscriptionId} inactive via direct query due to payment failure/status (${status})`);
+          }
         }
       } catch (dbError) {
         console.error(`Database error during invoice.payment_failed for SubID ${subscriptionId}:`, dbError);
@@ -955,5 +911,163 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
           return; // Subscription likely deleted, ignore
       }
       throw error; // Re-throw other errors
+  }
+}
+
+// --- Subscription Management Functions ---
+
+/**
+ * Helper function to parse JSON with error handling
+ */
+async function parseRequestBody(request) {
+  try {
+    return await request.json();
+  } catch (e) {
+    throw new Error('Invalid JSON');
+  }
+}
+
+/**
+ * Helper function to create error responses
+ */
+function createErrorResponse(status, error, message = null, headers = {}) {
+  const response = { error };
+  if (message) response.message = message;
+  
+  return new Response(JSON.stringify(response), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...headers }
+  });
+}
+
+/**
+ * Handle subscription status lookup (public endpoint)
+ */
+async function handleSubscriptionStatus(request, env, corsHeaders) {
+  try {
+    const { twitch_id } = await parseRequestBody(request);
+    if (!twitch_id) {
+      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+
+    const result = await env.DB.prepare(
+      `SELECT plus_active, subscription_end_date 
+       FROM subscriptions 
+       WHERE twitch_id = ?`
+    ).bind(twitch_id).first();
+
+    // Check if subscription is active and not expired
+    const isActive = result?.plus_active && 
+      (!result.subscription_end_date || new Date(result.subscription_end_date) > new Date());
+
+    return new Response(JSON.stringify({
+      plus_active: !!isActive,
+      subscription_end_date: result?.subscription_end_date || null
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  } catch (error) {
+    console.error(`Error fetching subscription status for twitch_id:`, error);
+    return createErrorResponse(500, 'Internal Server Error', error.message, corsHeaders);
+  }
+}
+
+/**
+ * Handle subscription upsert (internal auth required)
+ */
+async function handleSubscriptionUpsert(request, env, corsHeaders) {
+  try {
+    const { twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active } = await parseRequestBody(request);
+    
+    if (!twitch_id) {
+      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+
+    // Upsert subscription record
+    const result = await env.DB.prepare(`
+      INSERT INTO subscriptions (twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT (twitch_id) DO UPDATE SET
+        stripe_customer_id = COALESCE(excluded.stripe_customer_id, stripe_customer_id),
+        stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, stripe_subscription_id),
+        subscription_end_date = COALESCE(excluded.subscription_end_date, subscription_end_date),
+        plus_active = COALESCE(excluded.plus_active, plus_active),
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(
+      twitch_id,
+      stripe_customer_id || null,
+      stripe_subscription_id || null,
+      subscription_end_date || null,
+      plus_active !== undefined ? (plus_active ? 1 : 0) : null
+    ).run();
+
+    // After successful subscription update, sync the plus_active flag to lol_ranks table
+    if (result.changes && result.changes > 0) {
+      try {
+        await syncSubscriptionStatusToRanks(env, twitch_id, !!plus_active);
+      } catch (syncError) {
+        console.warn('Failed to sync subscription status to ranks table:', syncError);
+        // Don't fail the main operation if sync fails
+      }
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true, 
+      changes: result.changes || 0,
+      twitch_id,
+      plus_active: !!plus_active
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  } catch (error) {
+    console.error(`Error upserting subscription data:`, error);
+    return createErrorResponse(500, 'Internal Server Error', error.message, corsHeaders);
+  }
+}
+
+/**
+ * Sync subscription status to lol_ranks table for consistent badge display
+ */
+async function syncSubscriptionStatusToRanks(env, twitch_id, plus_active) {
+  try {
+    // First get the user's channel_name
+    const userQuery = 'SELECT channel_name FROM users WHERE twitch_id = ?';
+    const userResult = await env.DB.prepare(userQuery).bind(twitch_id).first();
+    
+    if (!userResult?.channel_name) {
+      console.warn('No channel_name found for twitch_id during sync:', twitch_id);
+      return;
+    }
+
+    // Update plus_active in lol_ranks table
+    const syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ?';
+    const syncResult = await env.DB.prepare(syncQuery).bind(plus_active ? 1 : 0, userResult.channel_name).run();
+    
+    if (syncResult.changes && syncResult.changes > 0) {
+      console.log(`Synced subscription status to ranks table: ${userResult.channel_name} -> plus_active: ${plus_active}`);
+    }
+  } catch (error) {
+    console.error('Error syncing subscription status to ranks:', error);
+    throw error;
+  }
+}
+
+/**
+ * Clean up old Stripe events to prevent database bloat
+ * Should be called periodically (e.g., via scheduled worker)
+ */
+async function cleanupOldWebhookEvents(env, daysToKeep = 30) {
+  try {
+    const cutoffTimestamp = Math.floor(Date.now() / 1000) - (daysToKeep * 24 * 60 * 60);
+    
+    const result = await env.DB.prepare(
+      'DELETE FROM stripe_events WHERE processed_at < ?'
+    ).bind(cutoffTimestamp).run();
+    
+    if (result.changes && result.changes > 0) {
+      console.log(`Cleaned up ${result.changes} old Stripe events (older than ${daysToKeep} days)`);
+    }
+  } catch (error) {
+    console.error('Error cleaning up old Stripe events:', error);
   }
 }
