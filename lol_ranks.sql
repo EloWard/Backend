@@ -9,7 +9,11 @@ CREATE TABLE lol_ranks (
   lp INTEGER DEFAULT 0,
   region TEXT,                        -- Riot API region (e.g., na1, euw1, kr)
   last_updated INTEGER NOT NULL,
-  plus_active BOOLEAN DEFAULT 0       -- Premium subscription status for badge display (added via migration)
+  plus_active BOOLEAN DEFAULT 0,      -- Premium subscription status for badge display (added via migration)
+  peak_rank_tier TEXT,               -- Peak rank tier achieved
+  peak_rank_division TEXT,           -- Peak rank division achieved
+  peak_lp INTEGER,                   -- Peak LP achieved
+  show_peak BOOLEAN DEFAULT 0        -- Whether to display peak rank instead of current rank
 );
 
 -- Add index for efficient Twitch username lookups (most common search)
