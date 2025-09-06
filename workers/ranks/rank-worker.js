@@ -70,6 +70,32 @@ function jsonResponse(data, status = 200) {
   });
 }
 
+// Rank comparison functions
+const RANK_TIERS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+const TIER_VALUES = Object.fromEntries(RANK_TIERS.map((tier, idx) => [tier, idx]));
+
+function normalizeRank(tier, division, lp) {
+  const tierValue = TIER_VALUES[tier?.toUpperCase()] ?? -1;
+  if (tierValue === -1) return -1; // Invalid tier
+  
+  // Master+ tiers don't have divisions
+  const divisionValue = (tierValue >= 7) ? 0 : (5 - (parseInt(division) || 4));
+  const lpValue = parseInt(lp) || 0;
+  
+  // Create comparable value: tier * 10000 + division * 1000 + lp
+  return tierValue * 10000 + divisionValue * 1000 + Math.min(lpValue, 999);
+}
+
+function isRankHigher(newRank, currentRank) {
+  if (!currentRank || !currentRank.rank_tier) return true;
+  if (!newRank || !newRank.rank_tier) return false;
+  
+  const newValue = normalizeRank(newRank.rank_tier, newRank.rank_division, newRank.lp);
+  const currentValue = normalizeRank(currentRank.rank_tier, currentRank.rank_division, currentRank.lp);
+  
+  return newValue > currentValue;
+}
+
 async function storeRank(request, env) {
   try {
     const { riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active } = await request.json();
@@ -81,16 +107,33 @@ async function storeRank(request, env) {
       }, 400);
     }
     
-    // Handle plus_active conditionally - only update if explicitly provided
+    // Handle plus_active conditionally
     const shouldUpdatePlusActive = plus_active !== undefined;
     const plusActiveValue = plus_active ? 1 : 0;
     
+    // Get existing peak rank for comparison
+    const existingData = await env.DB.prepare(
+      "SELECT peak_rank_tier, peak_rank_division, peak_lp FROM lol_ranks WHERE riot_puuid = ?"
+    ).bind(riot_puuid).first();
+    
+    const newRank = { rank_tier, rank_division, lp: lp || 0 };
+    const currentPeak = existingData ? {
+      rank_tier: existingData.peak_rank_tier,
+      rank_division: existingData.peak_rank_division,
+      lp: existingData.peak_lp
+    } : null;
+    
+    // Check if new rank is higher than current peak
+    const updatePeak = isRankHigher(newRank, currentPeak);
+    const peakTier = updatePeak ? rank_tier : (currentPeak?.rank_tier || rank_tier);
+    const peakDivision = updatePeak ? (rank_division || null) : (currentPeak?.rank_division || rank_division || null);
+    const peakLp = updatePeak ? (lp || 0) : (currentPeak?.lp || lp || 0);
+    
     let result;
     if (shouldUpdatePlusActive) {
-      // Update plus_active when explicitly provided (e.g., during auth/subscription changes)
       result = await env.DB.prepare(`
-        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, peak_rank_tier, peak_rank_division, peak_lp, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (riot_puuid) DO UPDATE SET
           twitch_username = excluded.twitch_username,
           riot_id = excluded.riot_id,
@@ -99,6 +142,9 @@ async function storeRank(request, env) {
           lp = excluded.lp,
           region = excluded.region,
           plus_active = excluded.plus_active,
+          peak_rank_tier = excluded.peak_rank_tier,
+          peak_rank_division = excluded.peak_rank_division,
+          peak_lp = excluded.peak_lp,
           last_updated = excluded.last_updated
       `).bind(
         riot_puuid,
@@ -109,13 +155,15 @@ async function storeRank(request, env) {
         lp || 0,
         region || null,
         plusActiveValue,
+        peakTier,
+        peakDivision,
+        peakLp,
         Math.floor(Date.now() / 1000)
       ).run();
     } else {
-      // Preserve existing plus_active when not provided (e.g., during rank refresh)
       result = await env.DB.prepare(`
-        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+        INSERT INTO lol_ranks (riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, peak_rank_tier, peak_rank_division, peak_lp, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
         ON CONFLICT (riot_puuid) DO UPDATE SET
           twitch_username = excluded.twitch_username,
           riot_id = excluded.riot_id,
@@ -123,6 +171,9 @@ async function storeRank(request, env) {
           rank_division = excluded.rank_division,
           lp = excluded.lp,
           region = excluded.region,
+          peak_rank_tier = excluded.peak_rank_tier,
+          peak_rank_division = excluded.peak_rank_division,
+          peak_lp = excluded.peak_lp,
           last_updated = excluded.last_updated
       `).bind(
         riot_puuid,
@@ -132,6 +183,9 @@ async function storeRank(request, env) {
         rank_division || null,
         lp || 0,
         region || null,
+        peakTier,
+        peakDivision,
+        peakLp,
         Math.floor(Date.now() / 1000)
       ).run();
     }
@@ -144,6 +198,7 @@ async function storeRank(request, env) {
       rank_division,
       lp,
       region,
+      peak_updated: updatePeak,
       changes: result.changes || 0
     });
   } catch (error) {
@@ -158,14 +213,27 @@ async function storeRank(request, env) {
 async function getRank(username, env) {
   try {
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated FROM lol_ranks WHERE twitch_username = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak FROM lol_ranks WHERE twitch_username = ?"
     ).bind(username).first();
     
     if (!result) {
       return jsonResponse({ error: "User rank not found" }, 404);
     }
     
-    return jsonResponse(result);
+    // Return peak rank data if show_peak is true, otherwise current rank
+    const responseData = {
+      twitch_username: result.twitch_username,
+      riot_id: result.riot_id,
+      rank_tier: result.show_peak ? result.peak_rank_tier : result.rank_tier,
+      rank_division: result.show_peak ? result.peak_rank_division : result.rank_division,
+      lp: result.show_peak ? result.peak_lp : result.lp,
+      region: result.region,
+      plus_active: result.plus_active,
+      last_updated: result.last_updated,
+      show_peak: result.show_peak
+    };
+    
+    return jsonResponse(responseData);
   } catch (error) {
     console.error(`Error fetching rank for ${username}:`, error);
     return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500);
@@ -204,14 +272,27 @@ async function getRankByPuuid(request, env) {
     }
     
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated FROM lol_ranks WHERE riot_puuid = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(requestedPuuid).first();
     
     if (!result) {
       return jsonResponse({ error: "User rank not found" }, 404);
     }
     
-    return jsonResponse(result);
+    // Return peak rank data if show_peak is true, otherwise current rank
+    const responseData = {
+      twitch_username: result.twitch_username,
+      riot_id: result.riot_id,
+      rank_tier: result.show_peak ? result.peak_rank_tier : result.rank_tier,
+      rank_division: result.show_peak ? result.peak_rank_division : result.rank_division,
+      lp: result.show_peak ? result.peak_lp : result.lp,
+      region: result.region,
+      plus_active: result.plus_active,
+      last_updated: result.last_updated,
+      show_peak: result.show_peak
+    };
+    
+    return jsonResponse(responseData);
   } catch (error) {
     console.error(`Error fetching rank for puuid ${requestedPuuid || 'unknown'}:`, error);
     return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500);
