@@ -70,30 +70,47 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-// Rank comparison functions
-const RANK_TIERS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
-const TIER_VALUES = Object.fromEntries(RANK_TIERS.map((tier, idx) => [tier, idx]));
-
-function normalizeRank(tier, division, lp) {
-  const tierValue = TIER_VALUES[tier?.toUpperCase()] ?? -1;
-  if (tierValue === -1) return -1; // Invalid tier
-  
-  // Master+ tiers don't have divisions
-  const divisionValue = (tierValue >= 7) ? 0 : (5 - (parseInt(division) || 4));
-  const lpValue = parseInt(lp) || 0;
-  
-  // Create comparable value: tier * 10000 + division * 1000 + lp
-  return tierValue * 10000 + divisionValue * 1000 + Math.min(lpValue, 999);
-}
+// Robust rank comparison following League of Legends hierarchy
+const TIER_ORDER = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+const TIER_VALUES = Object.fromEntries(TIER_ORDER.map((tier, idx) => [tier, idx]));
+const DIVISION_VALUES = { 'I': 1, 'II': 2, 'III': 3, 'IV': 4 }; // Lower number = higher rank
 
 function isRankHigher(newRank, currentRank) {
+  // Handle null/undefined cases
   if (!currentRank || !currentRank.rank_tier) return true;
   if (!newRank || !newRank.rank_tier) return false;
   
-  const newValue = normalizeRank(newRank.rank_tier, newRank.rank_division, newRank.lp);
-  const currentValue = normalizeRank(currentRank.rank_tier, currentRank.rank_division, currentRank.lp);
+  // Step 1: Compare tiers (CHALLENGER > GRANDMASTER > MASTER > ... > IRON)
+  const newTierValue = TIER_VALUES[newRank.rank_tier?.toUpperCase()] ?? -1;
+  const currentTierValue = TIER_VALUES[currentRank.rank_tier?.toUpperCase()] ?? -1;
   
-  return newValue > currentValue;
+  if (newTierValue === -1 || currentTierValue === -1) {
+    return false; // Invalid tier data
+  }
+  
+  if (newTierValue !== currentTierValue) {
+    return newTierValue > currentTierValue; // Higher tier value = higher rank
+  }
+  
+  // Step 2: Same tier - for Master+ skip division comparison, go to LP
+  if (newTierValue >= 7) { // MASTER, GRANDMASTER, CHALLENGER
+    const newLP = parseInt(newRank.lp) || 0;
+    const currentLP = parseInt(currentRank.lp) || 0;
+    return newLP > currentLP;
+  }
+  
+  // Step 3: For ranks below Master, compare divisions (I > II > III > IV)
+  const newDivision = DIVISION_VALUES[newRank.rank_division?.toUpperCase()] || 4; // Default to IV
+  const currentDivision = DIVISION_VALUES[currentRank.rank_division?.toUpperCase()] || 4;
+  
+  if (newDivision !== currentDivision) {
+    return newDivision < currentDivision; // Lower division number = higher rank
+  }
+  
+  // Step 4: Same tier and division, compare LP (0 is valid, higher LP = higher rank)
+  const newLP = parseInt(newRank.lp) || 0;
+  const currentLP = parseInt(currentRank.lp) || 0;
+  return newLP > currentLP;
 }
 
 async function storeRank(request, env) {
@@ -123,11 +140,13 @@ async function storeRank(request, env) {
       lp: existingData.peak_lp
     } : null;
     
-    // Check if new rank is higher than current peak
+    // Check if new rank is higher than current peak using robust comparison
     const updatePeak = isRankHigher(newRank, currentPeak);
+    
+    // Update all peak fields if new rank is higher, otherwise preserve existing peak
     const peakTier = updatePeak ? rank_tier : (currentPeak?.rank_tier || rank_tier);
     const peakDivision = updatePeak ? (rank_division || null) : (currentPeak?.rank_division || rank_division || null);
-    const peakLp = updatePeak ? (lp || 0) : (currentPeak?.lp || lp || 0);
+    const peakLp = updatePeak ? (lp ?? 0) : (currentPeak?.lp ?? lp ?? 0); // Use nullish coalescing to handle 0 properly
     
     let result;
     if (shouldUpdatePlusActive) {
