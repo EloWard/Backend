@@ -415,7 +415,7 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
     const riotId = `${accountData.gameName}#${accountData.tagLine}`;
     const rankData = {
       riot_puuid: accountData.puuid,
-      twitch_username: channelName, // This is the channel_name from users table
+      twitch_username: channelName,
       riot_id: riotId,
       rank_tier: currentRank ? currentRank.tier : 'UNRANKED',
       rank_division: currentRank ? currentRank.rank : null,
