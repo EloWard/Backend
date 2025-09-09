@@ -225,20 +225,18 @@ async function testOpGGScraper(opggUrl) {
       return null;
     }
 
-    // Display detected ranks
-    console.log('\nRanks detected:');
-    allRanks.forEach((rank, index) => {
-      const division = (rank.tier === 'MASTER' || rank.tier === 'GRANDMASTER' || rank.tier === 'CHALLENGER') ? '' : ` ${rank.division || ''}`;
-      console.log(`  ${index + 1}. ${rank.tier}${division} ${rank.lp}LP`);
-    });
-
-    // Find and display peak rank
+    // Find peak rank
     const peakRank = scraper.findHighestRank(allRanks);
-    const peakDivision = (peakRank.tier === 'MASTER' || peakRank.tier === 'GRANDMASTER' || peakRank.tier === 'CHALLENGER') ? '' : ` ${peakRank.division || ''}`;
-    console.log(`\nPeak rank: ${peakRank.tier}${peakDivision} ${peakRank.lp}LP`);
+    const division = (peakRank.tier === 'MASTER' || peakRank.tier === 'GRANDMASTER' || peakRank.tier === 'CHALLENGER') ? null : peakRank.division;
+    
+    const result = {
+      tier: peakRank.tier,
+      division: division,
+      lp: peakRank.lp
+    };
 
-    return peakRank;
-
+    console.log(result);
+    return result;
   } catch (error) {
     console.error('Error:', error.message);
     return null;
