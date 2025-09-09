@@ -194,8 +194,14 @@ class PeakSeedManager {
       
       return peakRank;
     } catch (error) {
+      // Handle 404 errors specifically - profile doesn't exist on op.gg
+      if (error.message.includes('404') || error.message.includes('Not Found')) {
+        console.log(`⏭️  Profile not found on op.gg: ${twitch_username} - skipping`);
+        return null; // Return null to skip this user (no retry needed)
+      }
+      
       console.error(`❌ Failed to scrape ${twitch_username}: ${error.message}`);
-      throw error;
+      throw error; // Re-throw for other errors that should be retried
     }
   }
 
