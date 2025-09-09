@@ -52,7 +52,7 @@ node manual-peak-seed.js [options]
 Options:
   --dry-run                    Test run without database changes
   --start-from-user-id=ID      Resume from specific user
-  --batch-size=50              Number of users per checkpoint
+  --batch-size=1               Checkpoint frequency (now saves after every user)
 ```
 
 ## Files Created During Run

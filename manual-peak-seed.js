@@ -61,9 +61,9 @@ const REGION_MAPPING = {
 const CONFIG = {
   CHECKPOINT_FILE: 'peak-seed-progress.json',
   LOG_FILE: 'peak-seed-log.txt',
-  MIN_DELAY_MS: 2000,    // Minimum 2 seconds between requests
-  MAX_DELAY_MS: 8000,    // Maximum 8 seconds between requests
-  BATCH_SIZE: 50,        // How many to process before checkpoint
+  MIN_DELAY_MS: 1000,    // Minimum 1 second between requests
+  MAX_DELAY_MS: 3000,    // Maximum 3 seconds between requests  
+  BATCH_SIZE: 1,         // Save checkpoint after every user (safer)
   MAX_RETRIES: 3         // Retries per user on failure
 };
 
@@ -110,15 +110,33 @@ class PeakSeedManager {
   }
 
   async updateUserPeakRank(puuid, peakRank) {
-    if (this.isDryRun) {
-      console.log(`🧪 DRY RUN: Would update ${puuid} with peak: ${peakRank.tier} ${peakRank.division} ${peakRank.lp}LP`);
-      return;
+    // Format data first for consistency in both dry run and live mode
+    const formattedTier = peakRank.tier.toUpperCase(); // Ensure uppercase (BRONZE, MASTER, etc.)
+    let formattedDivision = null;
+    let formattedLP = parseInt(peakRank.lp) || 0; // Ensure integer
+
+    // Handle division formatting to match database format
+    if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(formattedTier)) {
+      // Master+ always gets division = "I" (string, not null)
+      formattedDivision = 'I';
+    } else if (formattedTier === 'UNRANKED') {
+      // Unranked gets actual NULL (not string) division and 0 LP
+      formattedDivision = null; // JavaScript null, not "null" string
+      formattedLP = 0;
+    } else {
+      // Convert numeric divisions to Roman numerals if needed
+      if (peakRank.division && peakRank.division.trim() !== '') {
+        const divisionMap = { '1': 'I', '2': 'II', '3': 'III', '4': 'IV' };
+        formattedDivision = divisionMap[peakRank.division] || peakRank.division.toUpperCase();
+      } else {
+        // Explicitly set to JavaScript null (not undefined or empty string)
+        formattedDivision = null;
+      }
     }
 
-    // Normalize division for database (Master+ gets 'I')
-    let normalizedDivision = peakRank.division;
-    if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(peakRank.tier) && !normalizedDivision) {
-      normalizedDivision = 'I';
+    if (this.isDryRun) {
+      console.log(`🧪 DRY RUN: Would update ${puuid} with peak: ${formattedTier} ${formattedDivision || 'NULL'} ${formattedLP}LP`);
+      return;
     }
 
     const query = `
@@ -127,10 +145,20 @@ class PeakSeedManager {
       WHERE riot_puuid = ?
     `;
     
-    const params = [peakRank.tier, normalizedDivision, peakRank.lp || 0, puuid];
+    // Ensure we're sending the correct data types
+    const params = [
+      formattedTier,      // string
+      formattedDivision,  // string or null (JavaScript null, not "null")
+      formattedLP,        // integer
+      puuid               // string
+    ];
+    
+    // Debug: Log actual data types being sent
+    console.log(`📝 Sending to DB: tier="${formattedTier}" division=${formattedDivision === null ? 'NULL' : `"${formattedDivision}"`} lp=${formattedLP}`);
+    
     await this.executeD1Query(query, params);
     
-    console.log(`✅ Updated ${puuid} peak rank: ${peakRank.tier} ${normalizedDivision} ${peakRank.lp}LP`);
+    console.log(`✅ Updated ${puuid} peak rank: ${formattedTier} ${formattedDivision || 'NULL'} ${formattedLP}LP`);
   }
 
   constructOpGGUrl(riotId, region) {
@@ -240,10 +268,13 @@ class PeakSeedManager {
       
       await this.processUser(user);
       
-      // Save checkpoint every batch
+      // Save checkpoint after every user (CONFIG.BATCH_SIZE = 1)
       if (this.stats.processed % CONFIG.BATCH_SIZE === 0) {
         this.saveProgress();
-        this.logStats();
+        // Log stats every 10 users to avoid spam
+        if (this.stats.processed % 10 === 0) {
+          this.logStats();
+        }
       }
       
       // Random delay between requests (human-like behavior)
@@ -315,7 +346,10 @@ class PeakSeedManager {
         stats: this.stats
       };
       fs.writeFileSync(CONFIG.CHECKPOINT_FILE, JSON.stringify(data, null, 2));
-      console.log(`💾 Progress saved: ${this.stats.successful} successful, ${this.stats.failed} failed`);
+      // Only log saves every 10 users to reduce console spam
+      if (this.stats.processed % 10 === 0) {
+        console.log(`💾 Progress saved: ${this.stats.successful} successful, ${this.stats.failed} failed`);
+      }
     } catch (error) {
       console.error('❌ Failed to save progress:', error.message);
     }

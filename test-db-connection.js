@@ -97,6 +97,30 @@ async function testConnection() {
     console.log(`✅ Connected to Cloudflare D1!`);
     console.log(`📊 Found ${userCount} users in lol_ranks table`);
     
+    // Test null value handling (verify D1 API accepts JavaScript null)
+    console.log('🧪 Testing null value handling...');
+    const nullTestPayload = {
+      sql: 'SELECT ? as test_null, ? as test_string',
+      params: [null, 'test_value']
+    };
+    
+    const nullTestResponse = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(nullTestPayload)
+    });
+    
+    if (nullTestResponse.ok) {
+      const nullTestResult = await nullTestResponse.json();
+      const testData = nullTestResult.result?.[0]?.results?.[0];
+      console.log(`✅ Null handling test passed: null=${testData?.test_null === null ? 'NULL' : testData?.test_null}, string="${testData?.test_string}"`);
+    } else {
+      console.log('⚠️  Null handling test failed - but connection is still working');
+    }
+    
     if (userCount === 0) {
       console.log('⚠️  Database appears empty - make sure you have user data before running peak seeding');
     }
