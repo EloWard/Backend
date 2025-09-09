@@ -69,121 +69,32 @@ class OpGGScraper {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async scrapeAllStrategies(baseUrl) {
-    // Strategy 1: Multiple URL variations that might contain expanded data
-    const urlVariations = [
-      baseUrl,
-      `${baseUrl}?hl=en_US`,
-      `${baseUrl}?region=global`,
-      `${baseUrl}?locale=en_US`,
-      baseUrl.replace('/summoners/', '/summoner/'), // Alternative format
-      baseUrl + '/matches?queueId=420', // Ranked matches page might have more data
-    ];
-
-    let bestHtml = '';
-    let bestSeasonCount = 0;
-    let bestUrl = baseUrl;
-
-    // Try each URL variation
-    for (const url of urlVariations) {
-      try {
-        const html = await this.fetchWithRetry(url, {}, 2);
-        const seasonCount = (html.match(/S20\d+/g) || []).length;
-        
-        if (seasonCount > bestSeasonCount) {
-          bestHtml = html;
-          bestSeasonCount = seasonCount;
-          bestUrl = url;
-        }
-        
-        await this.sleep(500);
-      } catch (error) {
-        // Silently continue to next URL
-      }
-    }
-
-    if (!bestHtml) {
-      throw new Error('All URL variations failed');
-    }
-
-    // Strategy 2: Look for AJAX endpoints in the HTML
-    const ajaxUrls = this.findAjaxEndpoints(bestHtml, baseUrl);
-    
-    for (const ajaxUrl of ajaxUrls) {
-      try {
-        const ajaxHtml = await this.fetchWithRetry(ajaxUrl, {
-          headers: {
-            'Referer': bestUrl,
-            'X-Requested-With': 'XMLHttpRequest'
-          }
-        }, 1);
-        
-        const ajaxSeasons = (ajaxHtml.match(/S20\d+/g) || []).length;
-        if (ajaxSeasons > bestSeasonCount) {
-          bestHtml = ajaxHtml;
-          bestSeasonCount = ajaxSeasons;
-        }
-      } catch (error) {
-        // Silently continue to next AJAX URL
-      }
-    }
-
-    return bestHtml;
+  async scrapeUrl(url) {
+    // Fetch only the single provided URL
+    return await this.fetchWithRetry(url);
   }
 
-  findAjaxEndpoints(html, baseUrl) {
-    const endpoints = [];
-    const urlBase = new URL(baseUrl);
-    
-    // Look for potential AJAX URLs in the HTML
-    const patterns = [
-      /fetch\(['"`]([^'"`]+)['"`]/g,
-      /xhr\.open\([^,]+,\s*['"`]([^'"`]+)['"`]/g,
-      /"api[^"]*seasons[^"]*"/g,
-      /"[^"]*\/api\/[^"]*"/g,
-    ];
-    
-    for (const pattern of patterns) {
-      let match;
-      while ((match = pattern.exec(html)) !== null) {
-        let endpoint = match[1] || match[0].replace(/"/g, '');
-        
-        // Convert relative URLs to absolute
-        if (endpoint.startsWith('/')) {
-          endpoint = `${urlBase.protocol}//${urlBase.host}${endpoint}`;
-        } else if (!endpoint.startsWith('http')) {
-          continue;
-        }
-        
-        if (endpoint.includes('season') || endpoint.includes('rank') || endpoint.includes('tier')) {
-          endpoints.push(endpoint);
-        }
-      }
-    }
-    
-    return [...new Set(endpoints)]; // Remove duplicates
-  }
 
   extractAllRanksFromHTML(html) {
     const allRanks = [];
     
-    const soloQueueHtml = this.isolateRankedSoloSection(html);
-    const targetHtml = soloQueueHtml || html;
-    
-    const jsonRanks = this.extractFromJSON(html);
-    allRanks.push(...jsonRanks);
+    // Extract current rank (diamond 2, 75 LP with wins/losses)
+    const currentRank = this.extractCurrentRank(html);
+    if (currentRank) {
+      allRanks.push(currentRank);
+    }
 
-    const htmlRanks = this.extractFromHTML(targetHtml);
-    allRanks.push(...htmlRanks);
+    // Extract peak rank (challenger, 1,008 LP with "Top Tier" badge)
+    const peakRank = this.extractPeakRank(html);
+    if (peakRank) {
+      allRanks.push(peakRank);
+    }
 
-    const currentRanks = this.extractCurrentRank(html);
-    allRanks.push(...currentRanks);
+    // Extract all historical season ranks from table
+    const historicalRanks = this.extractHistoricalRanks(html);
+    allRanks.push(...historicalRanks);
 
-    const topTierRanks = this.extractTopTierRank(html);
-    allRanks.push(...topTierRanks);
-
-    const uniqueRanks = this.removeDuplicates(allRanks);
-    return uniqueRanks;
+    return allRanks;
   }
 
   /**
@@ -215,150 +126,101 @@ class OpGGScraper {
     return null;
   }
 
-  extractFromJSON(html) {
-    const ranks = [];
+  extractCurrentRank(html) {
+    // Extract current rank: diamond 2, 75 LP, 156W 122L, Win rate 56%
+    const currentPattern = /<strong class="text-xl first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span class="leading-\[26px\]">(\d+)(?:<!--[^>]*-->)?W(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?L<\/span>[\s\S]*?<span>Win rate(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?%<\/span>/;
     
-    const tooltipPattern = /data-tooltip-html="[^"]*&lt;strong class=&quot;text-white first-letter:uppercase&quot;&gt;([^&]+)&lt;\/strong&gt;&lt;span class=&quot;text-xs[^&]*&quot;&gt;([0-9,]+) LP&lt;\/span&gt;[^"]*Top Tier/gi;
-    let match;
-    while ((match = tooltipPattern.exec(html)) !== null) {
-      const tier = match[1]?.trim().toUpperCase();
-      const lp = parseInt(match[2]?.replace(/[^\d]/g, '')) || 0;
+    const match = html.match(currentPattern);
+    if (match) {
+      const rankText = match[1]?.trim().toLowerCase();
+      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
+      const wins = parseInt(match[3]) || 0;
+      const losses = parseInt(match[4]) || 0;
+      const winRate = parseInt(match[5]) || 0;
       
-      if (this.isValidTier(tier) && lp > 0) {
-        ranks.push({ tier, division: null, lp, source: 'tooltip_peak' });
-      }
-    }
-
-    const challengerJsonPattern = /challenger[^}]*"children":\s*\[\s*"([0-9,\s]+)"/gi;
-    while ((match = challengerJsonPattern.exec(html)) !== null) {
-      const lpText = match[1].replace(/[\s,]/g, '');
-      const lp = parseInt(lpText) || 0;
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
       
-      if (lp > 500) {
-        ranks.push({ tier: 'CHALLENGER', division: null, lp, source: 'json_challenger' });
+      if (this.isValidTier(tier)) {
+        return {
+          tier,
+          division,
+          lp,
+          wins,
+          losses,
+          winRate,
+          type: 'current'
+        };
       }
     }
     
-    const jsonRankPattern = /(S20\d+)[^}]*"rank_info":\s*\{\s*"tier":\s*"([^"]+)"\s*,\s*"lp":\s*"([^"]+)"/gi;
-    while ((match = jsonRankPattern.exec(html)) !== null) {
-      const season = match[1]?.trim();
-      const tierText = match[2]?.trim().toLowerCase();
-      const lp = parseInt(match[3]) || 0;
-      
-      if (season && tierText && lp >= 0) {
-        const tierParts = tierText.split(/\s+/);
-        const tier = tierParts[0]?.toUpperCase();
-        const division = tierParts[1] || null;
-        
-        if (this.isValidTier(tier)) {
-          ranks.push({ tier, division, lp, source: `json_${season}` });
-        }
-      }
-    }
-
-    return ranks;
+    return null;
   }
 
+  extractPeakRank(html) {
+    // Extract peak rank: challenger, 1,008 LP with "Top Tier" badge
+    const peakPattern = /<strong class="text-sm first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span[^>]*>Top Tier<\/span>/;
+    
+    const match = html.match(peakPattern);
+    if (match) {
+      const rankText = match[1]?.trim().toLowerCase();
+      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
+      
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
+      
+      if (this.isValidTier(tier)) {
+        return {
+          tier,
+          division,
+          lp,
+          type: 'peak'
+        };
+      }
+    }
+    
+    return null;
+  }
 
-  extractFromHTML(html) {
+  extractHistoricalRanks(html) {
     const ranks = [];
     
-    const tableRowPattern = /<tr[^>]*class="[^"]*bg-main-100[^"]*"[^>]*>[\s\S]*?<strong[^>]*>(S20\d+[^<]*)<\/strong>[\s\S]*?<span[^>]*class="[^"]*text-xs[^"]*lowercase[^"]*"[^>]*>\s*([a-z]+(?:\s+\d+)?)\s*<\/span>[\s\S]*?<td[^>]*align="right"[^>]*>\s*([0-9,]+)\s*<\/td>/gi;
-    
-    const seasonSeen = new Set();
+    // Extract historical ranks from table: S2024 S3 grandmaster 421, etc.
+    const tableRowPattern = /<tr class="bg-main-100[^"]*"[^>]*>.*?<strong[^>]*>(S\d{4}[^<]*)<\/strong>.*?<span class="text-xs lowercase first-letter:uppercase">([^<]+)<\/span>.*?<td align="right" class="text-xs text-gray-500">([0-9,]+)<\/td>/gs;
     
     let match;
     while ((match = tableRowPattern.exec(html)) !== null) {
       const season = match[1]?.trim();
       const rankText = match[2]?.trim().toLowerCase();
-      const lpText = match[3]?.trim();
+      const lp = parseInt(match[3]?.replace(/[^0-9]/g, '')) || 0;
       
-      if (season && rankText && lpText) {
-        if (seasonSeen.has(season)) {
-          continue;
-        }
-        
-        const lp = parseInt(lpText.replace(/[^\d]/g, '')) || 0;
-        const rankParts = rankText.split(/\s+/);
-        const tier = rankParts[0]?.toUpperCase();
-        const division = rankParts[1] || null;
-        
-        if (season.match(/^S20\d+(\s+S\d+)?/) && this.isValidTier(tier)) {
-          seasonSeen.add(season);
-          ranks.push({ tier, division, lp, source: `html_${season.replace(/\s+/g, '_')}` });
-        }
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
+      
+      if (this.isValidTier(tier)) {
+        ranks.push({
+          tier,
+          division,
+          lp,
+          season,
+          type: 'historical'
+        });
       }
     }
     
     return ranks;
   }
 
-  extractCurrentRank(html) {
-    const ranks = [];
-    
-    const currentPattern = /<strong[^>]*class="[^"]*text-xl[^"]*"[^>]*>\s*([^<]+)\s*<\/strong>[\s\S]{0,100}?<span[^>]*class="[^"]*text-xs[^"]*gray-500[^"]*"[^>]*>\s*([0-9,]+)(?:<!--[^>]*-->)?\s*LP\s*<\/span>/gi;
-    
-    let match;
-    while ((match = currentPattern.exec(html)) !== null) {
-      const rankText = match[1]?.trim().toLowerCase();
-      const lpText = match[2]?.trim();
-      
-      if (rankText && lpText) {
-        const lp = parseInt(lpText.replace(/[^\d]/g, '')) || 0;
-        const rankParts = rankText.split(/\s+/);
-        const tier = rankParts[0]?.toUpperCase();
-        const division = rankParts[1] || null;
-        
-        if (this.isValidTier(tier)) {
-          ranks.push({ tier, division, lp, source: 'current_rank' });
-          break;
-        }
-      }
-    }
-    
-    return ranks;
-  }
 
-  extractTopTierRank(html) {
-    const ranks = [];
-    
-    const topTierPattern = /<strong[^>]*class="[^"]*text-sm[^"]*"[^>]*>\s*([^<]+)\s*<\/strong>[\s\S]{0,200}?<span[^>]*class="[^"]*text-xs[^"]*gray-500[^"]*"[^>]*>\s*([0-9,]+)(?:<!--[^>]*-->)?\s*LP\s*<\/span>[\s\S]{0,400}?Top Tier/gi;
-    
-    let match;
-    while ((match = topTierPattern.exec(html)) !== null) {
-      const rankText = match[1]?.trim().toLowerCase();
-      const lpText = match[2]?.trim();
-      
-      if (rankText && lpText) {
-        const lp = parseInt(lpText.replace(/[^\d]/g, '')) || 0;
-        const rankParts = rankText.split(/\s+/);
-        const tier = rankParts[0]?.toUpperCase();
-        const division = rankParts[1] || null;
-        
-        if (this.isValidTier(tier)) {
-          ranks.push({ tier, division, lp, source: 'top_tier_peak' });
-          break;
-        }
-      }
-    }
-    
-    return ranks;
-  }
 
   isValidTier(tier) {
     const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
     return validTiers.includes(tier);
   }
 
-  removeDuplicates(ranks) {
-    const seen = new Set();
-    return ranks.filter(rank => {
-      const key = `${rank.tier}-${rank.division}-${rank.lp}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }
 
   findHighestRank(ranks) {
     if (ranks.length === 0) return null;
@@ -389,7 +251,7 @@ async function testOpGGScraper(opggUrl) {
   const scraper = new OpGGScraper();
 
   try {
-    const html = await scraper.scrapeAllStrategies(opggUrl);
+    const html = await scraper.scrapeUrl(opggUrl);
     const allRanks = scraper.extractAllRanksFromHTML(html);
     
     if (allRanks.length === 0) {
@@ -400,12 +262,14 @@ async function testOpGGScraper(opggUrl) {
     // Display detected ranks
     console.log('\nRanks detected:');
     allRanks.forEach((rank, index) => {
-      console.log(`  ${index + 1}. ${rank.tier} ${rank.division || ''} ${rank.lp}LP`);
+      const division = (rank.tier === 'MASTER' || rank.tier === 'GRANDMASTER' || rank.tier === 'CHALLENGER') ? '' : ` ${rank.division || ''}`;
+      console.log(`  ${index + 1}. ${rank.tier}${division} ${rank.lp}LP`);
     });
 
     // Find and display peak rank
     const peakRank = scraper.findHighestRank(allRanks);
-    console.log(`\nPeak rank: ${peakRank.tier} ${peakRank.division || ''} ${peakRank.lp}LP`);
+    const peakDivision = (peakRank.tier === 'MASTER' || peakRank.tier === 'GRANDMASTER' || peakRank.tier === 'CHALLENGER') ? '' : ` ${peakRank.division || ''}`;
+    console.log(`\nPeak rank: ${peakRank.tier}${peakDivision} ${peakRank.lp}LP`);
 
     return peakRank;
 
