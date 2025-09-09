@@ -146,7 +146,7 @@ async function storeRank(request, env) {
     // Update all peak fields if new rank is higher, otherwise preserve existing peak
     const peakTier = updatePeak ? rank_tier : (currentPeak?.rank_tier || rank_tier);
     const peakDivision = updatePeak ? (rank_division || null) : (currentPeak?.rank_division || rank_division || null);
-    const peakLp = updatePeak ? (lp ?? 0) : (currentPeak?.lp ?? lp ?? 0); // Use nullish coalescing to handle 0 properly
+    const peakLp = updatePeak ? (lp ?? 0) : (currentPeak?.lp ?? 0); // Preserve existing peak LP, default to 0 if null
     
     let result;
     if (shouldUpdatePlusActive) {
