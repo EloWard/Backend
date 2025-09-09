@@ -213,7 +213,7 @@ class PeakSeedManager {
       if (this.progress.completed.includes(riot_puuid)) {
         console.log(`⏭️  Skipping already processed: ${twitch_username}`);
         this.stats.skipped++;
-        return true;
+        return { processed: true, needsDelay: false }; // No delay needed for skipped users
       }
 
       const peakRank = await this.scrapeUserPeakRank(user);
@@ -228,7 +228,7 @@ class PeakSeedManager {
       }
       
       this.stats.processed++;
-      return true;
+      return { processed: true, needsDelay: true }; // Delay needed after actual processing
       
     } catch (error) {
       if (retries < CONFIG.MAX_RETRIES) {
@@ -241,7 +241,7 @@ class PeakSeedManager {
       this.stats.failed++;
       this.stats.processed++;
       this.log(`FAILED: ${twitch_username} - ${error.message}`);
-      return false;
+      return { processed: false, needsDelay: true }; // Delay after failed attempts too
     }
   }
 
@@ -272,7 +272,7 @@ class PeakSeedManager {
       
       console.log(`\n[${i + 1}/${users.length}] Processing: ${user.twitch_username}`);
       
-      await this.processUser(user);
+      const result = await this.processUser(user);
       
       // Save checkpoint after every user (CONFIG.BATCH_SIZE = 1)
       if (this.stats.processed % CONFIG.BATCH_SIZE === 0) {
@@ -283,8 +283,8 @@ class PeakSeedManager {
         }
       }
       
-      // Random delay between requests (human-like behavior)
-      if (i < users.length - 1) {
+      // Only delay after actual scraping attempts (not skipped users)
+      if (result.needsDelay && i < users.length - 1) {
         const delay = CONFIG.MIN_DELAY_MS + Math.random() * (CONFIG.MAX_DELAY_MS - CONFIG.MIN_DELAY_MS);
         console.log(`⏳ Waiting ${Math.round(delay)}ms...`);
         await this.sleep(delay);
