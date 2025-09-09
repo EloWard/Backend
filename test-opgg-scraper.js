@@ -1,16 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * Op.gg Peak Rank Scraper Test Script (Browser-Free Version)
+ * Op.gg Rank Scraper - Optimized Production Version
  * 
- * This script tests the complete op.gg scraping functionality using HTTP requests only:
- * - Multiple request strategies to get expanded season data
- * - Smart HTML parsing without browser automation
- * - Finding the absolute peak rank across ALL seasons
- * - Works in Cloudflare Workers environment
+ * Extracts current, peak, and historical ranks from op.gg ranked solo/duo pages
  * 
  * Usage: node test-opgg-scraper.js <opgg_url>
- * Example: node test-opgg-scraper.js "https://op.gg/lol/summoners/na/Spankers-CN1"
+ * Example: node test-opgg-scraper.js "https://op.gg/lol/summoners/na/Spankers-CN1?queue_type=SOLORANKED"
  */
 
 // Rank hierarchy for comparison
@@ -97,34 +93,6 @@ class OpGGScraper {
     return allRanks;
   }
 
-  /**
-   * Isolates the "Ranked Solo/Duo" section from the full HTML
-   * This is crucial to avoid mixing Solo/Duo ranks with Ranked Flex ranks
-   */
-  isolateRankedSoloSection(html) {
-    const soloTablePattern = /<table[^>]*>[\s\S]*?<caption>Ranked Solo\/Duo<\/caption>[\s\S]*?<\/table>/gi;
-    const tableMatch = html.match(soloTablePattern);
-    
-    if (tableMatch) {
-      const expandedPattern = /<div[^>]*class="[^"]*flex[^"]*"[^>]*>[\s\S]*?<strong[^>]*class="text-xl[^"]*"[^>]*>[^<]*<\/strong>[\s\S]*?<table[^>]*>[\s\S]*?<caption>Ranked Solo\/Duo<\/caption>[\s\S]*?<\/table>[\s\S]*?(?:<button[^>]*>Close|$)/gi;
-      const expandedMatch = html.match(expandedPattern);
-      
-      if (expandedMatch) {
-        return expandedMatch[0];
-      } else {
-        return tableMatch[0];
-      }
-    }
-    
-    const fallbackPattern = /(?:Ranked\s+)?Solo[\s\/]*Duo[\s\S]*?(?=(?:Ranked\s+)?Flex|<\/html>|$)/gi;
-    const fallbackMatch = html.match(fallbackPattern);
-    
-    if (fallbackMatch) {
-      return fallbackMatch[0];
-    }
-    
-    return null;
-  }
 
   extractCurrentRank(html) {
     // Extract current rank: diamond 2, 75 LP, 156W 122L, Win rate 56%
@@ -213,8 +181,6 @@ class OpGGScraper {
     
     return ranks;
   }
-
-
 
   isValidTier(tier) {
     const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
