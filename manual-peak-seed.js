@@ -61,8 +61,8 @@ const REGION_MAPPING = {
 const CONFIG = {
   CHECKPOINT_FILE: 'peak-seed-progress.json',
   LOG_FILE: 'peak-seed-log.txt',
-  MIN_DELAY_MS: 1000,    // Minimum 1 second between requests
-  MAX_DELAY_MS: 3000,    // Maximum 3 seconds between requests  
+  MIN_DELAY_MS: 2000,    // Minimum 2 second between requests
+  MAX_DELAY_MS: 5000,    // Maximum 5 seconds between requests  
   BATCH_SIZE: 1,         // Save checkpoint after every user (safer)
   MAX_RETRIES: 3         // Retries per user on failure
 };
