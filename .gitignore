@@ -4,3 +4,22 @@ node_modules/
 keys.txt
 .DS_Store
 twitch-chat-bot/
+
+# Manual peak seeding files
+.env.local
+peak-seed-progress.json
+peak-seed-log.txt
+
+# Cloudflare credentials
+CLOUDFLARE_ACCOUNT_ID
+CLOUDFLARE_DATABASE_ID  
+CLOUDFLARE_API_TOKEN
+
+# Database connection strings  
+DATABASE_URL
+*.env.local
+*.env.secret
+
+# Any manual scripts with hardcoded secrets
+*-local.js
+*-secret.js
