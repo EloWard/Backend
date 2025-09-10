@@ -170,6 +170,7 @@ class OpGGScraper {
   }
 
   private extractCurrentRank(html: string): any | null {
+    // Exact copy from working manual script
     const currentPattern = /<strong class="text-xl first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span class="leading-\[26px\]">(\d+)(?:<!--[^>]*-->)?W(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?L<\/span>[\s\S]*?<span>Win rate(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?%<\/span>/;
     
     const match = html.match(currentPattern);
@@ -201,6 +202,7 @@ class OpGGScraper {
   }
 
   private extractPeakRank(html: string): any | null {
+    // Exact copy from working manual script
     const peakPattern = /<strong class="text-sm first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span[^>]*>Top Tier<\/span>/;
     
     const match = html.match(peakPattern);
@@ -228,6 +230,7 @@ class OpGGScraper {
   private extractHistoricalRanks(html: string): any[] {
     const ranks: any[] = [];
     
+    // Exact copy from working manual script
     const tableRowPattern = /<tr class="bg-main-100[^"]*"[^>]*>.*?<strong[^>]*>(S\d{4}[^<]*)<\/strong>.*?<span class="text-xs lowercase first-letter:uppercase">([^<]+)<\/span>.*?<td align="right" class="text-xs text-gray-500">([0-9,]+)<\/td>/gs;
     
     let match;
@@ -373,10 +376,27 @@ async function updatePeakRank(puuid: string, riotId: string, region: string, pea
     const existingData = await lookupResponse.json();
     console.log(`[PeakSeed] Current user data:`, existingData);
     
-    // Normalize division for database (Master+ ALWAYS gets 'I', others keep their divisions)
-    let normalizedDivision = peakRank.division;
+    // Format division exactly like manual script (matches updateUserPeakRank logic)
+    let formattedDivision: string | null = null;
+    let formattedLP = parseInt(peakRank.lp) || 0;
+
+    // Handle division formatting to match database format (same as manual script)
     if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(peakRank.tier)) {
-      normalizedDivision = 'I'; // Master+ always gets 'I' regardless of scraped division
+      // Master+ always gets division = "I" (string, not null)
+      formattedDivision = 'I';
+    } else if (peakRank.tier === 'UNRANKED') {
+      // Unranked gets actual NULL (not string) division and 0 LP
+      formattedDivision = null; // JavaScript null, not "null" string
+      formattedLP = 0;
+    } else {
+      // Convert numeric divisions to Roman numerals if needed
+      if (peakRank.division && peakRank.division.trim() !== '') {
+        const divisionMap: Record<string, string> = { '1': 'I', '2': 'II', '3': 'III', '4': 'IV' };
+        formattedDivision = divisionMap[peakRank.division] || peakRank.division.toUpperCase();
+      } else {
+        // Explicitly set to JavaScript null (not undefined or empty string)
+        formattedDivision = null;
+      }
     }
 
     // Update with explicit peak rank override - preserves current rank data
@@ -389,12 +409,14 @@ async function updatePeakRank(puuid: string, riotId: string, region: string, pea
       lp: existingData.lp,
       region: region,
       plus_active: existingData.plus_active,
-      // Explicit peak rank override parameters
+      // Explicit peak rank override parameters (formatted like manual script)
       peak_rank_tier: peakRank.tier,
-      peak_rank_division: normalizedDivision,
-      peak_lp: peakRank.lp || 0
+      peak_rank_division: formattedDivision,
+      peak_lp: formattedLP
     };
 
+    // Debug: Log formatted data like manual script
+    console.log(`[PeakSeed] Formatted peak rank: ${peakRank.tier} ${formattedDivision || 'NULL'} ${formattedLP}LP`);
     console.log(`[PeakSeed] Update payload:`, updateData);
 
     const updateRequest = new Request('https://rank-worker/api/ranks/lol', {
