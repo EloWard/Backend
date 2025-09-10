@@ -22,6 +22,7 @@ interface Env {
   RIOT_CLIENT_ID: string;
   RIOT_API_KEY: string;
   RIOT_CLIENT_SECRET: string;
+  SCRAPERAPI_KEY: string; // ScraperAPI key for bypassing Cloudflare
   RANK_WORKER: Fetcher; // Service binding to rank-worker
   TWITCH_AUTH_WORKER: Fetcher; // Service binding to twitchauth-worker
   USERS_WORKER: Fetcher; // Service binding to users-worker
@@ -103,63 +104,47 @@ const RANK_ORDER: Record<string, number> = {
 
 const DIVISION_ORDER: Record<string, number> = { '4': 1, '3': 2, '2': 3, '1': 4 };
 
-// OpGG Scraper class (adapted for Cloudflare Workers)
+// OpGG Scraper class using ScraperAPI to bypass Cloudflare
 class OpGGScraper {
-  // Headers that work with Cloudflare Workers and bypass op.gg blocking
-  private defaultHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'Upgrade-Insecure-Requests': '1'
-  };
+  private scraperApiKey: string;
 
-  async fetchWithRetry(url: string, options: any = {}, retries = 3): Promise<string> {
-    const headers = { ...this.defaultHeaders, ...options.headers };
+  constructor(scraperApiKey: string) {
+    this.scraperApiKey = scraperApiKey;
+  }
+
+  async scrapeUrl(url: string): Promise<string> {
+    // Use ScraperAPI to bypass Cloudflare blocking
+    const scraperApiUrl = `http://api.scraperapi.com?api_key=${this.scraperApiKey}&url=${encodeURIComponent(url)}`;
     
-    for (let i = 0; i < retries; i++) {
-      try {
-        // Add small random delay to avoid rapid-fire requests
-        if (i > 0) {
-          const delay = 500 + Math.random() * 1000; // 500-1500ms random delay
-          console.log(`[OpGGScraper] Waiting ${Math.round(delay)}ms before attempt ${i + 1}`);
-          await this.sleep(delay);
-        }
-        
-        console.log(`[OpGGScraper] Attempt ${i + 1}/${retries} fetching: ${url}`);
-        const response = await fetch(url, {
-          method: 'GET',
-          headers,
-          ...options
-        });
+    console.log(`[OpGGScraper] Using ScraperAPI to fetch: ${url}`);
+    
+    const response = await fetch(scraperApiUrl, {
+      method: 'GET',
+      // ScraperAPI handles headers and retries automatically
+    });
 
-        console.log(`[OpGGScraper] Response status: ${response.status} ${response.statusText}`);
+    console.log(`[OpGGScraper] ScraperAPI response status: ${response.status} ${response.statusText}`);
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const text = await response.text();
-        console.log(`[OpGGScraper] Successfully fetched ${text.length} characters`);
-        return text;
-      } catch (error) {
-        console.error(`[OpGGScraper] Fetch attempt ${i + 1} failed:`, error instanceof Error ? error.message : String(error));
-        if (i === retries - 1) throw error;
-        
-        // Wait before retry with exponential backoff
-        await this.sleep(1000 * Math.pow(2, i));
+    if (!response.ok) {
+      // ScraperAPI specific error handling
+      if (response.status === 404) {
+        throw new Error(`Profile not found: HTTP 404`);
+      } else if (response.status === 429) {
+        throw new Error(`Rate limit exceeded: HTTP 429`);
+      } else if (response.status === 403) {
+        throw new Error(`Access forbidden: HTTP 403`);
+      } else {
+        throw new Error(`ScraperAPI error: HTTP ${response.status} ${response.statusText}`);
       }
     }
-    throw new Error('Max retries exceeded');
+
+    const text = await response.text();
+    console.log(`[OpGGScraper] Successfully fetched ${text.length} characters via ScraperAPI`);
+    return text;
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  async scrapeUrl(url: string): Promise<string> {
-    return await this.fetchWithRetry(url);
   }
 
   extractAllRanksFromHTML(html: string): any[] {
@@ -324,40 +309,29 @@ async function seedPeakRankAsync(
     
     console.log(`[PeakSeed] Scraping op.gg URL: ${opggUrl}`);
 
-    // Attempt scraping with retries
+    // Attempt scraping with ScraperAPI (handles retries automatically for up to 70 seconds)
     let peakRank: any = null;
-    const maxRetries = 3;
-    const scraper = new OpGGScraper(); // Create once, reuse for all attempts
+    const scraper = new OpGGScraper(env.SCRAPERAPI_KEY);
     
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`[PeakSeed] Scraping attempt ${attempt}/${maxRetries}`);
-        const html = await scraper.scrapeUrl(opggUrl);
-        console.log(`[PeakSeed] HTML scraped successfully, extracting ranks...`);
-        
-        const allRanks = scraper.extractAllRanksFromHTML(html);
-        console.log(`[PeakSeed] Extracted ${allRanks.length} ranks:`, allRanks);
-        
-        if (allRanks.length > 0) {
-          peakRank = scraper.findHighestRank(allRanks);
-          console.log(`[PeakSeed] Highest rank found:`, peakRank);
-          if (peakRank) {
-            console.log(`[PeakSeed] Peak rank confirmed: ${peakRank.tier} ${peakRank.division} ${peakRank.lp}LP`);
-            break;
-          }
-        } else {
-          console.log(`[PeakSeed] No ranks found in scraped HTML data`);
+    try {
+      console.log(`[PeakSeed] Scraping via ScraperAPI...`);
+      const html = await scraper.scrapeUrl(opggUrl);
+      console.log(`[PeakSeed] HTML scraped successfully, extracting ranks...`);
+      
+      const allRanks = scraper.extractAllRanksFromHTML(html);
+      console.log(`[PeakSeed] Extracted ${allRanks.length} ranks:`, allRanks);
+      
+      if (allRanks.length > 0) {
+        peakRank = scraper.findHighestRank(allRanks);
+        console.log(`[PeakSeed] Highest rank found:`, peakRank);
+        if (peakRank) {
+          console.log(`[PeakSeed] Peak rank confirmed: ${peakRank.tier} ${peakRank.division} ${peakRank.lp}LP`);
         }
-      } catch (error) {
-        console.error(`[PeakSeed] Scraping attempt ${attempt}/${maxRetries} failed:`, error instanceof Error ? error.message : String(error));
-        
-        if (attempt < maxRetries) {
-          // Wait before retry: 2s, 4s, 8s
-          const waitMs = 2000 * Math.pow(2, attempt - 1);
-          console.log(`[PeakSeed] Waiting ${waitMs}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-        }
+      } else {
+        console.log(`[PeakSeed] No ranks found in scraped HTML data`);
       }
+    } catch (error) {
+      console.error(`[PeakSeed] ScraperAPI scraping failed:`, error instanceof Error ? error.message : String(error));
     }
 
     // Update peak rank in database only if we found historical data
@@ -399,10 +373,10 @@ async function updatePeakRank(puuid: string, riotId: string, region: string, pea
     const existingData = await lookupResponse.json();
     console.log(`[PeakSeed] Current user data:`, existingData);
     
-    // Normalize division for database (Master+ gets 'I', others keep their divisions)
+    // Normalize division for database (Master+ ALWAYS gets 'I', others keep their divisions)
     let normalizedDivision = peakRank.division;
-    if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(peakRank.tier) && !normalizedDivision) {
-      normalizedDivision = 'I';
+    if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(peakRank.tier)) {
+      normalizedDivision = 'I'; // Master+ always gets 'I' regardless of scraped division
     }
 
     // Update with explicit peak rank override - preserves current rank data
