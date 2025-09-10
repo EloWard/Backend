@@ -12,6 +12,11 @@ interface Fetcher {
   fetch: (request: Request) => Promise<Response>;
 }
 
+interface ExecutionContext {
+  waitUntil(promise: Promise<any>): void;
+  passThroughOnException(): void;
+}
+
 // Define environment variable interface
 interface Env {
   RIOT_CLIENT_ID: string;
@@ -82,6 +87,366 @@ interface CompleteAuthRequest {
   region: string;
 }
 
+// Region mapping for op.gg URLs (matches extension logic)
+const REGION_MAPPING: Record<string, string> = {
+  'na1': 'na', 'euw1': 'euw', 'eun1': 'eune', 'kr': 'kr', 'br1': 'br',
+  'jp1': 'jp', 'la1': 'lan', 'la2': 'las', 'oc1': 'oce', 'tr1': 'tr',
+  'ru': 'ru', 'me1': 'me', 'sea': 'sea', 'sg2': 'sea', 'tw2': 'tw', 'vn2': 'vn'
+};
+
+// Rank hierarchy for comparison (matches test-opgg-scraper.js)
+const RANK_ORDER: Record<string, number> = {
+  'IRON': 1, 'BRONZE': 2, 'SILVER': 3, 'GOLD': 4, 
+  'PLATINUM': 5, 'EMERALD': 6, 'DIAMOND': 7,
+  'MASTER': 8, 'GRANDMASTER': 9, 'CHALLENGER': 10
+};
+
+const DIVISION_ORDER: Record<string, number> = { '4': 1, '3': 2, '2': 3, '1': 4 };
+
+// OpGG Scraper class (adapted for Cloudflare Workers)
+class OpGGScraper {
+  // Headers that work with Cloudflare Workers and bypass op.gg blocking
+  private defaultHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'Upgrade-Insecure-Requests': '1'
+  };
+
+  async fetchWithRetry(url: string, options: any = {}, retries = 3): Promise<string> {
+    const headers = { ...this.defaultHeaders, ...options.headers };
+    
+    for (let i = 0; i < retries; i++) {
+      try {
+        // Add small random delay to avoid rapid-fire requests
+        if (i > 0) {
+          const delay = 500 + Math.random() * 1000; // 500-1500ms random delay
+          console.log(`[OpGGScraper] Waiting ${Math.round(delay)}ms before attempt ${i + 1}`);
+          await this.sleep(delay);
+        }
+        
+        console.log(`[OpGGScraper] Attempt ${i + 1}/${retries} fetching: ${url}`);
+        const response = await fetch(url, {
+          method: 'GET',
+          headers,
+          ...options
+        });
+
+        console.log(`[OpGGScraper] Response status: ${response.status} ${response.statusText}`);
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const text = await response.text();
+        console.log(`[OpGGScraper] Successfully fetched ${text.length} characters`);
+        return text;
+      } catch (error) {
+        console.error(`[OpGGScraper] Fetch attempt ${i + 1} failed:`, error instanceof Error ? error.message : String(error));
+        if (i === retries - 1) throw error;
+        
+        // Wait before retry with exponential backoff
+        await this.sleep(1000 * Math.pow(2, i));
+      }
+    }
+    throw new Error('Max retries exceeded');
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async scrapeUrl(url: string): Promise<string> {
+    return await this.fetchWithRetry(url);
+  }
+
+  extractAllRanksFromHTML(html: string): any[] {
+    const allRanks: any[] = [];
+    
+    // Extract current rank
+    const currentRank = this.extractCurrentRank(html);
+    if (currentRank) {
+      allRanks.push(currentRank);
+    }
+
+    // Extract peak rank
+    const peakRank = this.extractPeakRank(html);
+    if (peakRank) {
+      allRanks.push(peakRank);
+    }
+
+    // Extract historical ranks
+    const historicalRanks = this.extractHistoricalRanks(html);
+    allRanks.push(...historicalRanks);
+
+    return allRanks;
+  }
+
+  private extractCurrentRank(html: string): any | null {
+    const currentPattern = /<strong class="text-xl first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span class="leading-\[26px\]">(\d+)(?:<!--[^>]*-->)?W(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?L<\/span>[\s\S]*?<span>Win rate(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?%<\/span>/;
+    
+    const match = html.match(currentPattern);
+    if (match) {
+      const rankText = match[1]?.trim().toLowerCase();
+      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
+      const wins = parseInt(match[3]) || 0;
+      const losses = parseInt(match[4]) || 0;
+      const winRate = parseInt(match[5]) || 0;
+      
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
+      
+      if (this.isValidTier(tier)) {
+        return {
+          tier,
+          division,
+          lp,
+          wins,
+          losses,
+          winRate,
+          type: 'current'
+        };
+      }
+    }
+    
+    return null;
+  }
+
+  private extractPeakRank(html: string): any | null {
+    const peakPattern = /<strong class="text-sm first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span[^>]*>Top Tier<\/span>/;
+    
+    const match = html.match(peakPattern);
+    if (match) {
+      const rankText = match[1]?.trim().toLowerCase();
+      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
+      
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
+      
+      if (this.isValidTier(tier)) {
+        return {
+          tier,
+          division,
+          lp,
+          type: 'peak'
+        };
+      }
+    }
+    
+    return null;
+  }
+
+  private extractHistoricalRanks(html: string): any[] {
+    const ranks: any[] = [];
+    
+    const tableRowPattern = /<tr class="bg-main-100[^"]*"[^>]*>.*?<strong[^>]*>(S\d{4}[^<]*)<\/strong>.*?<span class="text-xs lowercase first-letter:uppercase">([^<]+)<\/span>.*?<td align="right" class="text-xs text-gray-500">([0-9,]+)<\/td>/gs;
+    
+    let match;
+    while ((match = tableRowPattern.exec(html)) !== null) {
+      const season = match[1]?.trim();
+      const rankText = match[2]?.trim().toLowerCase();
+      const lp = parseInt(match[3]?.replace(/[^0-9]/g, '')) || 0;
+      
+      const rankParts = rankText.split(/\s+/);
+      const tier = rankParts[0]?.toUpperCase();
+      const division = rankParts[1] || null;
+      
+      if (this.isValidTier(tier)) {
+        ranks.push({
+          tier,
+          division,
+          lp,
+          season,
+          type: 'historical'
+        });
+      }
+    }
+    
+    return ranks;
+  }
+
+  private isValidTier(tier: string): boolean {
+    const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+    return validTiers.includes(tier);
+  }
+
+  findHighestRank(ranks: any[]): any | null {
+    if (ranks.length === 0) return null;
+    
+    return ranks.reduce((highest, current) => {
+      const currentValue = this.calculateRankValue(current);
+      const highestValue = this.calculateRankValue(highest);
+      
+      if (currentValue > highestValue) {
+        return current;
+      } else if (currentValue === highestValue && current.lp > highest.lp) {
+        return current;
+      }
+      
+      return highest;
+    });
+  }
+
+  private calculateRankValue(rank: any): number {
+    const tierValue = RANK_ORDER[rank.tier] || 0;
+    const divisionValue = DIVISION_ORDER[rank.division] || 5;
+    return tierValue * 10000 + divisionValue * 1000 + Math.min(rank.lp || 0, 9999);
+  }
+}
+
+
+// Async peak rank seeding function
+async function seedPeakRankAsync(
+  puuid: string, 
+  riotId: string, 
+  region: string, 
+  currentRank: any, 
+  env: Env
+): Promise<void> {
+  try {
+    console.log(`[PeakSeed] Starting peak rank seeding for ${riotId} (${region})`);
+    
+    const opggRegion = REGION_MAPPING[region.toLowerCase()];
+    if (!opggRegion) {
+      console.log(`[PeakSeed] Unknown region ${region} - keeping existing peak (current rank)`);
+      return;
+    }
+
+    // Construct op.gg URL like extension: gameName-tagLine?queue_type=SOLORANKED
+    const riotIdParts = riotId.split('#');
+    const encodedName = encodeURIComponent(riotIdParts[0] || '');
+    const tagLine = riotIdParts[1] || region.toUpperCase();
+    const opggUrl = `https://op.gg/lol/summoners/${opggRegion}/${encodedName}-${tagLine}?queue_type=SOLORANKED`;
+    
+    console.log(`[PeakSeed] Scraping op.gg URL: ${opggUrl}`);
+
+    // Attempt scraping with retries
+    let peakRank: any = null;
+    const maxRetries = 3;
+    const scraper = new OpGGScraper(); // Create once, reuse for all attempts
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[PeakSeed] Scraping attempt ${attempt}/${maxRetries}`);
+        const html = await scraper.scrapeUrl(opggUrl);
+        console.log(`[PeakSeed] HTML scraped successfully, extracting ranks...`);
+        
+        const allRanks = scraper.extractAllRanksFromHTML(html);
+        console.log(`[PeakSeed] Extracted ${allRanks.length} ranks:`, allRanks);
+        
+        if (allRanks.length > 0) {
+          peakRank = scraper.findHighestRank(allRanks);
+          console.log(`[PeakSeed] Highest rank found:`, peakRank);
+          if (peakRank) {
+            console.log(`[PeakSeed] Peak rank confirmed: ${peakRank.tier} ${peakRank.division} ${peakRank.lp}LP`);
+            break;
+          }
+        } else {
+          console.log(`[PeakSeed] No ranks found in scraped HTML data`);
+        }
+      } catch (error) {
+        console.error(`[PeakSeed] Scraping attempt ${attempt}/${maxRetries} failed:`, error instanceof Error ? error.message : String(error));
+        
+        if (attempt < maxRetries) {
+          // Wait before retry: 2s, 4s, 8s
+          const waitMs = 2000 * Math.pow(2, attempt - 1);
+          console.log(`[PeakSeed] Waiting ${waitMs}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+        }
+      }
+    }
+
+    // Update peak rank in database only if we found historical data
+    if (peakRank) {
+      console.log(`[PeakSeed] Successfully scraped peak rank, updating database`);
+      await updatePeakRank(puuid, riotId, region, peakRank, env);
+    } else {
+      console.log(`[PeakSeed] No historical peak rank found - keeping existing peak (current rank)`);
+    }
+
+  } catch (error) {
+    console.error(`[PeakSeed] Error during peak seeding: ${error instanceof Error ? error.message : String(error)}`);
+    console.log(`[PeakSeed] Keeping existing peak rank (current rank) due to scraping failure`);
+  }
+}
+
+async function updatePeakRank(puuid: string, riotId: string, region: string, peakRank: any, env: Env): Promise<void> {
+  try {
+    console.log(`[PeakSeed] Starting database update for ${riotId}`);
+    
+    // Get current data (optimized - only fetch what we need)
+    const lookupRequest = new Request('https://rank-worker/api/ranks/lol/by-puuid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Auth': env.RANK_WRITE_KEY
+      },
+      body: JSON.stringify({ puuid: puuid })
+    });
+
+    console.log(`[PeakSeed] Fetching existing user data...`);
+    const lookupResponse = await env.RANK_WORKER.fetch(lookupRequest);
+    if (!lookupResponse.ok) {
+      const errorText = await lookupResponse.text();
+      console.error(`[PeakSeed] Failed to lookup existing user data: ${lookupResponse.status} - ${errorText}`);
+      return;
+    }
+
+    const existingData = await lookupResponse.json();
+    console.log(`[PeakSeed] Current user data:`, existingData);
+    
+    // Normalize division for database (Master+ gets 'I', others keep their divisions)
+    let normalizedDivision = peakRank.division;
+    if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(peakRank.tier) && !normalizedDivision) {
+      normalizedDivision = 'I';
+    }
+
+    // Update with explicit peak rank override - preserves current rank data
+    const updateData = {
+      riot_puuid: puuid,
+      twitch_username: existingData.twitch_username,
+      riot_id: riotId,
+      rank_tier: existingData.rank_tier,
+      rank_division: existingData.rank_division,
+      lp: existingData.lp,
+      region: region,
+      plus_active: existingData.plus_active,
+      // Explicit peak rank override parameters
+      peak_rank_tier: peakRank.tier,
+      peak_rank_division: normalizedDivision,
+      peak_lp: peakRank.lp || 0
+    };
+
+    console.log(`[PeakSeed] Update payload:`, updateData);
+
+    const updateRequest = new Request('https://rank-worker/api/ranks/lol', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Auth': env.RANK_WRITE_KEY
+      },
+      body: JSON.stringify(updateData)
+    });
+
+    console.log(`[PeakSeed] Sending update request to rank worker...`);
+    const response = await env.RANK_WORKER.fetch(updateRequest);
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log(`[PeakSeed] Successfully updated peak rank:`, result);
+    } else {
+      const errorText = await response.text();
+      console.error(`[PeakSeed] Failed to update peak rank: ${response.status} - ${errorText}`);
+    }
+  } catch (error) {
+    console.error(`[PeakSeed] Error updating peak rank:`, error instanceof Error ? error.message : String(error));
+    console.error(`[PeakSeed] Error stack:`, error instanceof Error ? error.stack : 'No stack trace');
+  }
+}
 
 // Create a new router
 const router = Router();
@@ -285,7 +650,7 @@ router.get('/auth/redirect', async (request, env) => {
 });
 
 // Optimized single-call auth endpoint
-router.post('/auth/complete', async (request: Request, env: Env) => {
+router.post('/auth/complete', async (request: Request, env: Env, ctx: ExecutionContext) => {
   try {
     const body = await request.json() as CompleteAuthRequest;
     const { code, twitch_id, region } = body;
@@ -440,6 +805,25 @@ router.post('/auth/complete', async (request: Request, env: Env) => {
         error: 'database_error',
         error_description: 'Failed to store rank data'
       });
+    }
+
+    // Step 6.5: Trigger async peak rank seeding after successful connection
+    // This runs in background without blocking user response
+    const storeResult = await storeResponse.json();
+    if (storeResult.success) {
+      console.log(`[RiotAuth] Triggering async peak rank seeding for ${riotId}`);
+      // Use ctx.waitUntil to keep the async function alive after request completes
+      ctx.waitUntil(
+        seedPeakRankAsync(
+          accountData.puuid,
+          riotId,
+          region,
+          currentRank, // Pass current rank (could be null for unranked)
+          env
+        ).catch(error => {
+          console.error(`[RiotAuth] Peak rank seeding failed for ${riotId}: ${error instanceof Error ? error.message : String(error)}`);
+        })
+      );
     }
 
     // Step 7: Return complete user data for frontend
@@ -681,7 +1065,7 @@ async function validateRiotTokenAndGetAccount(riot_token: string): Promise<RiotA
 
 // Export fetch handler
 const workerExport = {
-  async fetch(request: Request, env: Env, ctx: any): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       return await router.handle(request, env, ctx);
     } catch (error) {
