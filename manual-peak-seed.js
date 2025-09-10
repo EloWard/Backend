@@ -76,7 +76,6 @@ class PeakSeedManager {
       processed: 0,
       successful: 0,
       failed: 0,
-      skipped: 0,
       startTime: new Date()
     };
   }
@@ -209,13 +208,6 @@ class PeakSeedManager {
     const { riot_puuid, twitch_username } = user;
     
     try {
-      // Check if already processed
-      if (this.progress.completed.includes(riot_puuid)) {
-        console.log(`⏭️  Skipping already processed: ${twitch_username}`);
-        this.stats.skipped++;
-        return { processed: true, needsDelay: false }; // No delay needed for skipped users
-      }
-
       const peakRank = await this.scrapeUserPeakRank(user);
       
       if (peakRank) {
@@ -253,24 +245,37 @@ class PeakSeedManager {
     console.log(`📊 Mode: ${this.isDryRun ? 'DRY RUN' : 'LIVE UPDATE'}`);
     
     await this.connectDatabase();
-    const users = await this.getAllUsers();
-    console.log(`👥 Found ${users.length} users to process`);
+    const allUsers = await this.getAllUsers();
+    console.log(`📊 Found ${allUsers.length} total users in database`);
     
-    // Filter users if starting from specific user
+    // Filter out already-processed users for maximum efficiency
+    const unprocessedUsers = allUsers.filter(user => !this.progress.completed.includes(user.riot_puuid));
+    const alreadyProcessed = allUsers.length - unprocessedUsers.length;
+    
+    console.log(`✅ Already processed: ${alreadyProcessed} users`);
+    console.log(`⏳ Remaining to process: ${unprocessedUsers.length} users`);
+    
+    if (unprocessedUsers.length === 0) {
+      console.log('🎉 All users already processed! Nothing to do.');
+      return;
+    }
+    
+    // Handle starting from specific user (now works on filtered list)
     let startIndex = 0;
     if (this.startFromUser) {
-      startIndex = users.findIndex(u => u.riot_puuid === this.startFromUser);
+      startIndex = unprocessedUsers.findIndex(u => u.riot_puuid === this.startFromUser);
       if (startIndex === -1) {
-        console.error(`❌ Start user ${this.startFromUser} not found`);
+        console.error(`❌ Start user ${this.startFromUser} not found in remaining users`);
         return;
       }
-      console.log(`⏯️  Starting from user ${startIndex + 1}/${users.length}`);
+      console.log(`⏯️  Starting from user ${startIndex + 1}/${unprocessedUsers.length} in remaining list`);
     }
 
-    for (let i = startIndex; i < users.length; i++) {
-      const user = users[i];
+    for (let i = startIndex; i < unprocessedUsers.length; i++) {
+      const user = unprocessedUsers[i];
+      const overallProgress = alreadyProcessed + i + 1;
       
-      console.log(`\n[${i + 1}/${users.length}] Processing: ${user.twitch_username}`);
+      console.log(`\n[${overallProgress}/${allUsers.length}] Processing: ${user.twitch_username}`);
       
       const result = await this.processUser(user);
       
@@ -284,7 +289,7 @@ class PeakSeedManager {
       }
       
       // Only delay after actual scraping attempts (not skipped users)
-      if (result.needsDelay && i < users.length - 1) {
+      if (result.needsDelay && i < unprocessedUsers.length - 1) {
         const delay = CONFIG.MIN_DELAY_MS + Math.random() * (CONFIG.MAX_DELAY_MS - CONFIG.MIN_DELAY_MS);
         console.log(`⏳ Waiting ${Math.round(delay)}ms...`);
         await this.sleep(delay);
@@ -369,7 +374,7 @@ class PeakSeedManager {
 
   logStats() {
     const elapsed = ((Date.now() - this.stats.startTime.getTime()) / 1000 / 60).toFixed(1);
-    console.log(`\n📊 Progress: ${this.stats.processed} processed | ✅ ${this.stats.successful} success | ❌ ${this.stats.failed} failed | ⏭️ ${this.stats.skipped} skipped | ⏱️ ${elapsed}min`);
+    console.log(`\n📊 Progress: ${this.stats.processed} processed | ✅ ${this.stats.successful} success | ❌ ${this.stats.failed} failed | ⏱️ ${elapsed}min`);
   }
 
   printFinalSummary() {
@@ -379,7 +384,6 @@ class PeakSeedManager {
     console.log(`   Total processed: ${this.stats.processed}`);
     console.log(`   ✅ Successful: ${this.stats.successful}`);
     console.log(`   ❌ Failed: ${this.stats.failed}`);
-    console.log(`   ⏭️ Skipped: ${this.stats.skipped}`);
     console.log(`   ⏱️ Total time: ${elapsed} minutes`);
     console.log(`   📄 Progress saved to: ${CONFIG.CHECKPOINT_FILE}`);
     console.log(`   📝 Logs saved to: ${CONFIG.LOG_FILE}`);
