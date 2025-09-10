@@ -54,7 +54,7 @@ loadEnvLocal();
 const REGION_MAPPING = {
   'na1': 'na', 'euw1': 'euw', 'eun1': 'eune', 'kr': 'kr', 'br1': 'br',
   'jp1': 'jp', 'la1': 'lan', 'la2': 'las', 'oc1': 'oce', 'tr1': 'tr',
-  'ru': 'ru', 'me1': 'me', 'sea': 'sg', 'tw2': 'tw', 'vn2': 'vn'
+  'ru': 'ru', 'me1': 'me', 'sg2': 'sea', 'tw2': 'tw', 'vn2': 'vn'
 };
 
 // Configuration
@@ -240,6 +240,7 @@ class PeakSeedManager {
   async run(options = {}) {
     this.isDryRun = options.dryRun || false;
     this.startFromUser = options.startFromUser || null;
+    this.retryFailed = options.retryFailed || false;
     
     console.log('🚀 Starting manual peak rank seeding...');
     console.log(`📊 Mode: ${this.isDryRun ? 'DRY RUN' : 'LIVE UPDATE'}`);
@@ -248,16 +249,42 @@ class PeakSeedManager {
     const allUsers = await this.getAllUsers();
     console.log(`📊 Found ${allUsers.length} total users in database`);
     
-    // Filter out already-processed users for maximum efficiency
-    const unprocessedUsers = allUsers.filter(user => !this.progress.completed.includes(user.riot_puuid));
-    const alreadyProcessed = allUsers.length - unprocessedUsers.length;
+    // Filter out already-processed users AND optionally previously failed users
+    const failedPuuids = this.progress.failed.map(f => f.puuid);
+    const unprocessedUsers = allUsers.filter(user => {
+      // Always skip completed users
+      if (this.progress.completed.includes(user.riot_puuid)) {
+        return false;
+      }
+      // Skip previously failed users unless --retry-failed is used
+      if (!this.retryFailed && failedPuuids.includes(user.riot_puuid)) {
+        return false;
+      }
+      return true;
+    });
     
-    console.log(`✅ Already processed: ${alreadyProcessed} users`);
+    const alreadyCompleted = this.progress.completed.length;
+    const previouslyFailed = failedPuuids.length;
+    const willRetryFailed = this.retryFailed ? previouslyFailed : 0;
+    const skippedFailed = this.retryFailed ? 0 : previouslyFailed;
+    
+    console.log(`✅ Already completed: ${alreadyCompleted} users`);
+    if (this.retryFailed && previouslyFailed > 0) {
+      console.log(`🔄 Will retry previously failed: ${willRetryFailed} users`);
+    } else if (previouslyFailed > 0) {
+      console.log(`❌ Skipping previously failed: ${skippedFailed} users`);
+    }
     console.log(`⏳ Remaining to process: ${unprocessedUsers.length} users`);
     
     if (unprocessedUsers.length === 0) {
       console.log('🎉 All users already processed! Nothing to do.');
       return;
+    }
+    
+    // If retrying failed users, clear their failed status so they can be marked as successful if they work this time
+    if (this.retryFailed && willRetryFailed > 0) {
+      console.log(`🧹 Clearing failed status for ${willRetryFailed} users to allow fresh attempts`);
+      this.progress.failed = [];
     }
     
     // Handle starting from specific user (now works on filtered list)
@@ -273,7 +300,7 @@ class PeakSeedManager {
 
     for (let i = startIndex; i < unprocessedUsers.length; i++) {
       const user = unprocessedUsers[i];
-      const overallProgress = alreadyProcessed + i + 1;
+      const overallProgress = alreadyCompleted + skippedFailed + i + 1;
       
       console.log(`\n[${overallProgress}/${allUsers.length}] Processing: ${user.twitch_username}`);
       
@@ -402,6 +429,8 @@ function parseArgs() {
   args.forEach(arg => {
     if (arg === '--dry-run') {
       options.dryRun = true;
+    } else if (arg === '--retry-failed') {
+      options.retryFailed = true;
     } else if (arg.startsWith('--start-from-user-id=')) {
       options.startFromUser = arg.split('=')[1];
     } else if (arg.startsWith('--batch-size=')) {
