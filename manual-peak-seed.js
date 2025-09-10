@@ -155,9 +155,13 @@ class PeakSeedManager {
     // Debug: Log actual data types being sent
     console.log(`📝 Sending to DB: tier="${formattedTier}" division=${formattedDivision === null ? 'NULL' : `"${formattedDivision}"`} lp=${formattedLP}`);
     
-    await this.executeD1Query(query, params);
-    
-    console.log(`✅ Updated ${puuid} peak rank: ${formattedTier} ${formattedDivision || 'NULL'} ${formattedLP}LP`);
+    try {
+      await this.executeD1Query(query, params);
+      console.log(`✅ Updated ${puuid} peak rank: ${formattedTier} ${formattedDivision || 'NULL'} ${formattedLP}LP`);
+    } catch (error) {
+      console.error(`❌ Database update failed for ${puuid}: ${error.message}`);
+      throw error; // Re-throw to trigger retry logic
+    }
   }
 
   constructOpGGUrl(riotId, region) {
