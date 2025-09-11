@@ -1,6 +1,6 @@
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -45,6 +45,16 @@ const worker = {
         return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: corsHeaders });
       }
       return getRankByPuuid(request, env);
+    }
+    
+    // User-facing options update endpoint (validated but no write key required)
+    if (path === "/api/options" && request.method === "PUT") {
+      return updateUserOptions(request, env);
+    }
+    
+    const getOptionsMatch = path.match(/^\/api\/options\/([^/]+)$/);
+    if (getOptionsMatch && request.method === "GET") {
+      return getUserOptions(getOptionsMatch[1], env);
     }
     
     return new Response("Not found", { status: 404, headers: corsHeaders });
@@ -249,7 +259,7 @@ async function storeRank(request, env) {
 async function getRank(username, env) {
   try {
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak FROM lol_ranks WHERE twitch_username = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak, animate_badge FROM lol_ranks WHERE twitch_username = ?"
     ).bind(username).first();
     
     if (!result) {
@@ -266,7 +276,8 @@ async function getRank(username, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak
+      show_peak: result.show_peak,
+      animate_badge: result.animate_badge
     };
     
     return jsonResponse(responseData);
@@ -431,6 +442,88 @@ async function refreshSingleRank(puuid, env) {
   }
 
   return result;
+}
+
+async function getUserOptions(puuid, env) {
+  try {
+    const result = await env.DB.prepare(
+      "SELECT show_peak, animate_badge, plus_active FROM lol_ranks WHERE riot_puuid = ?"
+    ).bind(puuid).first();
+    
+    if (!result) {
+      return jsonResponse({ error: "User not found" }, 404);
+    }
+    
+    return jsonResponse({
+      show_peak: Boolean(result.show_peak),
+      animate_badge: Boolean(result.animate_badge),
+      plus_active: Boolean(result.plus_active)
+    });
+  } catch (error) {
+    console.error(`Error fetching options for ${puuid}:`, error);
+    return jsonResponse({ error: "Failed to retrieve options", details: error.message }, 500);
+  }
+}
+
+async function updateUserOptions(request, env) {
+  try {
+    const body = await request.json();
+    const { puuid, twitch_username, show_peak, animate_badge } = body;
+    
+    if (!puuid || !twitch_username) {
+      return jsonResponse({ error: "PUUID and Twitch username are required" }, 400);
+    }
+    
+    // Verify PUUID and Twitch username match, get plus_active in single query
+    const userResult = await env.DB.prepare(
+      "SELECT plus_active FROM lol_ranks WHERE riot_puuid = ? AND twitch_username = ?"
+    ).bind(puuid, twitch_username.toLowerCase()).first();
+    
+    if (!userResult) {
+      return jsonResponse({ error: "User not found or credentials do not match" }, 403);
+    }
+    
+    if (!userResult.plus_active) {
+      return jsonResponse({ error: "Premium subscription required to modify options" }, 403);
+    }
+    
+    // Build update query dynamically based on provided fields
+    const updates = [];
+    const params = [];
+    
+    if (show_peak !== undefined) {
+      updates.push("show_peak = ?");
+      params.push(show_peak ? 1 : 0);
+    }
+    
+    if (animate_badge !== undefined) {
+      updates.push("animate_badge = ?");
+      params.push(animate_badge ? 1 : 0);
+    }
+    
+    if (updates.length === 0) {
+      return jsonResponse({ error: "No options provided to update" }, 400);
+    }
+    
+    params.push(puuid);
+    
+    const query = `UPDATE lol_ranks SET ${updates.join(", ")} WHERE riot_puuid = ?`;
+    await env.DB.prepare(query).bind(...params).run();
+    
+    // Return updated options
+    const updatedResult = await env.DB.prepare(
+      "SELECT show_peak, animate_badge, plus_active FROM lol_ranks WHERE riot_puuid = ?"
+    ).bind(puuid).first();
+    
+    return jsonResponse({
+      show_peak: Boolean(updatedResult.show_peak),
+      animate_badge: Boolean(updatedResult.animate_badge),
+      plus_active: Boolean(updatedResult.plus_active)
+    });
+  } catch (error) {
+    console.error(`Error updating user options:`, error);
+    return jsonResponse({ error: "Failed to update options", details: error.message }, 500);
+  }
 }
 
 export default worker;
