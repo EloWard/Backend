@@ -13,7 +13,8 @@ CREATE TABLE lol_ranks (
   peak_rank_tier TEXT,               -- Peak rank tier achieved
   peak_rank_division TEXT,           -- Peak rank division achieved
   peak_lp INTEGER,                   -- Peak LP achieved
-  show_peak BOOLEAN DEFAULT 0        -- Whether to display peak rank instead of current rank
+  show_peak BOOLEAN DEFAULT 0,       -- Whether to display peak rank instead of current rank
+  animate_badge BOOLEAN DEFAULT 0    -- Whether to show animated badge effects
 );
 
 -- Add index for efficient Twitch username lookups (most common search)
