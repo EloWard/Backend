@@ -319,7 +319,7 @@ async function getRankByPuuid(request, env) {
     }
     
     const result = await env.DB.prepare(
-      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak FROM lol_ranks WHERE riot_puuid = ?"
+      "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak, animate_badge FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(requestedPuuid).first();
     
     if (!result) {
@@ -336,7 +336,8 @@ async function getRankByPuuid(request, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak
+      show_peak: result.show_peak,
+      animate_badge: result.animate_badge
     };
     
     return jsonResponse(responseData);
