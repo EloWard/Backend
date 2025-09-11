@@ -115,7 +115,11 @@ function isRankHigher(newRank, currentRank) {
 
 async function storeRank(request, env) {
   try {
-    const { riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active } = await request.json();
+    const { 
+      riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active,
+      // Optional peak rank override parameters for seeding
+      peak_rank_tier, peak_rank_division, peak_lp
+    } = await request.json();
     
     if (!riot_puuid || !twitch_username || !rank_tier) {
       return jsonResponse({ 
@@ -128,25 +132,38 @@ async function storeRank(request, env) {
     const shouldUpdatePlusActive = plus_active !== undefined;
     const plusActiveValue = plus_active ? 1 : 0;
     
-    // Get existing peak rank for comparison
-    const existingData = await env.DB.prepare(
-      "SELECT peak_rank_tier, peak_rank_division, peak_lp FROM lol_ranks WHERE riot_puuid = ?"
-    ).bind(riot_puuid).first();
+    // Determine peak rank values - use explicit override if provided, otherwise calculate
+    let peakTier, peakDivision, peakLp, updatePeak = false;
     
-    const newRank = { rank_tier, rank_division, lp: lp || 0 };
-    const currentPeak = existingData ? {
-      rank_tier: existingData.peak_rank_tier,
-      rank_division: existingData.peak_rank_division,
-      lp: existingData.peak_lp
-    } : null;
-    
-    // Check if new rank is higher than current peak using robust comparison
-    const updatePeak = isRankHigher(newRank, currentPeak);
-    
-    // Update all peak fields if new rank is higher, otherwise preserve existing peak
-    const peakTier = updatePeak ? rank_tier : (currentPeak?.rank_tier || rank_tier);
-    const peakDivision = updatePeak ? (rank_division || null) : (currentPeak?.rank_division || rank_division || null);
-    const peakLp = updatePeak ? (lp ?? 0) : (currentPeak?.lp ?? 0); // Preserve existing peak LP, default to 0 if null
+    if (peak_rank_tier !== undefined) {
+      // Explicit peak rank provided (e.g., from op.gg seeding)
+      // Allow null/undefined for peak_rank_division (Master+ ranks) and peak_lp
+      peakTier = peak_rank_tier;
+      peakDivision = peak_rank_division !== undefined ? peak_rank_division : null;
+      peakLp = peak_lp !== undefined ? peak_lp : 0;
+      updatePeak = true; // Mark as explicit update
+      console.log(`[RankWorker] Using explicit peak rank: ${peakTier} ${peakDivision} ${peakLp}LP`);
+    } else {
+      // Calculate peak rank automatically (existing logic)
+      const existingData = await env.DB.prepare(
+        "SELECT peak_rank_tier, peak_rank_division, peak_lp FROM lol_ranks WHERE riot_puuid = ?"
+      ).bind(riot_puuid).first();
+      
+      const newRank = { rank_tier, rank_division, lp: lp || 0 };
+      const currentPeak = existingData ? {
+        rank_tier: existingData.peak_rank_tier,
+        rank_division: existingData.peak_rank_division,
+        lp: existingData.peak_lp
+      } : null;
+      
+      // Check if new rank is higher than current peak using robust comparison
+      updatePeak = isRankHigher(newRank, currentPeak);
+      
+      // Update all peak fields if new rank is higher, otherwise preserve existing peak
+      peakTier = updatePeak ? rank_tier : (currentPeak?.rank_tier || rank_tier);
+      peakDivision = updatePeak ? (rank_division || null) : (currentPeak?.rank_division || rank_division || null);
+      peakLp = updatePeak ? (lp ?? 0) : (currentPeak?.lp ?? 0); // Preserve existing peak LP, default to 0 if null
+    }
     
     let result;
     if (shouldUpdatePlusActive) {
@@ -217,7 +234,7 @@ async function storeRank(request, env) {
       rank_division,
       lp,
       region,
-      peak_updated: updatePeak,
+      peak_updated: peak_rank_tier !== undefined ? 'explicit_override' : (updatePeak ? 'rank_comparison' : false),
       changes: result.changes || 0
     });
   } catch (error) {
