@@ -345,11 +345,12 @@ async function batchRefreshAllRanks(env, ctx) {
   console.log('[RankCron] Starting batch rank refresh process');
 
   try {
-    // Fetch PUUIDs that need refreshing (only users updated more than 24 hours ago)
+    // Fetch PUUIDs that need refreshing (only users updated more than 24 hours ago, excluding specific PUUID)
     const twentyFourHoursAgo = Math.floor(Date.now() / 1000) - (24 * 60 * 60); // 86400 seconds
+    const excludedPuuid = "MF5og4YOGryMysvRDNx62aYesoyMwErT3rgfwmAq31fEBaeFniXzHn-nLhRAhnjMsNj56ifO_MlXKw";
     const result = await env.DB.prepare(
-      "SELECT riot_puuid, twitch_username, last_updated FROM lol_ranks WHERE last_updated < ? ORDER BY last_updated ASC"
-    ).bind(twentyFourHoursAgo).all();
+      "SELECT riot_puuid, twitch_username, last_updated FROM lol_ranks WHERE last_updated < ? AND riot_puuid != ? ORDER BY last_updated ASC"
+    ).bind(twentyFourHoursAgo, excludedPuuid).all();
 
     if (!result.results || result.results.length === 0) {
       console.log('[RankCron] No ranks found that need refreshing (all updated within 24 hours)');
