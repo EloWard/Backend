@@ -499,6 +499,7 @@ async function handleUserLookup(request, env, corsHeaders) {
 /**
  * Handles riot data fallback lookup by twitch_id
  * Allows users to retrieve their own riot data if it exists in the database
+ * Uses the ranks-worker to get properly processed rank data with user options applied
  */
 async function handleRiotDataFallback(request, env, corsHeaders) {
   try {
@@ -522,33 +523,64 @@ async function handleRiotDataFallback(request, env, corsHeaders) {
       return createErrorResponse(404, 'User not found', null, corsHeaders);
     }
     
-    // Now look up riot data using the twitch username
-    const riotQuery = `
-      SELECT riot_puuid, riot_id, rank_tier, rank_division, lp, region, plus_active
-      FROM lol_ranks 
+    // Get PUUID from database (required for response, ranks-worker doesn't expose PUUIDs for security)
+    const puuidQuery = `
+      SELECT riot_puuid FROM lol_ranks 
       WHERE twitch_username = ?
       LIMIT 1
     `;
     
-    const riotResult = await env.DB.prepare(riotQuery).bind(userResult.channel_name).first();
+    const puuidResult = await env.DB.prepare(puuidQuery).bind(userResult.channel_name).first();
     
-    if (!riotResult) {
+    if (!puuidResult) {
       return createErrorResponse(404, 'No riot account found for this user', null, corsHeaders);
     }
     
-    // Return the riot data needed by the extension
+    // Check if RANK_WRITE_KEY is available
+    if (!env.RANK_WRITE_KEY) {
+      return createErrorResponse(500, 'Server configuration error', null, corsHeaders);
+    }
+    
+    // Use service binding for internal worker-to-worker communication
+    const ranksRequest = new Request('https://ranks-worker/api/ranks/lol/by-puuid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Auth': env.RANK_WRITE_KEY
+      },
+      body: JSON.stringify({ puuid: puuidResult.riot_puuid })
+    });
+    
+    const ranksResponse = await env.RANKS_WORKER.fetch(ranksRequest);
+    
+    if (!ranksResponse.ok) {
+      if (ranksResponse.status === 404) {
+        return createErrorResponse(404, 'No riot account found for this user', null, corsHeaders);
+      }
+      if (ranksResponse.status === 403) {
+        return createErrorResponse(500, 'Internal authentication failed with ranks service', null, corsHeaders);
+      }
+      return createErrorResponse(500, 'Failed to fetch rank data from ranks service', null, corsHeaders);
+    }
+    
+    const rankData = await ranksResponse.json();
+    
+    // Return the riot data needed by the extension with properly applied user options
     return new Response(JSON.stringify({ 
       success: true,
       riot_data: {
-        puuid: riotResult.riot_puuid,
-        riotId: riotResult.riot_id,
+        puuid: puuidResult.riot_puuid,
+        riotId: rankData.riot_id,
         rankInfo: {
-          tier: riotResult.rank_tier,
-          rank: riotResult.rank_division,
-          leaguePoints: riotResult.lp
+          tier: rankData.rank_tier,
+          rank: rankData.rank_division,
+          leaguePoints: rankData.lp
         },
-        region: riotResult.region,
-        plus_active: riotResult.plus_active || false
+        region: rankData.region,
+        plus_active: rankData.plus_active || false,
+        // Include user options for frontend display
+        show_peak: rankData.show_peak || false,
+        animate_badge: rankData.animate_badge || false
       }
     }), { 
       status: 200,

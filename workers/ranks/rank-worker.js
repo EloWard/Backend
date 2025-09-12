@@ -267,6 +267,7 @@ async function getRank(username, env) {
     }
     
     // Return peak rank data if show_peak is true, otherwise current rank
+    // This endpoint is used for chat display - only return rank data + animate_badge
     const responseData = {
       twitch_username: result.twitch_username,
       riot_id: result.riot_id,
@@ -274,7 +275,6 @@ async function getRank(username, env) {
       rank_division: result.show_peak ? result.peak_rank_division : result.rank_division,
       lp: result.show_peak ? result.peak_lp : result.lp,
       region: result.region,
-      plus_active: result.plus_active,
       last_updated: result.last_updated,
       animate_badge: result.animate_badge
     };
@@ -326,6 +326,7 @@ async function getRankByPuuid(request, env) {
     }
     
     // Return peak rank data if show_peak is true, otherwise current rank
+    // This endpoint is used for frontend sync - return all options for proper state management
     const responseData = {
       twitch_username: result.twitch_username,
       riot_id: result.riot_id,
@@ -335,6 +336,7 @@ async function getRankByPuuid(request, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
+      show_peak: result.show_peak,
       animate_badge: result.animate_badge
     };
     
