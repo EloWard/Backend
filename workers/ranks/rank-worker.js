@@ -276,7 +276,6 @@ async function getRank(username, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak,
       animate_badge: result.animate_badge
     };
     
@@ -336,7 +335,6 @@ async function getRankByPuuid(request, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak,
       animate_badge: result.animate_badge
     };
     
