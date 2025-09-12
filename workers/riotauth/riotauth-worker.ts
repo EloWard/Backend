@@ -883,7 +883,7 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
       });
     }
 
-    // Look up user in lol_ranks database to get region
+    // Get user data from database to find region and user info
     const getUserRequest = new Request('https://rank-worker/api/ranks/lol/by-puuid', {
       method: 'POST',
       headers: {
@@ -896,85 +896,86 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
     const getUserResponse = await env.RANK_WORKER.fetch(getUserRequest);
     
     if (!getUserResponse.ok) {
-      // User not found in database - clear frontend persistent data
-      return corsResponse(404, {
+      return corsResponse(getUserResponse.status === 404 ? 404 : 500, {
         status: 'error',
-        message: 'User not found. Please reconnect your account.',
-        action: 'clear_persistent_data'
+        message: getUserResponse.status === 404 
+          ? 'Account not found. Please reconnect your League account.'
+          : 'Failed to retrieve account data. Please try again.',
+        ...(getUserResponse.status === 404 && { action: 'clear_persistent_data' })
       });
     }
 
     const userData = await getUserResponse.json();
-    const { region, twitch_username } = userData;
 
-    // Fetch current rank from Riot API using PUUID
-    const leagueUrl = `https://${region}.api.riotgames.com/lol/league/v4/entries/by-puuid/${puuid}`;
+    // Fetch current rank from Riot API
+    const leagueUrl = `https://${userData.region}.api.riotgames.com/lol/league/v4/entries/by-puuid/${puuid}`;
     const leagueResponse = await fetch(leagueUrl, {
-      headers: {
-        'X-Riot-Token': env.RIOT_API_KEY
-      }
+      headers: { 'X-Riot-Token': env.RIOT_API_KEY }
     });
 
     if (!leagueResponse.ok) {
-      // Riot API error - clear frontend persistent data
-      return corsResponse(leagueResponse.status, {
-        status: 'error',
-        message: 'Failed to fetch rank from Riot API. Please reconnect your account.',
-        action: 'clear_persistent_data',
-        riot_error: await leagueResponse.text()
-      });
+      throw new Error(`Riot API error: ${leagueResponse.status}`);
     }
 
     const leagueData = await leagueResponse.json() as LeagueEntry[];
     const currentRank = leagueData.find(entry => entry.queueType === 'RANKED_SOLO_5x5');
 
-    // Update database with new rank data
-    const rankData = {
-      riot_puuid: puuid,
-      twitch_username: twitch_username,
-      riot_id: userData.riot_id,
-      rank_tier: currentRank ? currentRank.tier : 'UNRANKED',
-      rank_division: currentRank ? currentRank.rank : null,
-      lp: currentRank ? currentRank.leaguePoints : 0,
-      region: region
-    };
-
+    // Update current rank in database (rank-worker handles peak rank logic)
     const updateRequest = new Request('https://rank-worker/api/ranks/lol', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Internal-Auth': env.RANK_WRITE_KEY
       },
-      body: JSON.stringify(rankData)
+      body: JSON.stringify({
+        riot_puuid: puuid,
+        twitch_username: userData.twitch_username,
+        riot_id: userData.riot_id,
+        rank_tier: currentRank ? currentRank.tier : 'UNRANKED',
+        rank_division: currentRank ? currentRank.rank : null,
+        lp: currentRank ? currentRank.leaguePoints : 0,
+        region: userData.region
+      })
     });
 
     const updateResponse = await env.RANK_WORKER.fetch(updateRequest);
-
     if (!updateResponse.ok) {
-      const errorText = await updateResponse.text();
-      return corsResponse(updateResponse.status, {
-        status: 'error',
-        message: 'Failed to update rank data',
-        error: errorText
-      });
+      throw new Error(`Failed to update rank: ${updateResponse.status}`);
     }
 
-    // Return the updated rank data to frontend
+    // Get final user data (rank-worker returns correct current/peak based on show_peak setting)
+    const getFinalUserRequest = new Request('https://rank-worker/api/ranks/lol/by-puuid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Auth': env.RANK_WRITE_KEY
+      },
+      body: JSON.stringify({ puuid })
+    });
+    
+    const finalUserResponse = await env.RANK_WORKER.fetch(getFinalUserRequest);
+    if (!finalUserResponse.ok) {
+      throw new Error(`Failed to retrieve updated data: ${finalUserResponse.status}`);
+    }
+
+    const finalUserData = await finalUserResponse.json();
+
     return corsResponse(200, {
       status: 'success',
       message: 'Rank refreshed successfully',
       data: {
-        tier: rankData.rank_tier,
-        rank: rankData.rank_division,
-        lp: rankData.lp,
-        region: rankData.region
+        rank_tier: finalUserData.rank_tier,
+        rank_division: finalUserData.rank_division,
+        lp: finalUserData.lp,
+        region: finalUserData.region,
+        plus_active: finalUserData.plus_active || false
       }
     });
   } catch (error) {
     return corsResponse(500, {
       status: 'error',
-      message: 'Internal server error during rank refresh',
-      error: error instanceof Error ? error.message : String(error),
+      message: 'Failed to refresh rank',
+      error: error instanceof Error ? error.message : String(error)
     });
   }
 });
