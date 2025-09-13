@@ -1039,12 +1039,23 @@ async function syncSubscriptionStatusToRanks(env, twitch_id, plus_active) {
       return;
     }
 
-    // Update plus_active in lol_ranks table
-    const syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ?';
-    const syncResult = await env.DB.prepare(syncQuery).bind(plus_active ? 1 : 0, userResult.channel_name).run();
+    // Update plus_active in lol_ranks table and reset options if deactivating
+    let syncQuery, syncParams;
+    if (plus_active) {
+      // Just update plus_active when activating
+      syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ?';
+      syncParams = [1, userResult.channel_name];
+    } else {
+      // When deactivating, also reset all plus options to false
+      syncQuery = 'UPDATE lol_ranks SET plus_active = ?, show_peak = ?, animate_badge = ? WHERE twitch_username = ?';
+      syncParams = [0, 0, 0, userResult.channel_name];
+    }
+    
+    const syncResult = await env.DB.prepare(syncQuery).bind(...syncParams).run();
     
     if (syncResult.changes && syncResult.changes > 0) {
-      console.log(`Synced subscription status to ranks table: ${userResult.channel_name} -> plus_active: ${plus_active}`);
+      const resetMsg = plus_active ? '' : ' and reset options';
+      console.log(`Synced subscription status to ranks table: ${userResult.channel_name} -> plus_active: ${plus_active}${resetMsg}`);
     }
   } catch (error) {
     console.error('Error syncing subscription status to ranks:', error);
