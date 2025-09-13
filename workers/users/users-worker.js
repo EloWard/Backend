@@ -69,9 +69,6 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleDashboardDataById(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
-      // Removed legacy name-based dashboard endpoint
-      } else if (url.pathname.includes('/dashboard/data')) {
-        response = new Response('Not Found', { status: 404 });
       } else if (url.pathname.includes('/user/register')) {
         if (request.method === 'POST') {
           // Require internal auth for write of Twitch users
@@ -89,9 +86,6 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleChannelActiveUpdateById(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
-      // Removed legacy name-based channel active update endpoint
-      } else if (url.pathname.includes('/channel/active/update')) {
-        response = new Response('Not Found', { status: 404 });
       } else if (url.pathname.includes('/user/lookup')) {
         response = request.method === 'POST'
           ? await handleUserLookup(request, env, corsHeaders)
@@ -336,11 +330,6 @@ async function handleUserRegistration(request, env, corsHeaders) {
 }
 
 /**
- * Handles dashboard data retrieval for a channel
- */
-// Removed legacy handleDashboardData
-
-/**
  * Handles dashboard data retrieval by twitch_id
  */
 async function handleDashboardDataById(request, env, corsHeaders) {
@@ -387,11 +376,6 @@ async function handleDashboardDataById(request, env, corsHeaders) {
     );
   }
 }
-
-/**
- * Handles updating the channel_active status for a channel
- */
-// Removed legacy handleChannelActiveUpdate
 
 /**
  * Handles updating the channel_active status for a channel by twitch_id
