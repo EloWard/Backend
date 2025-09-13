@@ -555,9 +555,9 @@ async function handleRiotDataFallback(request, env, corsHeaders) {
       riot_data: {
         puuid: puuidResult.riot_puuid,
         riotId: rankData.riot_id,
-        rankInfo: {
+        soloQueueRank: {
           tier: rankData.rank_tier,
-          rank: rankData.rank_division,
+          division: rankData.rank_division,
           leaguePoints: rankData.lp
         },
         region: rankData.region,
