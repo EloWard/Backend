@@ -138,7 +138,6 @@ D1 Database
 - Purpose: Handles Stripe payments, webhooks, and subscription management
 - Database Access: Direct D1 binding
 - Endpoints:
-  - `POST /api/create-checkout-session` — Status: Active (public write).
   - `POST /api/create-portal-session` — Status: Active (public write).
   - `POST /api/webhook` — Status: Active (webhook; raw body verification).
   - `POST /subscription/status` — Status: Active (public read). Returns subscription status for badge display.

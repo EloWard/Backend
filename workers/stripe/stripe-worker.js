@@ -72,9 +72,7 @@ const stripeWorker = {
       };
 
       // Route handling for non-webhook routes
-      if (url.pathname === '/api/create-checkout-session') {
-        response = await handleCreateCheckoutSession(request, env, corsHeaders, stripe);
-      } else if (url.pathname === '/api/create-portal-session') {
+      if (url.pathname === '/api/create-portal-session') {
         response = await handleCreatePortalSession(request, env, corsHeaders, stripe);
       } else if (url.pathname === '/subscription/status') {
         if (request.method === 'POST') {
@@ -141,87 +139,6 @@ const stripeWorker = {
 
 // Export the worker
 export default stripeWorker;
-
-// Handler for creating a checkout session
-async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 });
-  }
-
-  let data;
-  try {
-    data = await request.json();
-  } catch (err) {
-    // Return a specific error for invalid JSON
-    return new Response(JSON.stringify({ error: 'Invalid JSON format' }), { 
-        status: 400, 
-        headers: { 'Content-Type': 'application/json' } // Basic headers, CORS added later
-    });
-  }
-  
-  const { channelId, channelName, returnUrl } = data;
-
-  if (!channelId) {
-    return new Response(JSON.stringify({ error: 'Channel ID is required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  // Ensure we have a channel name, defaulting to channelId if not provided
-  const actualChannelName = channelName || channelId;
-
-  try {
-    // Verify if the channel exists in the database
-    // NOTE: Assumes env.DB is configured correctly for this worker
-    // If DB access is needed here, ensure bindings are set up in wrangler.toml
-    /* 
-    const channel = await env.DB.prepare(
-      'SELECT * FROM channels WHERE id = ?'
-    ).bind(channelId).first();
-
-    if (!channel) {
-      return new Response(JSON.stringify({ error: 'Channel not found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    */
-    // Temporarily bypass channel check if DB isn't configured for this worker
-    console.log(`Received checkout request for channelId: ${channelId}`);
-
-    // Create a checkout session
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price: env.price_id, // Ensure price_id is set in env
-          quantity: 1,
-        },
-      ],
-      mode: 'subscription',
-      success_url: returnUrl || 'https://eloward.com/dashboard?subscription=success',
-      cancel_url: returnUrl || 'https://eloward.com/dashboard?subscription=canceled',
-      client_reference_id: channelId, // Pass channelId to webhook
-      metadata: {
-        channelId: channelId, // Numeric Twitch ID
-        channelName: actualChannelName, // Twitch username
-      },
-      allow_promotion_codes: true,
-      // Optionally add customer_email if available
-    });
-
-    return new Response(JSON.stringify({ url: session.url }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } catch (error) {
-    console.error('Checkout session error:', error);
-    // Throw the error so it's caught by the main fetch handler's catch block
-    // This ensures consistent error handling and CORS headers via handleError
-    error.status = 500; // Add a status to the error object
-    throw error;
-  }
-}
 
 // Handler for creating a customer portal session
 async function handleCreatePortalSession(request, env, corsHeaders, stripe) {
