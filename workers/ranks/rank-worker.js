@@ -336,8 +336,8 @@ async function getRankByPuuid(request, env) {
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak, // Raw user preference
-      animate_badge: result.animate_badge // Raw user preference
+      show_peak: result.plus_active && result.show_peak, // Effective preference
+      animate_badge: result.plus_active && result.animate_badge // Effective preference
     };
     
     return jsonResponse(responseData);
