@@ -72,7 +72,9 @@ const stripeWorker = {
       };
 
       // Route handling for non-webhook routes
-      if (url.pathname === '/api/create-portal-session') {
+      if (url.pathname === '/api/create-checkout-session') {
+        response = await handleCreateCheckoutSession(request, env, corsHeaders, stripe);
+      } else if (url.pathname === '/api/create-portal-session') {
         response = await handleCreatePortalSession(request, env, corsHeaders, stripe);
       } else if (url.pathname === '/subscription/status') {
         if (request.method === 'POST') {
@@ -139,6 +141,106 @@ const stripeWorker = {
 
 // Export the worker
 export default stripeWorker;
+
+// Handler for creating a checkout session with native billing frequency toggle
+async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  let data;
+  try {
+    data = await request.json();
+  } catch (err) {
+    return new Response(JSON.stringify({ error: 'Invalid JSON format' }), { 
+      status: 400, 
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+  
+  const { channelId, channelName, returnUrl, mode } = data;
+
+  if (!channelId) {
+    return new Response(JSON.stringify({ error: 'Channel ID is required' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  const finalChannelName = channelName || channelId;
+  const finalReturnUrl = returnUrl || 'https://www.eloward.com/dashboard?subscription=success';
+
+  try {
+    let sessionConfig = {
+      payment_method_types: ['card'],
+      mode: 'subscription',
+      success_url: finalReturnUrl,
+      cancel_url: 'https://www.eloward.com/dashboard',
+      client_reference_id: channelId,
+      customer_email: data.email || null,
+      metadata: {
+        channel_id: channelId,
+        channel_name: finalChannelName,
+        checkout_mode: mode
+      }
+    };
+
+    // Configure line items based on mode
+    if (mode === 'with_toggle') {
+      // Monthly button: Start with monthly but allow customer to see yearly option
+      // Note: True billing frequency toggles require pricing tables
+      // This provides clean monthly checkout
+      sessionConfig.line_items = [
+        {
+          price: env.MONTHLY_PRICE_ID,
+          quantity: 1,
+        }
+      ];
+      sessionConfig.subscription_data = {
+        metadata: {
+          channel_id: channelId,
+          channel_name: finalChannelName,
+          checkout_type: 'monthly_preferred'
+        }
+      };
+    } else {
+      // Yearly button: Direct yearly checkout
+      sessionConfig.line_items = [
+        {
+          price: env.YEARLY_PRICE_ID,
+          quantity: 1,
+        }
+      ];
+      sessionConfig.subscription_data = {
+        metadata: {
+          channel_id: channelId,
+          channel_name: finalChannelName,
+          checkout_type: 'yearly_direct'
+        }
+      };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+
+    return new Response(JSON.stringify({ 
+      url: session.url,
+      session_id: session.id 
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    return new Response(JSON.stringify({ 
+      error: 'Failed to create checkout session',
+      details: error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+}
 
 // Handler for creating a customer portal session
 async function handleCreatePortalSession(request, env, corsHeaders, stripe) {

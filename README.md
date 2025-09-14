@@ -82,7 +82,7 @@ Apply them to your local D1 database using Wrangler.
 - Ranks: `DB` (D1), `RANK_WRITE_KEY`
 - Users: `DB` (D1), `USERS_WRITE_KEY`
 - CDN: `ELOWARD_BADGES` (R2)
-- Stripe: `secret_key`, `WEBHOOK_SECRET`, `DB` (D1)
+- Stripe: `secret_key`, `WEBHOOK_SECRET`, `MONTHLY_PRICE_ID`, `YEARLY_PRICE_ID`, `DB` (D1)
 - Bot: `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `WORKER_PUBLIC_URL`, `EVENTSUB_SECRET`, `BOT_KV`, `RANK_WORKER`, `BOT_WRITE_KEY`, `DB` (D1) + Durable Objects `BOT_MANAGER`, `IRC_SHARD`
 
 See each worker file header for binding specifics.
