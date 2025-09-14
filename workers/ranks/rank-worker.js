@@ -263,17 +263,18 @@ async function getRank(username, env) {
       return jsonResponse({ error: "User rank not found" }, 404);
     }
     
-    // Return peak rank data if show_peak is true, otherwise current rank
-    // This endpoint is used for chat display - only return rank data + animate_badge
+    // Return peak rank data if show_peak is true AND plus_active is true, otherwise current rank
+    const showPeak = result.plus_active && result.show_peak;
+    
     const responseData = {
       twitch_username: result.twitch_username,
       riot_id: result.riot_id,
-      rank_tier: result.show_peak ? result.peak_rank_tier : result.rank_tier,
-      rank_division: result.show_peak ? result.peak_rank_division : result.rank_division,
-      lp: result.show_peak ? result.peak_lp : result.lp,
+      rank_tier: showPeak ? result.peak_rank_tier : result.rank_tier,
+      rank_division: showPeak ? result.peak_rank_division : result.rank_division,
+      lp: showPeak ? result.peak_lp : result.lp,
       region: result.region,
       last_updated: result.last_updated,
-      animate_badge: result.animate_badge
+      animate_badge: result.plus_active && result.animate_badge
     };
     
     return jsonResponse(responseData);
@@ -322,19 +323,21 @@ async function getRankByPuuid(request, env) {
       return jsonResponse({ error: "User rank not found" }, 404);
     }
     
-    // Return peak rank data if show_peak is true, otherwise current rank
+    // Return peak rank data if show_peak is true AND plus_active is true, otherwise current rank
     // This endpoint is used for frontend sync - return all options for proper state management
+    const showPeak = result.plus_active && result.show_peak;
+    
     const responseData = {
       twitch_username: result.twitch_username,
       riot_id: result.riot_id,
-      rank_tier: result.show_peak ? result.peak_rank_tier : result.rank_tier,
-      rank_division: result.show_peak ? result.peak_rank_division : result.rank_division,
-      lp: result.show_peak ? result.peak_lp : result.lp,
+      rank_tier: showPeak ? result.peak_rank_tier : result.rank_tier,
+      rank_division: showPeak ? result.peak_rank_division : result.rank_division,
+      lp: showPeak ? result.peak_lp : result.lp,
       region: result.region,
       plus_active: result.plus_active,
       last_updated: result.last_updated,
-      show_peak: result.show_peak,
-      animate_badge: result.animate_badge
+      show_peak: result.show_peak, // Raw user preference
+      animate_badge: result.animate_badge // Raw user preference
     };
     
     return jsonResponse(responseData);
