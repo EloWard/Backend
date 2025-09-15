@@ -512,6 +512,7 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
         try {
             const subscriptionData = {
                 twitch_id: channelId,
+                channel_name: channelName, // Will be normalized in upsert
                 stripe_customer_id: customerId,
                 stripe_subscription_id: subscriptionId,
                 subscription_end_date: subscriptionEndDate,
@@ -681,6 +682,7 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
 
     const subscriptionData = {
       twitch_id: channelId,
+      channel_name: channelName, // Will be normalized in upsert
       stripe_customer_id: customerId,
       stripe_subscription_id: subscriptionId,
       subscription_end_date: subscriptionEndDate,
@@ -731,6 +733,7 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
   try {
     const subscriptionData = {
       twitch_id: channelId || null, // May be missing in deletion events
+      channel_name: channelName || null, // May be missing in deletion events
       stripe_customer_id: customerId || null,
       stripe_subscription_id: subscriptionId,
       plus_active: false // Deactivate the subscription
@@ -749,11 +752,25 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
 
     if (!upsertResponse.ok) {
       console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
-      // Try direct DB update as fallback (with retry)
+      // Try direct DB update as fallback (with retry) - also get channel_name for lol_ranks sync
+      const subscriptionLookup = await retryD1Operation(
+        () => env.DB.prepare(`SELECT channel_name FROM subscriptions WHERE stripe_subscription_id = ?`).bind(subscriptionId).first(),
+        `Subscription lookup for fallback deactivation ${subscriptionId}`
+      ).catch(() => null);
+      
       const directResult = await retryD1Operation(
         () => env.DB.prepare(`UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(subscriptionId).run(),
         `Direct subscription deactivation fallback for ${subscriptionId}`
       );
+      
+      // Sync to lol_ranks if we found the subscription
+      if (directResult.changes > 0 && subscriptionLookup?.channel_name) {
+        try {
+          await syncSubscriptionStatusToRanks(env, subscriptionLookup.channel_name, false);
+        } catch (syncError) {
+          console.warn('Failed to sync subscription deactivation to ranks table:', syncError);
+        }
+      }
       
       if (directResult.changes === 0) {
         console.warn(`DB: Subscription ${subscriptionId} not found in DB for subscription.deleted event.`);
@@ -818,6 +835,7 @@ async function handleInvoicePaid(invoice, env, stripe) {
     try {
         const subscriptionData = {
             twitch_id: channelId,
+            channel_name: channelName, // Will be normalized in upsert
             stripe_customer_id: customerId,
             stripe_subscription_id: subscriptionId,
             subscription_end_date: subscriptionEndDate,
@@ -874,6 +892,7 @@ async function handleInvoicePaid(invoice, env, stripe) {
               stripe_subscription_id: subscriptionId,
               subscription_end_date: subscriptionEndDate,
               plus_active: true // Activate since payment was confirmed
+              // Note: missing twitch_id and channel_name - this fallback may not work with new schema
           };
 
           const fallbackResponse = await handleSubscriptionUpsert(
@@ -948,11 +967,25 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
           console.log(`DB: Marked subscription ${subscriptionId} inactive due to payment failure/status (${status})`);
         } else {
           console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
-          // Try direct DB update as fallback (with retry)
+          // Try direct DB update as fallback (with retry) - also get channel_name for lol_ranks sync
+          const subscriptionLookup = await retryD1Operation(
+            () => env.DB.prepare(`SELECT channel_name FROM subscriptions WHERE stripe_subscription_id = ?`).bind(subscriptionId).first(),
+            `Subscription lookup for payment failure fallback ${subscriptionId}`
+          ).catch(() => null);
+          
           const directResult = await retryD1Operation(
             () => env.DB.prepare(`UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(subscriptionId).run(),
             `Direct subscription deactivation for payment failure ${subscriptionId}`
           );
+          
+          // Sync to lol_ranks if we found the subscription
+          if (directResult.changes > 0 && subscriptionLookup?.channel_name) {
+            try {
+              await syncSubscriptionStatusToRanks(env, subscriptionLookup.channel_name, false);
+            } catch (syncError) {
+              console.warn('Failed to sync subscription deactivation to ranks table:', syncError);
+            }
+          }
           
           if (directResult.changes === 0) {
             console.warn(`DB: Subscription ${subscriptionId} not found in DB for invoice.payment_failed update.`);
@@ -1083,18 +1116,22 @@ async function retryCriticalD1Operation(operation, context = 'Critical DB operat
  */
 async function handleSubscriptionUpsert(request, env, corsHeaders) {
   try {
-    const { twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, email } = await parseRequestBody(request);
+    const { twitch_id, channel_name, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, email } = await parseRequestBody(request);
     
-    if (!twitch_id) {
-      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    if (!twitch_id || !channel_name) {
+      return createErrorResponse(400, 'Missing twitch_id or channel_name parameter', null, corsHeaders);
     }
+
+    // Normalize channel name to lowercase for consistency
+    const normalizedChannelName = channel_name.toLowerCase();
 
     // Upsert subscription record with critical retry logic
     const result = await retryCriticalD1Operation(
       () => env.DB.prepare(`
-        INSERT INTO subscriptions (twitch_id, email, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO subscriptions (twitch_id, channel_name, email, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT (twitch_id) DO UPDATE SET
+          channel_name = excluded.channel_name,
           email = COALESCE(excluded.email, email),
           stripe_customer_id = COALESCE(excluded.stripe_customer_id, stripe_customer_id),
           stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, stripe_subscription_id),
@@ -1103,19 +1140,20 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
           updated_at = CURRENT_TIMESTAMP
       `).bind(
         twitch_id,
+        normalizedChannelName,
         email || null,
         stripe_customer_id || null,
         stripe_subscription_id || null,
         subscription_end_date || null,
         plus_active !== undefined ? (plus_active ? 1 : 0) : null
       ).run(),
-      `Subscription upsert for twitch_id ${twitch_id}`
+      `Subscription upsert for ${normalizedChannelName} (${twitch_id})`
     );
 
     // After successful subscription update, sync the plus_active flag to lol_ranks table
     if (result.changes && result.changes > 0) {
       try {
-        await syncSubscriptionStatusToRanks(env, twitch_id, !!plus_active);
+        await syncSubscriptionStatusToRanks(env, normalizedChannelName, !!plus_active);
       } catch (syncError) {
         console.warn('Failed to sync subscription status to ranks table:', syncError);
         // Don't fail the main operation if sync fails
@@ -1138,40 +1176,32 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
 
 /**
  * Sync subscription status to lol_ranks table for consistent badge display
+ * Optimized: uses channel_name directly, no users table lookup required
  */
-async function syncSubscriptionStatusToRanks(env, twitch_id, plus_active) {
+async function syncSubscriptionStatusToRanks(env, channel_name, plus_active) {
   try {
-    // First get the user's channel_name (with retry)
-    const userResult = await retryD1Operation(
-      () => env.DB.prepare('SELECT channel_name FROM users WHERE twitch_id = ?').bind(twitch_id).first(),
-      `User lookup for sync twitch_id ${twitch_id}`
-    );
-    
-    if (!userResult?.channel_name) {
-      console.warn('No channel_name found for twitch_id during sync:', twitch_id);
-      return;
-    }
-
     // Update plus_active in lol_ranks table and reset options if deactivating (with retry)
     let syncQuery, syncParams;
     if (plus_active) {
       // Just update plus_active when activating
       syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ?';
-      syncParams = [1, userResult.channel_name];
+      syncParams = [1, channel_name];
     } else {
       // When deactivating, also reset all plus options to false
       syncQuery = 'UPDATE lol_ranks SET plus_active = ?, show_peak = ?, animate_badge = ? WHERE twitch_username = ?';
-      syncParams = [0, 0, 0, userResult.channel_name];
+      syncParams = [0, 0, 0, channel_name];
     }
     
     const syncResult = await retryD1Operation(
       () => env.DB.prepare(syncQuery).bind(...syncParams).run(),
-      `Ranks table sync for ${userResult.channel_name}`
+      `Ranks table sync for ${channel_name}`
     );
     
     if (syncResult.changes && syncResult.changes > 0) {
       const resetMsg = plus_active ? '' : ' and reset options';
-      console.log(`Synced subscription status to ranks table: ${userResult.channel_name} -> plus_active: ${plus_active}${resetMsg}`);
+      console.log(`Synced subscription status to ranks table: ${channel_name} -> plus_active: ${plus_active}${resetMsg}`);
+    } else {
+      console.log(`No LoL account found for ${channel_name} - subscription sync skipped`);
     }
   } catch (error) {
     console.error('Error syncing subscription status to ranks:', error);
