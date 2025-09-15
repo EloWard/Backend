@@ -388,10 +388,11 @@ async function handleWebhook(request, env, stripe) {
         handlerCalled = 'subscription.deleted';
         break;
       case 'invoice.paid':
+      case 'invoice_payment.paid':
         // Important: Invoice paid is our primary activation trigger
-        console.log(`PROCESSING invoice.paid webhook (Event ID: ${event.id})`);
+        console.log(`PROCESSING ${event.type} webhook (Event ID: ${event.id})`);
         await handleInvoicePaid(event.data.object, env, stripe);
-        handlerCalled = 'invoice.paid';
+        handlerCalled = event.type;
         break;
       case 'invoice.payment_failed': 
         // Handle payment failures
