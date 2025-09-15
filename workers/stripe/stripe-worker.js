@@ -349,29 +349,48 @@ async function handleWebhook(request, env, stripe) {
     // Idempotency check - prevent duplicate event processing
     const eventId = event.id;
     
-    try {
-      // Check if we've already processed this event (with retry)
-      const existingEvent = await retryCriticalD1Operation(
-        () => env.DB.prepare('SELECT id FROM stripe_events WHERE stripe_event_id = ?').bind(eventId).first(),
-        `Idempotency check for event ${eventId}`
-      );
-      
-      if (existingEvent) {
-        console.log(`Webhook event ${eventId} already processed. Skipping.`);
-        return new Response(JSON.stringify({ received: true, duplicate: true }), {
-          headers: { 'Content-Type': 'application/json' }
+    // Idempotency for all events that modify subscription state or data
+    const criticalEvents = [
+      'checkout.session.completed', 
+      'invoice.paid', 
+      'customer.subscription.deleted', 
+      'customer.subscription.updated',  // Critical: handles status changes, renewals, cancellations
+      'customer.subscription.created',  // Critical: handles subscription creation (fallback to checkout)
+      'invoice.payment_failed'          // Critical: handles payment failures
+    ];
+    
+    if (criticalEvents.includes(event.type)) {
+      try {
+        // Quick idempotency check only for critical events
+        const existingEvent = await retryD1Operation(
+          () => env.DB.prepare('SELECT id FROM stripe_events WHERE stripe_event_id = ?').bind(eventId).first(),
+          `Idempotency check for critical event ${eventId}`,
+          1 // Only 1 retry for speed
+        );
+        
+        if (existingEvent) {
+          console.log(`Critical webhook event ${eventId} already processed. Skipping.`);
+          return new Response(JSON.stringify({ received: true, duplicate: true }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        
+        // Record only critical events (non-blocking)
+        retryD1Operation(
+          () => env.DB.prepare('INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(eventId, event.type).run(),
+          `Recording critical event ${eventId}`,
+          1 // Only 1 retry, don't block webhook processing
+        ).catch(error => {
+          console.warn(`Failed to record critical event ${eventId}, but continuing:`, error.message);
+          // Don't throw - continue processing even if event recording fails
         });
+        
+      } catch (idempotencyError) {
+        console.warn(`Idempotency check failed for ${eventId}, proceeding:`, idempotencyError.message);
+        // Continue processing - better to risk duplicate than fail
       }
-      
-      // Record that we're processing this event (with retry)
-      await retryCriticalD1Operation(
-        () => env.DB.prepare('INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(eventId, event.type).run(),
-        `Recording event processing for ${eventId}`
-      );
-      
-    } catch (idempotencyError) {
-      console.warn('Idempotency check failed, proceeding with processing:', idempotencyError);
-      // If idempotency check fails, continue processing (better to process twice than not at all)
+    } else {
+      console.log(`Processing non-critical event ${eventId} (${event.type}) without idempotency check`);
     }
     
     // Create a variable to track which handler was called
@@ -433,6 +452,7 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
     const channelName = session.metadata?.channelName || channelId; // Get the Twitch username, fallback to ID
     const customerId = session.customer;
     const subscriptionId = session.subscription;
+    const customerEmail = session.customer_email || session.customer_details?.email;
 
     // Add a small delay to reduce race conditions with other webhooks (invoice.paid might come first)
     // This gives invoice.paid a chance to process before we do
@@ -495,7 +515,8 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
                 stripe_customer_id: customerId,
                 stripe_subscription_id: subscriptionId,
                 subscription_end_date: subscriptionEndDate,
-                plus_active: false // Will be activated by invoice.paid
+                plus_active: false, // Will be activated by invoice.paid
+                email: customerEmail // Include customer email if available
             };
 
             // Call our internal subscription upsert endpoint
@@ -532,6 +553,15 @@ async function handleSubscriptionCreated(subscription, env, stripe) {
   // Attempt to get identifiers from metadata, but don't fail if missing
   const channelId = subscription.metadata?.channelId;
   const channelName = subscription.metadata?.channelName;
+  
+  // Get customer email for completeness
+  let customerEmail = null;
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    customerEmail = customer.email;
+  } catch (error) {
+    console.warn(`Failed to retrieve customer email for subscription.created ${subscriptionId}:`, error.message);
+  }
 
   console.log(`Subscription created event received: ${subscriptionId}, customer: ${customerId}, channel (from meta): ${channelName} (ID: ${channelId})`);
   
@@ -593,6 +623,16 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
   const customerId = subscription.customer;
   const status = subscription.status;
   
+  // Get customer email for database sync
+  let customerEmail = null;
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    customerEmail = customer.email;
+  } catch (error) {
+    console.warn(`Failed to retrieve customer email for ${customerId}:`, error.message);
+    // Continue without email - it's not critical for subscription updates
+  }
+  
   // Complete status handling for all Stripe subscription statuses
   const shouldDeactivate = ['canceled', 'past_due', 'unpaid', 'incomplete_expired', 'paused'].includes(status);
   
@@ -644,7 +684,8 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
       stripe_customer_id: customerId,
       stripe_subscription_id: subscriptionId,
       subscription_end_date: subscriptionEndDate,
-      plus_active: plusActiveValue
+      plus_active: plusActiveValue,
+      email: customerEmail
     };
 
     // Call our internal subscription upsert endpoint
@@ -740,11 +781,16 @@ async function handleInvoicePaid(invoice, env, stripe) {
   
   // Initialize subscription end date (renewal date)
   let subscriptionEndDate = null;
+  let customerEmail = null;
   
-  // Retrieve the subscription to get renewal date, status and metadata
+  // Retrieve the subscription and customer to get renewal date, status, metadata, and email
   try {
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    const [subscription, customer] = await Promise.all([
+      stripe.subscriptions.retrieve(subscriptionId),
+      stripe.customers.retrieve(customerId)
+    ]);
     const status = subscription.status;
+    customerEmail = customer.email;
     
     // Always set channel_active=1 when invoice.paid is received
     // This is the definitive signal that payment has been processed successfully
@@ -766,7 +812,7 @@ async function handleInvoicePaid(invoice, env, stripe) {
     const channelId = subscription.metadata?.channelId;
     const channelName = subscription.metadata?.channelName;
 
-    console.log(`ACTIVATION: Invoice paid for subscription: ${subscriptionId}, Cust: ${customerId}, Chan: ${channelName}(${channelId}), Status: ${status}, Renewal Date: ${subscriptionEndDate || 'N/A'}`);
+    console.log(`ACTIVATION: Invoice paid for subscription: ${subscriptionId}, Cust: ${customerId} (${customerEmail || 'no email'}), Chan: ${channelName}(${channelId}), Status: ${status}, Renewal Date: ${subscriptionEndDate || 'N/A'}`);
 
     // --- Database Update using new subscription system --- 
     try {
@@ -775,7 +821,8 @@ async function handleInvoicePaid(invoice, env, stripe) {
             stripe_customer_id: customerId,
             stripe_subscription_id: subscriptionId,
             subscription_end_date: subscriptionEndDate,
-            plus_active: true // ACTIVATE the subscription - invoice paid = confirmed payment
+            plus_active: true, // ACTIVATE the subscription - invoice paid = confirmed payment
+            email: customerEmail // Include customer email
         };
 
         // Call our internal subscription upsert endpoint to activate the subscription
@@ -988,10 +1035,10 @@ async function handleSubscriptionStatus(request, env, corsHeaders) {
 }
 
 /**
- * Production-grade retry mechanism for D1 operations
- * Handles overload, timeout, and connection issues with exponential backoff and jitter
+ * Webhook-optimized retry mechanism for D1 operations
+ * Fast retries to stay within Stripe's 30-second webhook timeout
  */
-async function retryD1Operation(operation, context = 'DB operation', maxRetries = 3, baseDelayMs = 300) {
+async function retryD1Operation(operation, context = 'DB operation', maxRetries = 2, baseDelayMs = 100) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await operation();
@@ -1005,10 +1052,10 @@ async function retryD1Operation(operation, context = 'DB operation', maxRetries 
         errorMessage.includes('SQLITE_BUSY');
       
       if (isRetryableError && attempt < maxRetries) {
-        // Exponential backoff with jitter to prevent thundering herd
-        const exponentialDelay = baseDelayMs * Math.pow(2, attempt - 1);
-        const jitter = Math.random() * 0.3 * exponentialDelay; // 30% jitter
-        const totalDelay = Math.min(exponentialDelay + jitter, 5000); // Cap at 5s
+        // Fast exponential backoff optimized for webhooks
+        const exponentialDelay = baseDelayMs * Math.pow(1.5, attempt - 1); // Gentler exponential growth
+        const jitter = Math.random() * 0.2 * exponentialDelay; // 20% jitter
+        const totalDelay = Math.min(exponentialDelay + jitter, 1000); // Cap at 1s for webhooks
         
         console.warn(`${context} failed (attempt ${attempt}/${maxRetries}): ${errorMessage}. Retrying in ${Math.round(totalDelay)}ms`);
         await new Promise(resolve => setTimeout(resolve, totalDelay));
@@ -1024,10 +1071,11 @@ async function retryD1Operation(operation, context = 'DB operation', maxRetries 
 }
 
 /**
- * Critical operation wrapper - higher retry count for important operations
+ * Critical operation wrapper - only for the most essential operations
+ * Still webhook-optimized but with one extra retry
  */
 async function retryCriticalD1Operation(operation, context = 'Critical DB operation') {
-  return retryD1Operation(operation, context, 5, 200); // 5 retries, faster initial delay
+  return retryD1Operation(operation, context, 3, 100); // 3 retries max, very fast
 }
 
 /**
@@ -1035,7 +1083,7 @@ async function retryCriticalD1Operation(operation, context = 'Critical DB operat
  */
 async function handleSubscriptionUpsert(request, env, corsHeaders) {
   try {
-    const { twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active } = await parseRequestBody(request);
+    const { twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, email } = await parseRequestBody(request);
     
     if (!twitch_id) {
       return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
@@ -1044,9 +1092,10 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
     // Upsert subscription record with critical retry logic
     const result = await retryCriticalD1Operation(
       () => env.DB.prepare(`
-        INSERT INTO subscriptions (twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO subscriptions (twitch_id, email, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT (twitch_id) DO UPDATE SET
+          email = COALESCE(excluded.email, email),
           stripe_customer_id = COALESCE(excluded.stripe_customer_id, stripe_customer_id),
           stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, stripe_subscription_id),
           subscription_end_date = COALESCE(excluded.subscription_end_date, subscription_end_date),
@@ -1054,6 +1103,7 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
           updated_at = CURRENT_TIMESTAMP
       `).bind(
         twitch_id,
+        email || null,
         stripe_customer_id || null,
         stripe_subscription_id || null,
         subscription_end_date || null,

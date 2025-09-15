@@ -4,7 +4,7 @@ DROP TABLE IF EXISTS `subscriptions`;
 -- Create the subscriptions table for payment/subscription management
 CREATE TABLE IF NOT EXISTS `subscriptions` (
   `twitch_id` TEXT PRIMARY KEY,  -- Primary key and reference to users.twitch_id
-  `email` TEXT NOT NULL, -- Customer email (cached from users table for performance)
+  `email` TEXT, -- Customer email (optional, cached from users table for performance)
   `stripe_customer_id` TEXT UNIQUE, -- Stripe Customer ID should be unique
   `stripe_subscription_id` TEXT UNIQUE, -- Stripe Subscription ID should be unique
   `subscription_end_date` TIMESTAMP, -- When subscription expires
