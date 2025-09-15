@@ -158,7 +158,7 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
     });
   }
   
-  const { channelId, channelName, returnUrl, mode } = data;
+  const { channelId, channelName, returnUrl, mode, email } = data;
 
   if (!channelId) {
     return new Response(JSON.stringify({ error: 'Channel ID is required' }), {
@@ -177,13 +177,17 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
       success_url: finalReturnUrl,
       cancel_url: 'https://www.eloward.com/dashboard',
       client_reference_id: channelId,
-      customer_email: data.email || null,
       metadata: {
         channel_id: channelId,
         channel_name: finalChannelName,
         checkout_mode: mode
       }
     };
+
+    // Only add customer_email if we have a valid email
+    if (email && email.trim() && email.includes('@')) {
+      sessionConfig.customer_email = email.trim();
+    }
 
     // Configure line items based on mode
     if (mode === 'with_toggle') {

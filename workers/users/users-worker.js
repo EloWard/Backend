@@ -8,7 +8,8 @@
 const allowedOrigins = [
   'https://www.eloward.com', 
   'https://eloward.com',
-  'https://www.twitch.tv'  // FFZ addon access
+  'https://www.twitch.tv',  // FFZ addon access
+  'http://localhost:3000'   // Development
 ];
 
 // Helper function to parse JSON with error handling
@@ -93,6 +94,10 @@ const usersWorker = {
       } else if (url.pathname.includes('/user/riot-fallback')) {
         response = request.method === 'POST'
           ? await handleRiotDataFallback(request, env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
+      } else if (url.pathname.match(/\/user\/email\/(.+)$/)) {
+        response = request.method === 'GET'
+          ? await handleGetUserEmail(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/health')) {
         response = new Response(JSON.stringify({ status: 'ok' }), {
@@ -578,5 +583,42 @@ async function handleRiotDataFallback(request, env, corsHeaders) {
       error.message === 'Invalid JSON' ? null : error.message,
       corsHeaders
     );
+  }
+}
+
+// Handler for getting user email by Twitch ID (for Stripe operations)
+async function handleGetUserEmail(request, env, corsHeaders) {
+  try {
+    const url = new URL(request.url);
+    const twitchId = url.pathname.split('/').pop();
+
+    if (!twitchId) {
+      return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
+    }
+
+    // Query the users table for email
+    const result = await env.DB.prepare(
+      'SELECT email FROM users WHERE twitch_id = ?'
+    ).bind(twitchId).first();
+
+    if (!result) {
+      return createErrorResponse(404, 'User not found', null, corsHeaders);
+    }
+
+    if (!result.email) {
+      return createErrorResponse(404, 'Email not available for user', null, corsHeaders);
+    }
+
+    return new Response(JSON.stringify({
+      email: result.email,
+      twitch_id: twitchId
+    }), {
+      status: 200,
+      headers: corsHeaders
+    });
+
+  } catch (error) {
+    console.error('Error getting user email:', error);
+    return createErrorResponse(500, 'Failed to get user email', error.message, corsHeaders);
   }
 }
