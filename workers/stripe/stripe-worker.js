@@ -171,6 +171,7 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
   const finalReturnUrl = returnUrl || 'https://www.eloward.com/dashboard?subscription=success';
 
   try {
+    // Create checkout session configuration
     let sessionConfig = {
       payment_method_types: ['card'],
       mode: 'subscription',
@@ -189,14 +190,16 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
       sessionConfig.customer_email = email.trim();
     }
 
-    // Configure line items based on mode
+    // Configure pricing based on mode
     if (mode === 'with_toggle') {
-      // Monthly button: Start with monthly but allow customer to see yearly option
-      // Note: True billing frequency toggles require pricing tables
-      // This provides clean monthly checkout
+      // Include both monthly and yearly prices for billing frequency selection
       sessionConfig.line_items = [
         {
           price: env.MONTHLY_PRICE_ID,
+          quantity: 1,
+        },
+        {
+          price: env.YEARLY_PRICE_ID,
           quantity: 1,
         }
       ];
@@ -204,11 +207,11 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
         metadata: {
           channel_id: channelId,
           channel_name: finalChannelName,
-          checkout_type: 'monthly_preferred'
+          checkout_type: 'billing_frequency_toggle'
         }
       };
     } else {
-      // Yearly button: Direct yearly checkout
+      // Direct yearly checkout
       sessionConfig.line_items = [
         {
           price: env.YEARLY_PRICE_ID,
@@ -245,6 +248,7 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
     });
   }
 }
+
 
 // Handler for creating a customer portal session
 async function handleCreatePortalSession(request, env, corsHeaders, stripe) {
