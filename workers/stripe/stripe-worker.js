@@ -256,10 +256,11 @@ async function handleCreatePortalSession(request, env, corsHeaders, stripe) {
   }
 
   try {
-    // Get the Stripe customer ID from the subscriptions table
-    const subscribedChannel = await env.DB.prepare(
-      'SELECT stripe_customer_id FROM subscriptions WHERE twitch_id = ?'
-    ).bind(channelId).first();
+    // Get the Stripe customer ID from the subscriptions table (with retry)
+    const subscribedChannel = await retryD1Operation(
+      () => env.DB.prepare('SELECT stripe_customer_id FROM subscriptions WHERE twitch_id = ?').bind(channelId).first(),
+      `Portal session customer lookup for channel ${channelId}`
+    );
 
     if (!subscribedChannel || !subscribedChannel.stripe_customer_id) {
       return new Response(JSON.stringify({ error: 'No subscription found for this channel' }), {
@@ -349,10 +350,11 @@ async function handleWebhook(request, env, stripe) {
     const eventId = event.id;
     
     try {
-      // Check if we've already processed this event
-      const existingEvent = await env.DB.prepare(
-        'SELECT id FROM stripe_events WHERE stripe_event_id = ?'
-      ).bind(eventId).first();
+      // Check if we've already processed this event (with retry)
+      const existingEvent = await retryCriticalD1Operation(
+        () => env.DB.prepare('SELECT id FROM stripe_events WHERE stripe_event_id = ?').bind(eventId).first(),
+        `Idempotency check for event ${eventId}`
+      );
       
       if (existingEvent) {
         console.log(`Webhook event ${eventId} already processed. Skipping.`);
@@ -361,10 +363,11 @@ async function handleWebhook(request, env, stripe) {
         });
       }
       
-      // Record that we're processing this event
-      await env.DB.prepare(
-        'INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)'
-      ).bind(eventId, event.type).run();
+      // Record that we're processing this event (with retry)
+      await retryCriticalD1Operation(
+        () => env.DB.prepare('INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(eventId, event.type).run(),
+        `Recording event processing for ${eventId}`
+      );
       
     } catch (idempotencyError) {
       console.warn('Idempotency check failed, proceeding with processing:', idempotencyError);
@@ -705,9 +708,11 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
 
     if (!upsertResponse.ok) {
       console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
-      // Try direct DB update as fallback
-      const directQuery = `UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`;
-      const directResult = await env.DB.prepare(directQuery).bind(subscriptionId).run();
+      // Try direct DB update as fallback (with retry)
+      const directResult = await retryD1Operation(
+        () => env.DB.prepare(`UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(subscriptionId).run(),
+        `Direct subscription deactivation fallback for ${subscriptionId}`
+      );
       
       if (directResult.changes === 0) {
         console.warn(`DB: Subscription ${subscriptionId} not found in DB for subscription.deleted event.`);
@@ -790,10 +795,11 @@ async function handleInvoicePaid(invoice, env, stripe) {
 
         console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) from invoice.paid`);
         
-        // Verify activation in subscriptions table
-        const verifyResult = await env.DB.prepare(
-            'SELECT plus_active FROM subscriptions WHERE stripe_subscription_id = ?'
-        ).bind(subscriptionId).first();
+        // Verify activation in subscriptions table (with retry)
+        const verifyResult = await retryD1Operation(
+            () => env.DB.prepare('SELECT plus_active FROM subscriptions WHERE stripe_subscription_id = ?').bind(subscriptionId).first(),
+            `Subscription activation verification for ${subscriptionId}`
+        );
             
         if (verifyResult) {
             console.log(`VERIFICATION: Subscription ${subscriptionId} plus_active status is now: ${verifyResult.plus_active}`);
@@ -895,9 +901,11 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
           console.log(`DB: Marked subscription ${subscriptionId} inactive due to payment failure/status (${status})`);
         } else {
           console.warn(`Failed to deactivate subscription ${subscriptionId} via API: ${upsertResponse.status}`);
-          // Try direct DB update as fallback
-          const directQuery = `UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`;
-          const directResult = await env.DB.prepare(directQuery).bind(subscriptionId).run();
+          // Try direct DB update as fallback (with retry)
+          const directResult = await retryD1Operation(
+            () => env.DB.prepare(`UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(subscriptionId).run(),
+            `Direct subscription deactivation for payment failure ${subscriptionId}`
+          );
           
           if (directResult.changes === 0) {
             console.warn(`DB: Subscription ${subscriptionId} not found in DB for invoice.payment_failed update.`);
@@ -958,11 +966,10 @@ async function handleSubscriptionStatus(request, env, corsHeaders) {
       return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
     }
 
-    const result = await env.DB.prepare(
-      `SELECT plus_active, subscription_end_date 
-       FROM subscriptions 
-       WHERE twitch_id = ?`
-    ).bind(twitch_id).first();
+    const result = await retryD1Operation(
+      () => env.DB.prepare(`SELECT plus_active, subscription_end_date FROM subscriptions WHERE twitch_id = ?`).bind(twitch_id).first(),
+      `Subscription status lookup for twitch_id ${twitch_id}`
+    );
 
     // Check if subscription is active and not expired
     const isActive = result?.plus_active && 
@@ -981,6 +988,49 @@ async function handleSubscriptionStatus(request, env, corsHeaders) {
 }
 
 /**
+ * Production-grade retry mechanism for D1 operations
+ * Handles overload, timeout, and connection issues with exponential backoff and jitter
+ */
+async function retryD1Operation(operation, context = 'DB operation', maxRetries = 3, baseDelayMs = 300) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const errorMessage = error.message || '';
+      const isRetryableError = 
+        errorMessage.includes('D1 DB is overloaded') ||
+        errorMessage.includes('Too many requests queued') ||
+        errorMessage.includes('timeout') ||
+        errorMessage.includes('connection') ||
+        errorMessage.includes('SQLITE_BUSY');
+      
+      if (isRetryableError && attempt < maxRetries) {
+        // Exponential backoff with jitter to prevent thundering herd
+        const exponentialDelay = baseDelayMs * Math.pow(2, attempt - 1);
+        const jitter = Math.random() * 0.3 * exponentialDelay; // 30% jitter
+        const totalDelay = Math.min(exponentialDelay + jitter, 5000); // Cap at 5s
+        
+        console.warn(`${context} failed (attempt ${attempt}/${maxRetries}): ${errorMessage}. Retrying in ${Math.round(totalDelay)}ms`);
+        await new Promise(resolve => setTimeout(resolve, totalDelay));
+      } else {
+        // Log final failure
+        if (isRetryableError) {
+          console.error(`${context} failed after ${maxRetries} attempts: ${errorMessage}`);
+        }
+        throw error;
+      }
+    }
+  }
+}
+
+/**
+ * Critical operation wrapper - higher retry count for important operations
+ */
+async function retryCriticalD1Operation(operation, context = 'Critical DB operation') {
+  return retryD1Operation(operation, context, 5, 200); // 5 retries, faster initial delay
+}
+
+/**
  * Handle subscription upsert (internal auth required)
  */
 async function handleSubscriptionUpsert(request, env, corsHeaders) {
@@ -991,23 +1041,26 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
       return createErrorResponse(400, 'Missing twitch_id parameter', null, corsHeaders);
     }
 
-    // Upsert subscription record
-    const result = await env.DB.prepare(`
-      INSERT INTO subscriptions (twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT (twitch_id) DO UPDATE SET
-        stripe_customer_id = COALESCE(excluded.stripe_customer_id, stripe_customer_id),
-        stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, stripe_subscription_id),
-        subscription_end_date = COALESCE(excluded.subscription_end_date, subscription_end_date),
-        plus_active = COALESCE(excluded.plus_active, plus_active),
-        updated_at = CURRENT_TIMESTAMP
-    `).bind(
-      twitch_id,
-      stripe_customer_id || null,
-      stripe_subscription_id || null,
-      subscription_end_date || null,
-      plus_active !== undefined ? (plus_active ? 1 : 0) : null
-    ).run();
+    // Upsert subscription record with critical retry logic
+    const result = await retryCriticalD1Operation(
+      () => env.DB.prepare(`
+        INSERT INTO subscriptions (twitch_id, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT (twitch_id) DO UPDATE SET
+          stripe_customer_id = COALESCE(excluded.stripe_customer_id, stripe_customer_id),
+          stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, stripe_subscription_id),
+          subscription_end_date = COALESCE(excluded.subscription_end_date, subscription_end_date),
+          plus_active = COALESCE(excluded.plus_active, plus_active),
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(
+        twitch_id,
+        stripe_customer_id || null,
+        stripe_subscription_id || null,
+        subscription_end_date || null,
+        plus_active !== undefined ? (plus_active ? 1 : 0) : null
+      ).run(),
+      `Subscription upsert for twitch_id ${twitch_id}`
+    );
 
     // After successful subscription update, sync the plus_active flag to lol_ranks table
     if (result.changes && result.changes > 0) {
@@ -1038,16 +1091,18 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
  */
 async function syncSubscriptionStatusToRanks(env, twitch_id, plus_active) {
   try {
-    // First get the user's channel_name
-    const userQuery = 'SELECT channel_name FROM users WHERE twitch_id = ?';
-    const userResult = await env.DB.prepare(userQuery).bind(twitch_id).first();
+    // First get the user's channel_name (with retry)
+    const userResult = await retryD1Operation(
+      () => env.DB.prepare('SELECT channel_name FROM users WHERE twitch_id = ?').bind(twitch_id).first(),
+      `User lookup for sync twitch_id ${twitch_id}`
+    );
     
     if (!userResult?.channel_name) {
       console.warn('No channel_name found for twitch_id during sync:', twitch_id);
       return;
     }
 
-    // Update plus_active in lol_ranks table and reset options if deactivating
+    // Update plus_active in lol_ranks table and reset options if deactivating (with retry)
     let syncQuery, syncParams;
     if (plus_active) {
       // Just update plus_active when activating
@@ -1059,7 +1114,10 @@ async function syncSubscriptionStatusToRanks(env, twitch_id, plus_active) {
       syncParams = [0, 0, 0, userResult.channel_name];
     }
     
-    const syncResult = await env.DB.prepare(syncQuery).bind(...syncParams).run();
+    const syncResult = await retryD1Operation(
+      () => env.DB.prepare(syncQuery).bind(...syncParams).run(),
+      `Ranks table sync for ${userResult.channel_name}`
+    );
     
     if (syncResult.changes && syncResult.changes > 0) {
       const resetMsg = plus_active ? '' : ' and reset options';
@@ -1079,9 +1137,10 @@ async function cleanupOldWebhookEvents(env, daysToKeep = 30) {
   try {
     const cutoffTimestamp = Math.floor(Date.now() / 1000) - (daysToKeep * 24 * 60 * 60);
     
-    const result = await env.DB.prepare(
-      'DELETE FROM stripe_events WHERE processed_at < ?'
-    ).bind(cutoffTimestamp).run();
+    const result = await retryD1Operation(
+      () => env.DB.prepare('DELETE FROM stripe_events WHERE processed_at < ?').bind(cutoffTimestamp).run(),
+      'Webhook events cleanup'
+    );
     
     if (result.changes && result.changes > 0) {
       console.log(`Cleaned up ${result.changes} old Stripe events (older than ${daysToKeep} days)`);
