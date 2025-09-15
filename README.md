@@ -33,7 +33,7 @@ See `architecture.txt` for a deeper overview of routes, flows, and database sche
   - Key endpoints:
     - `POST /user/register` – Upsert Twitch profile (internal auth)
     - `POST /user/lookup` – Lookup `channel_name` by `twitch_id`
-    - `POST /dashboard/data_id` – Dashboard summary by Twitch ID (preferred)
+    - `POST /dashboard/data_id` – Dashboard summary by Twitch ID (includes user email for Stripe)
     - `POST /dashboard/data` – Dashboard summary by login (legacy)
     - `POST /metrics/db_read` – Increment read counter
     - `POST /metrics/successful_lookup` – Increment display counter

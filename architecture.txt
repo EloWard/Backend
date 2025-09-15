@@ -123,8 +123,7 @@ D1 Database
   - `POST /user/register` — Status: Active (internal write). Requires `X-Internal-Auth`.
   - `POST /user/lookup` — Status: Active (internal read). Requires `X-Internal-Auth`.
   - `POST /user/riot-fallback` — Status: Active (public read). Returns consolidated riot and user data.
-  - `GET /user/email/{twitch_id}` — Status: Active (public read). Returns user email for Stripe operations.
-  - `POST /dashboard/data_id` — Status: Active (public read). ID-based; sanitized fields only.
+  - `POST /dashboard/data_id` — Status: Active (public read). ID-based; includes user email for authenticated user.
   - `POST /channel/active/update_id` — Status: Active (internal write). ID-based; requires `X-Internal-Auth`.
 
 #### Utility Workers

@@ -21,3 +21,4 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_customer_id ON `subscription
 CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_subscription_id ON `subscriptions` (`stripe_subscription_id`); 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_plus_active ON `subscriptions` (`plus_active`);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_end_date ON `subscriptions` (`subscription_end_date`);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON `subscriptions` (`email`);
