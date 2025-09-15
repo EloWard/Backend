@@ -142,7 +142,7 @@ const stripeWorker = {
 // Export the worker
 export default stripeWorker;
 
-// Handler for creating a checkout session with native billing frequency toggle
+// Handler for creating a checkout session
 async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -171,56 +171,40 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
   const finalReturnUrl = returnUrl || 'https://www.eloward.com/dashboard?subscription=success';
 
   try {
-    // Create checkout session configuration
-    let sessionConfig = {
+    // Determine price based on mode
+    const isMonthly = mode === 'monthly';
+    const priceId = isMonthly ? env.MONTHLY_PRICE_ID : env.YEARLY_PRICE_ID;
+    const subscriptionType = isMonthly ? 'monthly' : 'yearly';
+
+    const sessionConfig = {
       payment_method_types: ['card'],
       mode: 'subscription',
       success_url: finalReturnUrl,
       cancel_url: 'https://www.eloward.com/dashboard',
       client_reference_id: channelId,
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        }
+      ],
+      subscription_data: {
+        metadata: {
+          channel_id: channelId,
+          channel_name: finalChannelName,
+          subscription_type: subscriptionType
+        }
+      },
       metadata: {
         channel_id: channelId,
         channel_name: finalChannelName,
-        checkout_mode: mode
+        subscription_type: subscriptionType
       }
     };
 
-    // Only add customer_email if we have a valid email
+    // Add customer email if provided
     if (email && email.trim() && email.includes('@')) {
       sessionConfig.customer_email = email.trim();
-    }
-
-    // Configure pricing based on mode
-    if (mode === 'with_toggle') {
-      // Direct monthly checkout (no toggle - like 7TV actually does)
-      sessionConfig.line_items = [
-        {
-          price: env.MONTHLY_PRICE_ID,
-          quantity: 1,
-        }
-      ];
-      sessionConfig.subscription_data = {
-        metadata: {
-          channel_id: channelId,
-          channel_name: finalChannelName,
-          checkout_type: 'monthly_direct'
-        }
-      };
-    } else {
-      // Direct yearly checkout
-      sessionConfig.line_items = [
-        {
-          price: env.YEARLY_PRICE_ID,
-          quantity: 1,
-        }
-      ];
-      sessionConfig.subscription_data = {
-        metadata: {
-          channel_id: channelId,
-          channel_name: finalChannelName,
-          checkout_type: 'yearly_direct'
-        }
-      };
     }
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
