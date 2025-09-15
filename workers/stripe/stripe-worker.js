@@ -192,14 +192,10 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
 
     // Configure pricing based on mode
     if (mode === 'with_toggle') {
-      // Include both monthly and yearly prices for billing frequency selection
+      // Direct monthly checkout (no toggle - like 7TV actually does)
       sessionConfig.line_items = [
         {
           price: env.MONTHLY_PRICE_ID,
-          quantity: 1,
-        },
-        {
-          price: env.YEARLY_PRICE_ID,
           quantity: 1,
         }
       ];
@@ -207,7 +203,7 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
         metadata: {
           channel_id: channelId,
           channel_name: finalChannelName,
-          checkout_type: 'billing_frequency_toggle'
+          checkout_type: 'monthly_direct'
         }
       };
     } else {
