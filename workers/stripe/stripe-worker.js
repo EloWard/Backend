@@ -142,7 +142,7 @@ const stripeWorker = {
 // Export the worker
 export default stripeWorker;
 
-// Handler for creating a checkout session with native billing frequency toggle
+// Handler for creating a checkout session
 async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -190,9 +190,9 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
       sessionConfig.customer_email = email.trim();
     }
 
-    // Configure pricing based on mode
+    // Configure line items based on subscription mode
     if (mode === 'with_toggle') {
-      // Direct monthly checkout (no toggle - like 7TV actually does)
+      // Monthly subscription
       sessionConfig.line_items = [
         {
           price: env.MONTHLY_PRICE_ID,
@@ -203,11 +203,11 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
         metadata: {
           channel_id: channelId,
           channel_name: finalChannelName,
-          checkout_type: 'monthly_direct'
+          subscription_type: 'monthly'
         }
       };
     } else {
-      // Direct yearly checkout
+      // Yearly subscription
       sessionConfig.line_items = [
         {
           price: env.YEARLY_PRICE_ID,
@@ -218,7 +218,7 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
         metadata: {
           channel_id: channelId,
           channel_name: finalChannelName,
-          checkout_type: 'yearly_direct'
+          subscription_type: 'yearly'
         }
       };
     }
@@ -285,7 +285,6 @@ async function handleCreatePortalSession(request, env, corsHeaders, stripe) {
     }
     const customerId = subscribedChannel.stripe_customer_id;
     
-    console.log(`Creating portal session for customer: ${customerId}`);
 
     // Create a portal session
     const session = await stripe.billingPortal.sessions.create({
@@ -334,12 +333,6 @@ async function handleWebhook(request, env, stripe) {
     return new Response('Failed to read webhook payload', { status: 400 });
   }
 
-  // --- Added Detailed Logging --- 
-  console.log(`Received Stripe-Signature: ${signature}`);
-  console.log(`Raw payload length: ${payload.length}`);
-  // Avoid logging the full secret or sensitive payload data in production logs if possible
-  // Consider logging a hash of the payload if needed for comparison: `crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload))`
-  // --- End Added Logging ---
 
   let event;
   try {
@@ -358,8 +351,6 @@ async function handleWebhook(request, env, stripe) {
 
   // Handle different event types
   try {
-    // Log successful webhook receipt
-    console.log(`Webhook verified successfully! Event type: ${event.type}, Event ID: ${event.id}`); // Added Event ID
     
     // Idempotency check - prevent duplicate event processing
     const eventId = event.id;
@@ -371,7 +362,6 @@ async function handleWebhook(request, env, stripe) {
       ).bind(eventId).first();
       
       if (existingEvent) {
-        console.log(`Webhook event ${eventId} already processed. Skipping.`);
         return new Response(JSON.stringify({ received: true, duplicate: true }), {
           headers: { 'Content-Type': 'application/json' }
         });
@@ -404,8 +394,6 @@ async function handleWebhook(request, env, stripe) {
         handlerCalled = 'subscription.deleted';
         break;
       case 'invoice.paid':
-        // Important: Invoice paid is our primary activation trigger
-        console.log(`PROCESSING invoice.paid webhook (Event ID: ${event.id})`);
         await handleInvoicePaid(event.data.object, env, stripe);
         handlerCalled = 'invoice.paid';
         break;
@@ -419,11 +407,8 @@ async function handleWebhook(request, env, stripe) {
         handlerCalled = 'checkout.session.completed';
         break;
       default:
-        console.log(`Unhandled event type: ${event.type}`);
         handlerCalled = 'none';
     }
-    
-    console.log(`Webhook handler completed: ${handlerCalled} for event: ${event.id}`);
   } catch (dbError) {
       console.error('Webhook database handler error:', dbError);
       // Return 500 if DB operations fail, so Stripe retries
@@ -451,8 +436,6 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
     await new Promise(resolve => setTimeout(resolve, 1000)); // Increased to 1 second for better sequencing
 
     if (session.mode === 'subscription' && customerId && subscriptionId && channelId && channelName) {
-        console.log(`Checkout completed for subscription: ${subscriptionId}, customer: ${customerId}, channel: ${channelName} (ID: ${channelId})`);
-        
         let subscriptionEndDate = null;
         let subscriptionStatus = 'incomplete'; // Default status
         try {
@@ -463,13 +446,11 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             // Get the renewal date from current_period_end
             if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
                 subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-                console.log(`Using subscription.current_period_end (${subscription.current_period_end}) as renewal date for subscription ${subscriptionId}`);
             } else {
                 // Calculate a default renewal date (1 month from now) for new subscriptions
                 const defaultEndDate = new Date();
                 defaultEndDate.setMonth(defaultEndDate.getMonth() + 1);
                 subscriptionEndDate = defaultEndDate.toISOString();
-                console.log(`Subscription ${subscriptionId} has no current_period_end. Using calculated renewal date: ${subscriptionEndDate}`);
             }
 
             // Ensure metadata is on the subscription object itself for future webhooks
@@ -481,7 +462,6 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
                             channelName: channelName
                         }
                     });
-                    console.log(`Updated subscription ${subscriptionId} with metadata: channelId=${channelId}, channelName=${channelName}`);
                 } catch (metaUpdateError) {
                     console.error(`Failed to update metadata for subscription ${subscriptionId}:`, metaUpdateError);
                     // Proceed even if metadata update fails, core data is more important
@@ -493,7 +473,6 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             const defaultEndDate = new Date();
             defaultEndDate.setMonth(defaultEndDate.getMonth() + 1);
             subscriptionEndDate = defaultEndDate.toISOString();
-            console.log(`Failed to retrieve subscription. Using calculated renewal date: ${subscriptionEndDate}`);
         }
 
         // Initially set channel_active=0 and let invoice.paid webhook activate the subscription
@@ -525,8 +504,6 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
                 throw new Error(`Subscription upsert failed: ${upsertResponse.status}`);
             }
 
-            console.log(`DB: Created/updated subscription record for ${channelName} (ID: ${channelId}), SubID: ${subscriptionId}. Will be activated when payment is confirmed via invoice.paid.`);
-            
 
         } catch (dbError) {
             console.error(`Database error during checkout completed for channel ${channelName} (SubID: ${subscriptionId}):`, dbError);
@@ -545,58 +522,12 @@ async function handleSubscriptionCreated(subscription, env, stripe) {
   const channelId = subscription.metadata?.channelId;
   const channelName = subscription.metadata?.channelName;
 
-  console.log(`Subscription created event received: ${subscriptionId}, customer: ${customerId}, channel (from meta): ${channelName} (ID: ${channelId})`);
-  
-  // We primarily rely on checkout.session.completed now. 
-  // This handler might only be useful as a fallback or for logging.
-  // We won't perform DB updates here unless absolutely necessary, 
-  // as checkout.session.completed should handle the initial record creation/update.
-
   if (!customerId || !subscriptionId) {
       console.error('Subscription created event missing customer or subscription ID. Cannot process further.');
       return; 
   }
 
-  // Optional: Could add logic here to update the DB *if* a record with this subscriptionId 
-  // already exists but is missing customerId or channel info, but it adds complexity.
-  // For now, we assume checkout.session.completed handles the main logic.
-  console.log(`Subscription created event for ${subscriptionId} processed (no DB action taken by default).`);
-
-  /* // Example of potential fallback DB logic (use with caution):
-  try {
-    let subscriptionEndDate = null;
-    if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
-        subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-    } else {
-        console.warn(`Subscription ${subscriptionId} (created event) has invalid current_period_end.`);
-    }
-    const isActive = ['active', 'trialing'].includes(subscription.status) ? 1 : 0;
-
-    // Attempt to update ONLY if the subscription ID exists
-    const updateQuery = `
-        UPDATE \`subscribed-channels\` SET
-            stripe_customer_id = COALESCE(?, stripe_customer_id),
-            channel_name = COALESCE(?, channel_name),
-            twitch_id = COALESCE(?, twitch_id),
-            subscription_end_date = COALESCE(?, subscription_end_date),
-            active = ?, 
-            updated_at = CURRENT_TIMESTAMP
-        WHERE stripe_subscription_id = ?;
-    `;
-    const result = await env.DB.prepare(updateQuery)
-        .bind(customerId, channelName, channelId, subscriptionEndDate, isActive, subscriptionId)
-        .run();
-       
-    if (result.meta.changes > 0) {
-        console.log(`DB: Updated existing record for SubID ${subscriptionId} via subscription.created event.`);
-    } else {
-        console.log(`DB: No existing record found for SubID ${subscriptionId} during subscription.created event (expected, handled by checkout.session.completed).`);
-    }
-  } catch (dbError) {
-      console.error(`Database error during subscription.created fallback for SubID ${subscriptionId}:`, dbError);
-      // Don't throw here, as it's a fallback
-  }
-  */
+  // We primarily rely on checkout.session.completed for subscription setup
 }
 
 // Handler for subscription updated event
