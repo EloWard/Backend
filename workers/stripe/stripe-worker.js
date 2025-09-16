@@ -754,8 +754,28 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
 
 // Handler for invoice paid event (updates end date and activates subscription)
 async function handleInvoicePaid(invoice, env, stripe) {
-  const subscriptionId = invoice.subscription;
+  // DEBUG: Log the actual invoice object structure to verify field names
+  console.log(`DEBUG: Invoice object keys:`, Object.keys(invoice));
+  console.log(`DEBUG: Invoice subscription field:`, invoice.subscription);
+  console.log(`DEBUG: Invoice customer field:`, invoice.customer);
+  console.log(`DEBUG: Invoice lines data:`, invoice.lines?.data?.[0]?.subscription || 'no lines data');
+  
+  let subscriptionId = invoice.subscription;
   const customerId = invoice.customer;
+
+  // If subscription ID is missing, try to find it via customer lookup
+  if (!subscriptionId && customerId) {
+    try {
+      console.log(`Invoice ${invoice.id} missing subscription ID, looking up by customer ${customerId}`);
+      const subscriptions = await stripe.subscriptions.list({ customer: customerId, limit: 1 });
+      if (subscriptions.data.length > 0) {
+        subscriptionId = subscriptions.data[0].id;
+        console.log(`Found subscription ${subscriptionId} for customer ${customerId}`);
+      }
+    } catch (error) {
+      console.error(`Failed to lookup subscription for customer ${customerId}:`, error.message);
+    }
+  }
 
   if (!subscriptionId || !customerId) {
       console.log(`Invoice paid event ${invoice.id} is missing subscription ID (${subscriptionId}) or customer ID (${customerId}). Ignoring.`);
