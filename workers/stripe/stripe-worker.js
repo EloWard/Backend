@@ -200,6 +200,20 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
         channel_id: channelId,
         channel_name: normalizedChannelName,
         subscription_type: subscriptionType
+      },
+      // Essential checkout features for clean payment link style
+      allow_promotion_codes: true,
+      billing_address_collection: 'required',
+      automatic_tax: {
+        enabled: true,
+      },
+      // Clean UI options
+      ui_mode: 'hosted', // Use Stripe's polished hosted checkout page
+      locale: 'auto', // Auto-detect user's language
+      // Payment method configuration
+      saved_payment_method_options: {
+        payment_method_save: 'enabled',
+        allow_redisplay_filters: ['always'],
       }
     };
 
