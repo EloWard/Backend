@@ -65,10 +65,6 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleIncrementSuccessfulLookups(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
-      } else if (url.pathname.includes('/metrics/batch')) {
-        response = request.method === 'POST'
-          ? await handleBatchMetricsUpdate(request, env, corsHeaders)
-          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/dashboard/data_id')) {
         response = request.method === 'POST'
           ? await handleDashboardDataById(request, env, corsHeaders)
@@ -231,59 +227,6 @@ async function handleIncrementSuccessfulLookups(request, env, corsHeaders) {
     return createErrorResponse(
       error.message === 'Invalid JSON' ? 400 : 500,
       error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to increment successful_lookups',
-      error.message === 'Invalid JSON' ? null : error.message,
-      corsHeaders
-    );
-  }
-}
-
-/**
- * Handles batch metrics update for a channel
- */
-async function handleBatchMetricsUpdate(request, env, corsHeaders) {
-  try {
-    const body = await parseRequestBody(request);
-    const channelName = validateChannelName(body.channel_name);
-    
-    // Validate counts are positive integers
-    const dbReads = parseInt(body.db_reads_count) || 0;
-    const successfulLookups = parseInt(body.successful_lookups_count) || 0;
-    
-    if (dbReads < 0 || successfulLookups < 0) {
-      return createErrorResponse(400, 'Counts must be non-negative integers', null, corsHeaders);
-    }
-    
-    // Skip update if both counts are zero
-    if (dbReads === 0 && successfulLookups === 0) {
-      return new Response(JSON.stringify({ 
-        success: true, 
-        message: 'No updates needed',
-        channel_name: body.channel_name 
-      }), {
-        status: 200,
-        headers: corsHeaders
-      });
-    }
-    
-    // Update both counters in a single query for efficiency
-    const query = `UPDATE \`users\` SET db_reads = db_reads + ?, successful_lookups = successful_lookups + ? WHERE channel_name = ?`;
-    const result = await env.DB.prepare(query).bind(dbReads, successfulLookups, channelName).run();
-    
-    return new Response(JSON.stringify({ 
-      success: true, 
-      db_reads_added: dbReads, 
-      successful_lookups_added: successfulLookups,
-      changes: result.meta?.changes || 0,
-      channel_name: body.channel_name 
-    }), {
-      status: 200,
-      headers: corsHeaders
-    });
-  } catch (error) {
-    console.error('Error updating batch metrics:', error);
-    return createErrorResponse(
-      error.message === 'Invalid JSON' ? 400 : 500,
-      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to update batch metrics',
       error.message === 'Invalid JSON' ? null : error.message,
       corsHeaders
     );
