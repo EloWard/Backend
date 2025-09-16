@@ -487,15 +487,28 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             // Retrieve subscription details to get the renewal date
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             
-            // Ensure we have complete subscription data before processing
-            if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-                console.warn(`Subscription ${subscriptionId} is missing current_period_end. Skipping checkout processing until subscription is fully initialized by Stripe.`);
-                return; // Don't create subscription record with incomplete data
+            // Only process subscriptions that have established billing cycles
+            const validBillingStatuses = ['active', 'past_due', 'unpaid', 'canceled', 'incomplete'];
+            if (!validBillingStatuses.includes(subscription.status)) {
+                console.log(`Subscription ${subscriptionId} has status '${subscription.status}' - waiting for established billing state.`);
+                return; // Wait for subscription to reach billable status
             }
             
-            // Use actual Stripe billing period data
+            // For 'incomplete' subscriptions, skip until payment is processed (invoice.paid will handle activation)
+            if (subscription.status === 'incomplete') {
+                console.log(`Subscription ${subscriptionId} is incomplete - will be processed when payment succeeds via invoice.paid`);
+                return; // Let invoice.paid handle activation of incomplete subscriptions
+            }
+            
+            // For subscriptions with billing cycles, current_period_end should be available
+            if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
+                console.error(`Subscription ${subscriptionId} has status '${subscription.status}' but missing current_period_end. Stripe data integrity issue.`);
+                return; // Don't process inconsistent data
+            }
+            
+            // Use authoritative Stripe billing period data
             subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-            console.log(`Using subscription.current_period_end (${subscription.current_period_end}) as renewal date for subscription ${subscriptionId}`);
+            console.log(`Processing checkout for subscription ${subscriptionId} (status: ${subscription.status}) with renewal date: ${subscriptionEndDate}`);
 
             // Ensure metadata is on the subscription object itself for future webhooks
             if ((!subscription.metadata?.channel_name || !subscription.metadata?.channel_id) && channelName && channelId) {
@@ -610,15 +623,22 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
   
   let subscriptionEndDate = null;
   
-  // Ensure we have complete subscription data for meaningful updates
-  if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-    console.warn(`Subscription ${subscriptionId} is missing current_period_end in updated event. Skipping processing until subscription data is complete.`);
-    return; // Don't process incomplete subscription updates
+  // Only update subscriptions that are in meaningful billing states
+  const billableStatuses = ['active', 'past_due', 'unpaid', 'canceled', 'trialing'];
+  if (!billableStatuses.includes(status)) {
+    console.log(`Subscription ${subscriptionId} updated with status '${status}' - not a billable state, skipping processing.`);
+    return; // Don't process subscriptions in transitional states
   }
   
-  // Use actual Stripe billing period data
+  // For billable subscriptions, current_period_end should be available
+  if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
+    console.error(`Subscription ${subscriptionId} has billable status '${status}' but missing current_period_end. Stripe data integrity issue.`);
+    return; // Don't process inconsistent data
+  }
+  
+  // Use authoritative Stripe billing period data
   subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-  console.log(`Using subscription.current_period_end (${subscription.current_period_end}) as renewal date for subscription ${subscriptionId} in updated event`);
+  console.log(`Processing subscription update ${subscriptionId} (status: ${status}) with renewal date: ${subscriptionEndDate}`);
 
   // Attempt to get channel identifiers from metadata for logging/completeness
   const channelId = subscription.metadata?.channel_id;
@@ -803,15 +823,22 @@ async function handleInvoicePaid(invoice, env, stripe) {
     const status = subscription.status;
     customerEmail = customer.email;
     
-    // Ensure we have complete subscription data before processing
-    if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-        console.warn(`Subscription ${subscriptionId} is missing current_period_end. This indicates incomplete Stripe data - skipping activation until subscription is fully processed.`);
-        return; // Don't activate with incomplete data
+    // Only process subscriptions that are in a billable state with complete billing periods
+    const validBillingStatuses = ['active', 'past_due', 'unpaid', 'canceled'];
+    if (!validBillingStatuses.includes(status)) {
+        console.log(`Subscription ${subscriptionId} has status '${status}' - waiting for active billing state before processing.`);
+        return; // Only process subscriptions with established billing cycles
     }
     
-    // Use actual Stripe billing period data
+    // For subscriptions with valid billing status, current_period_end should be available
+    if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
+        console.error(`Subscription ${subscriptionId} has billing status '${status}' but missing current_period_end. This indicates a Stripe data integrity issue.`);
+        return; // Don't process inconsistent Stripe data
+    }
+    
+    // Use authoritative Stripe billing period data
     subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-    console.log(`Using subscription.current_period_end (${subscription.current_period_end}) as renewal date for subscription ${subscriptionId}`);
+    console.log(`Processing subscription ${subscriptionId} (status: ${status}) with renewal date: ${subscriptionEndDate}`);
 
     // Get identifiers from metadata (hopefully populated by checkout.session.completed)
     const channelId = subscription.metadata?.channel_id;
