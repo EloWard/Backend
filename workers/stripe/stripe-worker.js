@@ -40,7 +40,7 @@ const stripeWorker = {
     if (url.pathname === '/api/webhook' && request.method === 'POST') {
       try {
         // Initialize Stripe with the secret key from environment variables
-        const stripe = new Stripe(env.secret_key);
+        const stripe = new Stripe(env.SECRET_KEY);
         // Pass the request directly to the webhook handler without cloning it
         return await handleWebhook(request, env, stripe);
       } catch (error) {
@@ -62,7 +62,7 @@ const stripeWorker = {
     let response;
     try {
       // Initialize Stripe with the secret key from environment variables
-      const stripe = new Stripe(env.secret_key);
+      const stripe = new Stripe(env.SECRET_KEY);
 
       // Internal authentication helper
       const authorizeInternal = () => {
@@ -160,14 +160,15 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
   
   const { channelId, channelName, returnUrl, mode, email } = data;
 
-  if (!channelId) {
-    return new Response(JSON.stringify({ error: 'Channel ID is required' }), {
+  if (!channelId || !channelName) {
+    return new Response(JSON.stringify({ error: 'Missing required fields: channelId, channelName' }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
     });
   }
 
-  const finalChannelName = channelName || channelId;
+  // Ensure channel name is lowercase for consistency
+  const normalizedChannelName = channelName.toLowerCase();
   const finalReturnUrl = returnUrl || 'https://www.eloward.com/dashboard?subscription=success';
 
   try {
@@ -191,13 +192,13 @@ async function handleCreateCheckoutSession(request, env, corsHeaders, stripe) {
       subscription_data: {
         metadata: {
           channel_id: channelId,
-          channel_name: finalChannelName,
+          channel_name: normalizedChannelName,
           subscription_type: subscriptionType
         }
       },
       metadata: {
         channel_id: channelId,
-        channel_name: finalChannelName,
+        channel_name: normalizedChannelName,
         subscription_type: subscriptionType
       }
     };
@@ -472,8 +473,8 @@ async function handleWebhook(request, env, stripe) {
 
 // Handler for checkout session completed event (potentially more robust)
 async function handleCheckoutSessionCompleted(session, env, stripe) {
-    const channelId = session.client_reference_id || session.metadata?.channelId;
-    const channelName = session.metadata?.channelName || channelId; // Get the Twitch username, fallback to ID
+    const channelId = session.client_reference_id || session.metadata?.channel_id;
+    const channelName = session.metadata?.channel_name; // Get the Twitch username from metadata
     const customerId = session.customer;
     const subscriptionId = session.subscription;
     const customerEmail = session.customer_email || session.customer_details?.email;
@@ -499,12 +500,12 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             }
 
             // Ensure metadata is on the subscription object itself for future webhooks
-            if ((!subscription.metadata?.channelName || !subscription.metadata?.channelId) && channelName && channelId) {
+            if ((!subscription.metadata?.channel_name || !subscription.metadata?.channel_id) && channelName && channelId) {
                 try {
                     await stripe.subscriptions.update(subscriptionId, {
                         metadata: {
-                            channelId: channelId,
-                            channelName: channelName
+                            channel_id: channelId,
+                            channel_name: channelName
                         }
                     });
                     console.log(`Updated subscription ${subscriptionId} with metadata: channelId=${channelId}, channelName=${channelName}`);
@@ -566,8 +567,8 @@ async function handleSubscriptionCreated(subscription, env, stripe) {
   const customerId = subscription.customer;
   const subscriptionId = subscription.id;
   // Attempt to get identifiers from metadata, but don't fail if missing
-  const channelId = subscription.metadata?.channelId;
-  const channelName = subscription.metadata?.channelName;
+  const channelId = subscription.metadata?.channel_id;
+  const channelName = subscription.metadata?.channel_name;
 
   console.log(`Subscription created event received: ${subscriptionId}, customer: ${customerId}, channel (from meta): ${channelName} (ID: ${channelId})`);
   
@@ -624,8 +625,8 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
   }
 
   // Attempt to get channel identifiers from metadata for logging/completeness
-  const channelId = subscription.metadata?.channelId;
-  const channelName = subscription.metadata?.channelName;
+  const channelId = subscription.metadata?.channel_id;
+  const channelName = subscription.metadata?.channel_name;
 
   console.log(`Subscription updated: ${subscriptionId}, Cust: ${customerId}, Chan: ${channelName}(${channelId}), Status: ${status}, Renewal Date: ${subscriptionEndDate || 'N/A'}, Set Active: ${shouldActivate ? 1 : (shouldDeactivate ? 0 : 'unchanged')}`);
 
@@ -684,8 +685,8 @@ async function handleSubscriptionDeleted(subscription, env, stripe) {
   const subscriptionId = subscription.id;
   const customerId = subscription.customer;
   // Metadata might be missing here, don't rely on it
-  const channelId = subscription.metadata?.channelId;
-  const channelName = subscription.metadata?.channelName;
+  const channelId = subscription.metadata?.channel_id;
+  const channelName = subscription.metadata?.channel_name;
   
   console.log(`Subscription deleted event: ${subscriptionId}, Customer: ${customerId}, Channel (from meta, might be missing): ${channelName} (${channelId})`);
 
@@ -787,8 +788,8 @@ async function handleInvoicePaid(invoice, env, stripe) {
     }
 
     // Get identifiers from metadata (hopefully populated by checkout.session.completed)
-    const channelId = subscription.metadata?.channelId;
-    const channelName = subscription.metadata?.channelName;
+    const channelId = subscription.metadata?.channel_id;
+    const channelName = subscription.metadata?.channel_name;
 
     console.log(`ACTIVATION: Invoice paid for subscription: ${subscriptionId}, Cust: ${customerId} (${customerEmail || 'no email'}), Chan: ${channelName}(${channelId}), Status: ${status}, Renewal Date: ${subscriptionEndDate || 'N/A'}`);
 
@@ -849,8 +850,8 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
     // Retrieve the subscription to get the current details and metadata
     const subscription = await stripe.subscriptions.retrieve(subscriptionId);
     const status = subscription.status;
-    const channelId = subscription.metadata?.channelId;
-    const channelName = subscription.metadata?.channelName;
+    const channelId = subscription.metadata?.channel_id;
+    const channelName = subscription.metadata?.channel_name;
     
     console.log(`Invoice payment failed for subscription: ${subscriptionId}, Cust: ${customerId}, Chan: ${channelName}(${channelId}), Status: ${status}`);
     
@@ -1032,7 +1033,7 @@ async function handleSubscriptionUpsert(request, env, corsHeaders) {
     const { twitch_id, channel_name, stripe_customer_id, stripe_subscription_id, subscription_end_date, plus_active, email } = await parseRequestBody(request);
     
     if (!twitch_id || !channel_name) {
-      return createErrorResponse(400, 'Missing twitch_id or channel_name parameter', null, corsHeaders);
+      return createErrorResponse(400, 'Missing required parameters: twitch_id, channel_name', null, corsHeaders);
     }
 
     // Normalize channel name to lowercase for consistency
