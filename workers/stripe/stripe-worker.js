@@ -634,15 +634,29 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
     // Continue without email - it's not critical for subscription updates
   }
   
-  // Complete status handling for all Stripe subscription statuses
-  const shouldDeactivate = ['canceled', 'past_due', 'unpaid', 'incomplete_expired', 'paused'].includes(status);
+  // Subscription lifecycle: canceled subs keep access until period ends
+  const activationStatuses = ['active', 'trialing', 'canceled']; // Keep access until period ends
+  const gracePeriodStatuses = ['past_due']; // 7-day grace period for payment issues  
+  const deactivationStatuses = ['unpaid', 'incomplete_expired', 'paused']; // Immediate deactivation
+  const maintainStatuses = ['incomplete']; // Let invoice.paid handle these
   
-  // Activate for active subscriptions and trialing subscriptions (premium during trial)
-  // Also activate for incomplete if it becomes active later via invoice.paid
-  const shouldActivate = ['active', 'trialing'].includes(status) && !shouldDeactivate;
+  // Determine subscription access based on status and timing
+  let shouldActivate = false;
+  let shouldMaintainStatus = false;
   
-  // Special handling for incomplete subscriptions - keep current status, let invoice.paid decide
-  const shouldMaintainStatus = ['incomplete'].includes(status);
+  if (activationStatuses.includes(status)) {
+    shouldActivate = true;
+  } else if (gracePeriodStatuses.includes(status)) {
+    // For past_due: 7-day grace period from when payment was due (current_period_end)
+    const gracePeriodDays = 7;
+    const gracePeriodEnd = new Date(subscription.current_period_end * 1000);
+    gracePeriodEnd.setDate(gracePeriodEnd.getDate() + gracePeriodDays);
+    shouldActivate = new Date() <= gracePeriodEnd;
+  } else if (maintainStatuses.includes(status)) {
+    shouldMaintainStatus = true; // Don't change current status
+  } else {
+    shouldActivate = false; // Deactivate for other statuses
+  }
   
   let subscriptionEndDate = null;
   
@@ -860,18 +874,32 @@ async function handleInvoicePaid(invoice, env, stripe) {
     const status = subscription.status;
     customerEmail = customer.email;
     
-    // For invoice.paid, we should process subscriptions that transition from incomplete to active
-    const activationStatuses = ['active', 'trialing']; // These should activate Plus features
-    const deactivationStatuses = ['past_due', 'unpaid', 'canceled']; // These should deactivate Plus features
-    const validStatuses = [...activationStatuses, ...deactivationStatuses];
+    // Subscription lifecycle: canceled subs keep access until period ends
+    const activationStatuses = ['active', 'trialing', 'canceled']; // Keep access until period ends
+    const gracePeriodStatuses = ['past_due']; // 7-day grace period for payment issues
+    const deactivationStatuses = ['unpaid']; // Immediate deactivation after multiple failures
+    const validStatuses = [...activationStatuses, ...gracePeriodStatuses, ...deactivationStatuses];
     
     if (!validStatuses.includes(status)) {
         console.log(`Subscription ${subscriptionId} has status '${status}' - not processing for invoice.paid (likely transitional state).`);
         return; // Skip transitional states
     }
     
-    // Determine if this should activate or deactivate Plus features
-    const shouldActivate = activationStatuses.includes(status);
+    // Determine subscription access based on status and timing
+    let shouldActivate;
+    if (activationStatuses.includes(status)) {
+        shouldActivate = true; // Always active for these statuses
+    } else if (gracePeriodStatuses.includes(status)) {
+        // For past_due: 7-day grace period from when payment was due (current_period_end)
+        const gracePeriodDays = 7;
+        const gracePeriodEnd = new Date(subscription.current_period_end * 1000);
+        gracePeriodEnd.setDate(gracePeriodEnd.getDate() + gracePeriodDays);
+        shouldActivate = new Date() <= gracePeriodEnd;
+        console.log(`Grace period check for ${subscriptionId}: ${shouldActivate ? 'within' : 'exceeded'} ${gracePeriodDays}-day window`);
+    } else {
+        shouldActivate = false; // Deactivate for unpaid status
+    }
+    
     console.log(`Processing invoice.paid for subscription ${subscriptionId}: status='${status}', activate=${shouldActivate}`);
     
     // Fallback to subscription data if invoice line items didn't have period info
@@ -967,15 +995,34 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
     
     console.log(`Invoice payment failed for subscription: ${subscriptionId}, Cust: ${customerId}, Chan: ${channelName}(${channelId}), Status: ${status}`);
     
-    // If status indicates payment issue, mark as inactive in our database
-    if (['past_due', 'unpaid', 'incomplete_expired', 'canceled'].includes(status)) { // Added 'canceled' for robustness
+    // Apply subscription lifecycle rules for payment failures
+    const activationStatuses = ['active', 'trialing', 'canceled']; // Keep access until period ends
+    const gracePeriodStatuses = ['past_due']; // 7-day grace period for payment issues
+    const deactivationStatuses = ['unpaid', 'incomplete_expired']; // Immediate deactivation
+    
+    let shouldActivate = false;
+    if (activationStatuses.includes(status)) {
+      shouldActivate = true; // Keep access for canceled until period ends
+    } else if (gracePeriodStatuses.includes(status)) {
+      // For past_due: 7-day grace period from when payment was due (current_period_end)
+      const gracePeriodDays = 7;
+      const gracePeriodEnd = new Date(subscription.current_period_end * 1000);
+      gracePeriodEnd.setDate(gracePeriodEnd.getDate() + gracePeriodDays);
+      shouldActivate = new Date() <= gracePeriodEnd;
+      console.log(`Payment failed grace period check for ${subscriptionId}: ${shouldActivate ? 'within' : 'exceeded'} ${gracePeriodDays}-day window`);
+    } else {
+      shouldActivate = false; // Deactivate for truly failed statuses
+    }
+    
+    // Only process statuses that require action
+    if (activationStatuses.includes(status) || gracePeriodStatuses.includes(status) || deactivationStatuses.includes(status)) {
       try {
         const subscriptionData = {
           twitch_id: channelId,
           channel_name: channelName, // Will be normalized in upsert
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
-          plus_active: false // Deactivate due to payment failure
+          plus_active: shouldActivate // Follow subscription lifecycle rules
         };
 
         // Call our internal subscription upsert endpoint to deactivate
@@ -990,14 +1037,15 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
         );
 
         if (upsertResponse.ok) {
-          console.log(`DB: Marked subscription ${subscriptionId} inactive due to payment failure/status (${status})`);
+          const action = shouldActivate ? 'MAINTAINED' : 'DEACTIVATED';
+          console.log(`DB: ${action} subscription ${subscriptionId} (plus_active=${shouldActivate}) due to payment failure/status (${status})`);
           
-          // Ensure lol_ranks sync happens directly (critical for Plus deactivation)
+          // Ensure lol_ranks sync happens directly
           if (channelName) {
             try {
-              await syncSubscriptionStatusToRanks(env, channelName.toLowerCase(), false);
+              await syncSubscriptionStatusToRanks(env, channelName.toLowerCase(), shouldActivate);
             } catch (syncError) {
-              console.error(`[CRITICAL] Failed to sync Plus deactivation to LoL ranks for ${channelName}:`, syncError);
+              console.error(`[CRITICAL] Failed to sync Plus ${action.toLowerCase()} to LoL ranks for ${channelName}:`, syncError);
             }
           }
         } else {
@@ -1009,14 +1057,14 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
           ).catch(() => null);
           
           const directResult = await retryD1Operation(
-            () => env.DB.prepare(`UPDATE subscriptions SET plus_active = 0, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(subscriptionId).run(),
-            `Direct subscription deactivation for payment failure ${subscriptionId}`
+            () => env.DB.prepare(`UPDATE subscriptions SET plus_active = ?, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = ?`).bind(shouldActivate ? 1 : 0, subscriptionId).run(),
+            `Direct subscription update for payment failure ${subscriptionId}`
           );
           
           // Sync to lol_ranks if we found the subscription
           if (directResult.changes > 0 && subscriptionLookup?.channel_name) {
             try {
-              await syncSubscriptionStatusToRanks(env, subscriptionLookup.channel_name, false);
+              await syncSubscriptionStatusToRanks(env, subscriptionLookup.channel_name, shouldActivate);
             } catch (syncError) {
               console.warn('Failed to sync subscription deactivation to ranks table:', syncError);
             }
@@ -1025,7 +1073,8 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
           if (directResult.changes === 0) {
             console.warn(`DB: Subscription ${subscriptionId} not found in DB for invoice.payment_failed update.`);
           } else {
-            console.log(`DB: Marked subscription ${subscriptionId} inactive via direct query due to payment failure/status (${status})`);
+            const action = shouldActivate ? 'maintained' : 'deactivated';
+            console.log(`DB: ${action} subscription ${subscriptionId} via direct query due to payment failure/status (${status})`);
           }
         }
       } catch (dbError) {
