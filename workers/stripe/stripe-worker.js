@@ -349,14 +349,20 @@ async function handleWebhook(request, env, stripe) {
     // Idempotency check - prevent duplicate event processing
     const eventId = event.id;
     
-    // Idempotency for all events that modify subscription state or data
+    // Events that require idempotency protection (modify subscription state)
     const criticalEvents = [
       'checkout.session.completed', 
       'invoice.paid', 
       'customer.subscription.deleted', 
-      'customer.subscription.updated',  // Critical: handles status changes, renewals, cancellations
-      'customer.subscription.created',  // Critical: handles subscription creation (fallback to checkout)
-      'invoice.payment_failed'          // Critical: handles payment failures
+      'customer.subscription.updated',
+      'customer.subscription.created',
+      'invoice.payment_failed'
+    ];
+    
+    // Additional events worth logging for production debugging (no idempotency needed)
+    const debugEvents = [
+      'customer.created',
+      'invoice.created'
     ];
     
     if (criticalEvents.includes(event.type)) {
@@ -389,8 +395,20 @@ async function handleWebhook(request, env, stripe) {
         console.warn(`Idempotency check failed for ${eventId}, proceeding:`, idempotencyError.message);
         // Continue processing - better to risk duplicate than fail
       }
+    } else if (debugEvents.includes(event.type)) {
+      // Log debug events for production troubleshooting (non-blocking)
+      retryD1Operation(
+        () => env.DB.prepare('INSERT INTO stripe_events (stripe_event_id, event_type, processed_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(eventId, event.type).run(),
+        `Recording debug event ${eventId}`,
+        1 // Single retry, don't block
+      ).catch(error => {
+        console.warn(`Failed to record debug event ${eventId}:`, error.message);
+        // Don't throw - this is just for debugging
+      });
+      
+      console.log(`Processing debug event ${eventId} (${event.type}) - logged for troubleshooting`);
     } else {
-      console.log(`Processing non-critical event ${eventId} (${event.type}) without idempotency check`);
+      console.log(`Processing untracked event ${eventId} (${event.type}) - no logging`);
     }
     
     // Create a variable to track which handler was called
@@ -425,6 +443,12 @@ async function handleWebhook(request, env, stripe) {
         await handleCheckoutSessionCompleted(event.data.object, env, stripe);
         handlerCalled = 'checkout.session.completed';
         break;
+      case 'customer.created':
+      case 'invoice.created':
+        // Debug events - logged but no processing needed
+        console.log(`Debug event ${event.type} logged for ${event.data.object.id}`);
+        handlerCalled = `${event.type} (debug)`;
+        break;
       default:
         console.log(`Unhandled event type: ${event.type}`);
         handlerCalled = 'none';
@@ -454,19 +478,13 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
     const subscriptionId = session.subscription;
     const customerEmail = session.customer_email || session.customer_details?.email;
 
-    // Add a small delay to reduce race conditions with other webhooks (invoice.paid might come first)
-    // This gives invoice.paid a chance to process before we do
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Increased to 1 second for better sequencing
-
     if (session.mode === 'subscription' && customerId && subscriptionId && channelId && channelName) {
         console.log(`Checkout completed for subscription: ${subscriptionId}, customer: ${customerId}, channel: ${channelName} (ID: ${channelId})`);
         
         let subscriptionEndDate = null;
-        let subscriptionStatus = 'incomplete'; // Default status
         try {
-            // Retrieve subscription details to get the renewal date and status
+            // Retrieve subscription details to get the renewal date
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-            subscriptionStatus = subscription.status;
             
             // Get the renewal date from current_period_end
             if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
@@ -503,10 +521,6 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             subscriptionEndDate = defaultEndDate.toISOString();
             console.log(`Failed to retrieve subscription. Using calculated renewal date: ${subscriptionEndDate}`);
         }
-
-        // Initially set channel_active=0 and let invoice.paid webhook activate the subscription
-        // This ensures we only activate after payment is fully processed
-        const isChannelActive = 0; // Always start inactive until payment confirmed via invoice.paid
 
         // Use the new subscription upsert endpoint to handle subscription data
         try {
@@ -554,68 +568,19 @@ async function handleSubscriptionCreated(subscription, env, stripe) {
   // Attempt to get identifiers from metadata, but don't fail if missing
   const channelId = subscription.metadata?.channelId;
   const channelName = subscription.metadata?.channelName;
-  
-  // Get customer email for completeness
-  let customerEmail = null;
-  try {
-    const customer = await stripe.customers.retrieve(customerId);
-    customerEmail = customer.email;
-  } catch (error) {
-    console.warn(`Failed to retrieve customer email for subscription.created ${subscriptionId}:`, error.message);
-  }
 
   console.log(`Subscription created event received: ${subscriptionId}, customer: ${customerId}, channel (from meta): ${channelName} (ID: ${channelId})`);
   
   // We primarily rely on checkout.session.completed now. 
-  // This handler might only be useful as a fallback or for logging.
-  // We won't perform DB updates here unless absolutely necessary, 
-  // as checkout.session.completed should handle the initial record creation/update.
+  // This handler is mainly for logging as checkout.session.completed handles the DB operations.
 
   if (!customerId || !subscriptionId) {
       console.error('Subscription created event missing customer or subscription ID. Cannot process further.');
       return; 
   }
 
-  // Optional: Could add logic here to update the DB *if* a record with this subscriptionId 
-  // already exists but is missing customerId or channel info, but it adds complexity.
-  // For now, we assume checkout.session.completed handles the main logic.
-  console.log(`Subscription created event for ${subscriptionId} processed (no DB action taken by default).`);
-
-  /* // Example of potential fallback DB logic (use with caution):
-  try {
-    let subscriptionEndDate = null;
-    if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
-        subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
-    } else {
-        console.warn(`Subscription ${subscriptionId} (created event) has invalid current_period_end.`);
-    }
-    const isActive = ['active', 'trialing'].includes(subscription.status) ? 1 : 0;
-
-    // Attempt to update ONLY if the subscription ID exists
-    const updateQuery = `
-        UPDATE \`subscribed-channels\` SET
-            stripe_customer_id = COALESCE(?, stripe_customer_id),
-            channel_name = COALESCE(?, channel_name),
-            twitch_id = COALESCE(?, twitch_id),
-            subscription_end_date = COALESCE(?, subscription_end_date),
-            active = ?, 
-            updated_at = CURRENT_TIMESTAMP
-        WHERE stripe_subscription_id = ?;
-    `;
-    const result = await env.DB.prepare(updateQuery)
-        .bind(customerId, channelName, channelId, subscriptionEndDate, isActive, subscriptionId)
-        .run();
-       
-    if (result.meta.changes > 0) {
-        console.log(`DB: Updated existing record for SubID ${subscriptionId} via subscription.created event.`);
-    } else {
-        console.log(`DB: No existing record found for SubID ${subscriptionId} during subscription.created event (expected, handled by checkout.session.completed).`);
-    }
-  } catch (dbError) {
-      console.error(`Database error during subscription.created fallback for SubID ${subscriptionId}:`, dbError);
-      // Don't throw here, as it's a fallback
-  }
-  */
+  // No DB action needed - checkout.session.completed handles the main logic
+  console.log(`Subscription created event for ${subscriptionId} processed (no DB action taken).`);
 }
 
 // Handler for subscription updated event
@@ -809,10 +774,6 @@ async function handleInvoicePaid(invoice, env, stripe) {
     const status = subscription.status;
     customerEmail = customer.email;
     
-    // Always set channel_active=1 when invoice.paid is received
-    // This is the definitive signal that payment has been processed successfully
-    const isChannelActive = 1; // Invoice paid = active subscription
-    
     // Get the actual renewal date from current_period_end
     if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
         subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
@@ -859,67 +820,18 @@ async function handleInvoicePaid(invoice, env, stripe) {
         }
 
         console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) from invoice.paid`);
-        
-        // Verify activation in subscriptions table (with retry)
-        const verifyResult = await retryD1Operation(
-            () => env.DB.prepare('SELECT plus_active FROM subscriptions WHERE stripe_subscription_id = ?').bind(subscriptionId).first(),
-            `Subscription activation verification for ${subscriptionId}`
-        );
-            
-        if (verifyResult) {
-            console.log(`VERIFICATION: Subscription ${subscriptionId} plus_active status is now: ${verifyResult.plus_active}`);
-            if (verifyResult.plus_active !== 1) {
-                console.error(`CRITICAL: Subscription ${subscriptionId} should be plus_active=1 but is ${verifyResult.plus_active}!`);
-            }
-        }
     } catch(dbError) {
         console.error(`Database error during invoice.paid for SubID ${subscriptionId}:`, dbError);
         throw dbError; // Re-throw to trigger retry
     }
   } catch (error) {
-      console.error(`Error retrieving subscription ${subscriptionId} during invoice.paid handling:`, error);
-      
-      // Even if subscription retrieval fails, we can still calculate a default renewal date
-      // and activate the subscription since payment was confirmed
-      const defaultEndDate = new Date();
-      defaultEndDate.setMonth(defaultEndDate.getMonth() + 1);
-      subscriptionEndDate = defaultEndDate.toISOString();
-      console.log(`Failed to retrieve subscription. Using calculated renewal date: ${subscriptionEndDate} for database update`);
-      
-      try {
-          // Try activating using subscription upsert with fallback data
-          const fallbackSubscriptionData = {
-              stripe_subscription_id: subscriptionId,
-              subscription_end_date: subscriptionEndDate,
-              plus_active: true // Activate since payment was confirmed
-              // Note: missing twitch_id and channel_name - this fallback may not work with new schema
-          };
-
-          const fallbackResponse = await handleSubscriptionUpsert(
-              new Request('https://internal/subscription/upsert', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(fallbackSubscriptionData)
-              }), 
-              env, 
-              {}
-          );
-
-          if (fallbackResponse.ok) {
-              console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) using calculated renewal date via fallback`);
-              return; // Success, exit function
-          } else {
-              console.warn(`Fallback subscription activation failed for ${subscriptionId}: ${fallbackResponse.status}`);
-          }
-      } catch (fallbackDbError) {
-          console.error(`Fallback subscription activation failed for subscription ${subscriptionId}:`, fallbackDbError);
-      }
-      
       if (error.type === 'StripeInvalidRequestError') {
           console.warn(`Subscription ${subscriptionId} not found via Stripe API during invoice.paid. It might have been deleted.`);
           return; // Subscription likely deleted, ignore
       }
-      throw error; // Re-throw other errors
+      
+      console.error(`Error retrieving subscription ${subscriptionId} during invoice.paid handling:`, error);
+      throw error; // Re-throw other errors for Stripe to retry
   }
 }
 
@@ -947,6 +859,7 @@ async function handleInvoicePaymentFailed(invoice, env, stripe) {
       try {
         const subscriptionData = {
           twitch_id: channelId,
+          channel_name: channelName, // Will be normalized in upsert
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           plus_active: false // Deactivate due to payment failure
