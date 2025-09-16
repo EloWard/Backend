@@ -483,8 +483,29 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
         console.log(`Checkout completed for subscription: ${subscriptionId}, customer: ${customerId}, channel: ${channelName} (ID: ${channelId})`);
         
         let subscriptionEndDate = null;
+        
+        // First, try to get billing period from the session's invoice (most reliable)
+        if (session.invoice && typeof session.invoice === 'string') {
+            try {
+                console.log(`Retrieving invoice ${session.invoice} for billing period data`);
+                const invoice = await stripe.invoices.retrieve(session.invoice, { 
+                    expand: ['lines'] // Ensure we get line items
+                });
+                
+                if (invoice.lines?.data?.length > 0) {
+                    const lineItem = invoice.lines.data[0];
+                    if (lineItem.period?.end && typeof lineItem.period.end === 'number') {
+                        subscriptionEndDate = new Date(lineItem.period.end * 1000).toISOString();
+                        // Using invoice line item billing period (most reliable)
+                    }
+                }
+            } catch (invoiceError) {
+                console.log(`Could not retrieve invoice ${session.invoice} for billing period: ${invoiceError.message}`);
+            }
+        }
+        
         try {
-            // Retrieve subscription details to get the renewal date
+            // Retrieve subscription details to get the status and fallback billing data
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             
             // Only process subscriptions that have established billing cycles
@@ -500,14 +521,19 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
                 return; // Let invoice.paid handle activation of incomplete subscriptions
             }
             
-            // For subscriptions with billing cycles, current_period_end should be available
-            if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-                console.error(`Subscription ${subscriptionId} has status '${subscription.status}' but missing current_period_end. Stripe data integrity issue.`);
-                return; // Don't process inconsistent data
+            // Fallback to subscription data if invoice didn't have billing period
+            if (!subscriptionEndDate) {
+                if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
+                    subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
+                    // Using subscription current_period_end
+                } else if (subscription.trial_end && typeof subscription.trial_end === 'number') {
+                    subscriptionEndDate = new Date(subscription.trial_end * 1000).toISOString();
+                    // Using subscription trial_end
+                } else {
+                    console.log(`Subscription ${subscriptionId} (${subscription.status}) doesn't have billing period established yet. Letting invoice.paid handle activation.`);
+                    subscriptionEndDate = null; // Will be set when invoice.paid processes
+                }
             }
-            
-            // Use authoritative Stripe billing period data
-            subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
             console.log(`Processing checkout for subscription ${subscriptionId} (status: ${subscription.status}) with renewal date: ${subscriptionEndDate}`);
 
             // Ensure metadata is on the subscription object itself for future webhooks
@@ -527,11 +553,8 @@ async function handleCheckoutSessionCompleted(session, env, stripe) {
             }
         } catch (subRetrieveError) {
             console.error(`Failed to retrieve subscription ${subscriptionId} during checkout completed handling:`, subRetrieveError);
-            // If we can't retrieve the subscription, create a default renewal date
-            const defaultEndDate = new Date();
-            defaultEndDate.setMonth(defaultEndDate.getMonth() + 1);
-            subscriptionEndDate = defaultEndDate.toISOString();
-            console.log(`Failed to retrieve subscription. Using calculated renewal date: ${subscriptionEndDate}`);
+            // If we can't retrieve subscription data, let invoice.paid handle it with complete information
+            subscriptionEndDate = null;
         }
 
         // Use the new subscription upsert endpoint to handle subscription data
@@ -630,14 +653,19 @@ async function handleSubscriptionUpdated(subscription, env, stripe) {
     return; // Don't process subscriptions in transitional states
   }
   
-  // For billable subscriptions, current_period_end should be available
-  if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-    console.error(`Subscription ${subscriptionId} has billable status '${status}' but missing current_period_end. Stripe data integrity issue.`);
-    return; // Don't process inconsistent data
+  // Calculate subscription end date - handle timing gracefully
+  if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
+    // Use authoritative Stripe billing period data when available
+    subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
+  } else if (subscription.trial_end && typeof subscription.trial_end === 'number') {
+    // Use trial end as fallback for trial subscriptions
+    subscriptionEndDate = new Date(subscription.trial_end * 1000).toISOString();
+  } else {
+    // For subscriptions without established billing periods, skip this update
+    // Future events will handle when billing period is available
+    console.log(`Subscription ${subscriptionId} (${status}) doesn't have billing period established yet. Skipping update.`);
+    return;
   }
-  
-  // Use authoritative Stripe billing period data
-  subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
   console.log(`Processing subscription update ${subscriptionId} (status: ${status}) with renewal date: ${subscriptionEndDate}`);
 
   // Attempt to get channel identifiers from metadata for logging/completeness
@@ -810,11 +838,20 @@ async function handleInvoicePaid(invoice, env, stripe) {
       return; // Don't process incomplete invoice data
   }
   
-  // Initialize subscription end date (renewal date)
+  // Extract billing period directly from invoice line items (most reliable source)
   let subscriptionEndDate = null;
   let customerEmail = null;
   
-  // Retrieve the subscription and customer to get renewal date, status, metadata, and email
+  // Check invoice line items for billing period (authoritative source)
+  if (invoice.lines?.data?.length > 0) {
+    const lineItem = invoice.lines.data[0]; // First line item contains subscription period
+    if (lineItem.period?.end && typeof lineItem.period.end === 'number') {
+      subscriptionEndDate = new Date(lineItem.period.end * 1000).toISOString();
+      // Using invoice line item billing period (authoritative)
+    }
+  }
+  
+  // Retrieve the subscription and customer to get status, metadata, and email
   try {
     const [subscription, customer] = await Promise.all([
       stripe.subscriptions.retrieve(subscriptionId),
@@ -823,21 +860,33 @@ async function handleInvoicePaid(invoice, env, stripe) {
     const status = subscription.status;
     customerEmail = customer.email;
     
-    // Only process subscriptions that are in a billable state with complete billing periods
-    const validBillingStatuses = ['active', 'past_due', 'unpaid', 'canceled'];
-    if (!validBillingStatuses.includes(status)) {
-        console.log(`Subscription ${subscriptionId} has status '${status}' - waiting for active billing state before processing.`);
-        return; // Only process subscriptions with established billing cycles
+    // For invoice.paid, we should process subscriptions that transition from incomplete to active
+    const activationStatuses = ['active', 'trialing']; // These should activate Plus features
+    const deactivationStatuses = ['past_due', 'unpaid', 'canceled']; // These should deactivate Plus features
+    const validStatuses = [...activationStatuses, ...deactivationStatuses];
+    
+    if (!validStatuses.includes(status)) {
+        console.log(`Subscription ${subscriptionId} has status '${status}' - not processing for invoice.paid (likely transitional state).`);
+        return; // Skip transitional states
     }
     
-    // For subscriptions with valid billing status, current_period_end should be available
-    if (!subscription.current_period_end || typeof subscription.current_period_end !== 'number') {
-        console.error(`Subscription ${subscriptionId} has billing status '${status}' but missing current_period_end. This indicates a Stripe data integrity issue.`);
-        return; // Don't process inconsistent Stripe data
-    }
+    // Determine if this should activate or deactivate Plus features
+    const shouldActivate = activationStatuses.includes(status);
+    console.log(`Processing invoice.paid for subscription ${subscriptionId}: status='${status}', activate=${shouldActivate}`);
     
-    // Use authoritative Stripe billing period data
-    subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
+    // Fallback to subscription data if invoice line items didn't have period info
+    if (!subscriptionEndDate) {
+        if (subscription.current_period_end && typeof subscription.current_period_end === 'number') {
+            subscriptionEndDate = new Date(subscription.current_period_end * 1000).toISOString();
+            // Using subscription current_period_end as fallback
+        } else if (subscription.trial_end && typeof subscription.trial_end === 'number') {
+            subscriptionEndDate = new Date(subscription.trial_end * 1000).toISOString();
+            // Using subscription trial_end as fallback
+        } else {
+            console.warn(`No billing period available from invoice or subscription for ${subscriptionId}. Proceeding with null date.`);
+            subscriptionEndDate = null;
+        }
+    }
     console.log(`Processing subscription ${subscriptionId} (status: ${status}) with renewal date: ${subscriptionEndDate}`);
 
     // Get identifiers from metadata (hopefully populated by checkout.session.completed)
@@ -854,7 +903,7 @@ async function handleInvoicePaid(invoice, env, stripe) {
             stripe_customer_id: customerId,
             stripe_subscription_id: subscriptionId,
             subscription_end_date: subscriptionEndDate,
-            plus_active: true, // ACTIVATE the subscription - invoice paid = confirmed payment
+            plus_active: shouldActivate, // Activate for active/trialing, deactivate for failed statuses
             email: customerEmail // Include customer email
         };
 
@@ -870,17 +919,18 @@ async function handleInvoicePaid(invoice, env, stripe) {
         );
 
         if (!upsertResponse.ok) {
-            throw new Error(`Subscription activation failed: ${upsertResponse.status}`);
+            throw new Error(`Subscription upsert failed: ${upsertResponse.status}`);
         }
 
-        console.log(`DB: ACTIVATED subscription ${subscriptionId} (plus_active=true) from invoice.paid`);
+        const action = shouldActivate ? 'ACTIVATED' : 'DEACTIVATED';
+        console.log(`DB: ${action} subscription ${subscriptionId} (plus_active=${shouldActivate}) from invoice.paid`);
         
         // Ensure lol_ranks sync happens directly (critical for Plus features)
         if (channelName) {
           try {
-            await syncSubscriptionStatusToRanks(env, channelName.toLowerCase(), true);
+            await syncSubscriptionStatusToRanks(env, channelName.toLowerCase(), shouldActivate);
           } catch (syncError) {
-            console.error(`[CRITICAL] Failed to sync Plus activation to LoL ranks for ${channelName}:`, syncError);
+            console.error(`[CRITICAL] Failed to sync Plus ${action.toLowerCase()} to LoL ranks for ${channelName}:`, syncError);
           }
         }
     } catch(dbError) {
@@ -1189,8 +1239,11 @@ async function syncSubscriptionStatusToRanks(env, channel_name, plus_active) {
       return;
     }
     
-    const syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ? AND riot_puuid = ?';
-    const syncParams = [newPlusActiveValue, channel_name, existingRank.riot_puuid];
+    // Use only twitch_username for the update to avoid potential PUUID mismatches
+    const syncQuery = 'UPDATE lol_ranks SET plus_active = ? WHERE twitch_username = ?';
+    const syncParams = [newPlusActiveValue, channel_name];
+    
+    // Update plus_active in lol_ranks table
     
     const syncResult = await retryD1Operation(
       () => env.DB.prepare(syncQuery).bind(...syncParams).run(),
@@ -1200,13 +1253,20 @@ async function syncSubscriptionStatusToRanks(env, channel_name, plus_active) {
     if (syncResult.changes && syncResult.changes > 0) {
       console.log(`[RANKS SYNC] ✅ Successfully synced: ${channel_name} -> plus_active: ${plus_active} (${syncResult.changes} rows updated)`);
     } else {
-      console.error(`[RANKS SYNC] ❌ No rows updated for ${channel_name} despite value change needed. Current: ${existingRank.plus_active}, Target: ${newPlusActiveValue}`);
-      // Log the exact query for debugging
-      console.error(`[RANKS SYNC] Debug - Query: ${syncQuery}, Params: [${syncParams.join(', ')}]`);
+      console.error(`[RANKS SYNC] ❌ No rows updated for ${channel_name}. Expected to update PUUID: ${existingRank.riot_puuid}`);
+      
+      // Additional debugging - check what records exist
+      const debugResult = await retryD1Operation(
+        () => env.DB.prepare('SELECT twitch_username, riot_puuid, plus_active FROM lol_ranks WHERE twitch_username = ?').bind(channel_name).all(),
+        `Debug query for ${channel_name}`
+      ).catch(() => ({ results: [] }));
+      
+      console.error(`[RANKS SYNC] Found ${debugResult.results?.length || 0} records for ${channel_name}`);
     }
   } catch (error) {
     console.error(`[RANKS SYNC] ❌ Error syncing subscription status for ${channel_name}:`, error);
-    throw error;
+    // Don't throw - lol_ranks sync failure should not break subscription processing
+    return;
   }
 }
 
