@@ -79,15 +79,50 @@ const STANDARD_REDIRECT_URI = "https://www.eloward.com/twitch/auth/redirect";
 // Create a router
 const router = Router();
 
+// Allowed origins for CORS
+const allowedOrigins = [
+  'https://www.eloward.com',
+  'https://eloward.com',
+  'http://localhost:3000'  // Development
+];
+
+// Helper function to generate CORS headers based on the request
+function getCorsHeaders(request: Request) {
+  const origin = request.headers.get('Origin');
+  
+  // Allow browser extensions (they send chrome-extension:// or moz-extension:// origins)
+  const isExtensionOrigin = origin && (
+    origin.startsWith('chrome-extension://') || 
+    origin.startsWith('moz-extension://')
+  );
+  
+  // Allow specific domains or extension origins
+  const allowedOrigin = (origin && allowedOrigins.includes(origin)) || isExtensionOrigin 
+    ? origin 
+    : allowedOrigins[0];
+
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin || allowedOrigins[0],
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
 // Helper function for CORS responses
-function corsResponse(status: number, data: any): Response {
+function corsResponse(status: number, data: any, request?: Request): Response {
+  const corsHeaders = request ? getCorsHeaders(request) : {
+    'Access-Control-Allow-Origin': allowedOrigins[0],
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+  };
+
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      ...corsHeaders,
     },
   });
 }
@@ -98,8 +133,8 @@ router.get('/health', () => {
 });
 
 // Handle OPTIONS requests for CORS
-router.options('*', () => {
-  return corsResponse(200, {});
+router.options('*', (request) => {
+  return corsResponse(200, {}, request);
 });
 
 // Redirect handler (parity with Riot): forward Twitch code/state to website
@@ -265,7 +300,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: any): Promise<Response> {
     // Handle CORS preflight requests
     if (request.method === 'OPTIONS') {
-      return corsResponse(200, {});
+      return corsResponse(200, {}, request);
     }
     
     // Handle all other requests via the router

@@ -1,13 +1,38 @@
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+// Allowed origins for CORS
+const allowedOrigins = [
+  'https://www.eloward.com',
+  'https://eloward.com',
+  'http://localhost:3000'  // Development
+];
+
+// Helper function to generate CORS headers based on the request
+function getCorsHeaders(request) {
+  const origin = request.headers.get('Origin');
+  
+  // Allow browser extensions (they send chrome-extension:// or moz-extension:// origins)
+  const isExtensionOrigin = origin && (
+    origin.startsWith('chrome-extension://') || 
+    origin.startsWith('moz-extension://')
+  );
+  
+  // Allow specific domains or extension origins
+  const allowedOrigin = allowedOrigins.includes(origin) || isExtensionOrigin 
+    ? origin 
+    : allowedOrigins[0];
+
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Internal-Auth",
+    "Access-Control-Max-Age": "86400",
+  };
+}
 
 const worker = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+    const corsHeaders = getCorsHeaders(request);
     
     // Lightweight internal auth for write operations (POST/DELETE)
     const authorizeInternal = () => {
@@ -25,33 +50,33 @@ const worker = {
         if (!authorizeInternal()) {
           return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: corsHeaders });
         }
-        return storeRank(request, env);
+        return storeRank(request, env, corsHeaders);
       }
       if (request.method === "DELETE") {
         if (!authorizeInternal()) {
           return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: corsHeaders });
         }
-        return deleteRank(request, env);
+        return deleteRank(request, env, corsHeaders);
       }
     }
     
     const getUserMatch = path.match(/^\/api\/ranks\/lol\/([^/]+)$/);
     if (getUserMatch && request.method === "GET") {
-      return getRank(getUserMatch[1].toLowerCase(), env);
+      return getRank(getUserMatch[1].toLowerCase(), env, corsHeaders);
     }
     
     if (path === "/api/ranks/lol/by-puuid" && request.method === "POST") {
-      return getRankByPuuid(request, env);
+      return getRankByPuuid(request, env, corsHeaders);
     }
     
     // User-facing options update endpoint (validated but no write key required)
     if (path === "/api/options" && request.method === "PUT") {
-      return updateUserOptions(request, env);
+      return updateUserOptions(request, env, corsHeaders);
     }
     
     const getOptionsMatch = path.match(/^\/api\/options\/([^/]+)$/);
     if (getOptionsMatch && request.method === "GET") {
-      return getUserOptions(getOptionsMatch[1], env);
+      return getUserOptions(getOptionsMatch[1], env, corsHeaders);
     }
     
     return new Response("Not found", { status: 404, headers: corsHeaders });
@@ -70,7 +95,7 @@ const worker = {
   }
 };
 
-function jsonResponse(data, status = 200) {
+function jsonResponse(data, status = 200, corsHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json", ...corsHeaders }
@@ -120,7 +145,7 @@ function isRankHigher(newRank, currentRank) {
   return newLP > currentLP;
 }
 
-async function storeRank(request, env) {
+async function storeRank(request, env, corsHeaders) {
   try {
     const { 
       riot_puuid, twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active,
@@ -132,7 +157,7 @@ async function storeRank(request, env) {
       return jsonResponse({ 
         error: "Missing required fields", 
         required: ["riot_puuid", "twitch_username", "rank_tier"] 
-      }, 400);
+      }, 400, corsHeaders);
     }
     
     // Handle plus_active conditionally
@@ -243,24 +268,24 @@ async function storeRank(request, env) {
       region,
       peak_updated: peak_rank_tier !== undefined ? 'explicit_override' : (updatePeak ? 'rank_comparison' : false),
       changes: result.changes || 0
-    });
+    }, 200, corsHeaders);
   } catch (error) {
     console.error("Error storing rank data:", error);
     return jsonResponse({ 
       error: "Failed to store rank data", 
       details: error.message 
-    }, 500);
+    }, 500, corsHeaders);
   }
 }
 
-async function getRank(username, env) {
+async function getRank(username, env, corsHeaders) {
   try {
     const result = await env.DB.prepare(
       "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak, animate_badge FROM lol_ranks WHERE twitch_username = ?"
     ).bind(username).first();
     
     if (!result) {
-      return jsonResponse({ error: "User rank not found" }, 404);
+      return jsonResponse({ error: "User rank not found" }, 404, corsHeaders);
     }
     
     // Return peak rank data if show_peak is true AND plus_active is true, otherwise current rank
@@ -277,42 +302,42 @@ async function getRank(username, env) {
       animate_badge: result.plus_active && result.animate_badge
     };
     
-    return jsonResponse(responseData);
+    return jsonResponse(responseData, 200, corsHeaders);
   } catch (error) {
     console.error(`Error fetching rank for ${username}:`, error);
-    return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500);
+    return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500, corsHeaders);
   }
 }
 
-async function deleteRank(request, env) {
+async function deleteRank(request, env, corsHeaders) {
   try {
     const { puuid } = await request.json();
     
     if (!puuid) {
-      return jsonResponse({ error: "Missing puuid parameter" }, 400);
+      return jsonResponse({ error: "Missing puuid parameter" }, 400, corsHeaders);
     }
     
     const result = await env.DB.prepare("DELETE FROM lol_ranks WHERE riot_puuid = ?").bind(puuid).run();
     
     if (result.changes === 0) {
-      return jsonResponse({ error: "User rank not found" }, 404);
+      return jsonResponse({ error: "User rank not found" }, 404, corsHeaders);
     }
     
-    return jsonResponse({ success: true, deleted: result.changes });
+    return jsonResponse({ success: true, deleted: result.changes }, 200, corsHeaders);
   } catch (error) {
     console.error("Error deleting rank:", error);
-    return jsonResponse({ error: "Failed to delete rank", details: error.message }, 500);
+    return jsonResponse({ error: "Failed to delete rank", details: error.message }, 500, corsHeaders);
   }
 }
 
-async function getRankByPuuid(request, env) {
+async function getRankByPuuid(request, env, corsHeaders) {
   let requestedPuuid = undefined;
   try {
     const body = await request.json();
     requestedPuuid = body?.puuid;
     
     if (!requestedPuuid) {
-      return jsonResponse({ error: "Missing puuid parameter" }, 400);
+      return jsonResponse({ error: "Missing puuid parameter" }, 400, corsHeaders);
     }
     
     const result = await env.DB.prepare(
@@ -320,7 +345,7 @@ async function getRankByPuuid(request, env) {
     ).bind(requestedPuuid).first();
     
     if (!result) {
-      return jsonResponse({ error: "User rank not found" }, 404);
+      return jsonResponse({ error: "User rank not found" }, 404, corsHeaders);
     }
     
     // Return peak rank data if show_peak is true AND plus_active is true, otherwise current rank
@@ -340,10 +365,10 @@ async function getRankByPuuid(request, env) {
       animate_badge: result.plus_active && result.animate_badge // Effective preference
     };
     
-    return jsonResponse(responseData);
+    return jsonResponse(responseData, 200, corsHeaders);
   } catch (error) {
     console.error(`Error fetching rank for puuid ${requestedPuuid || 'unknown'}:`, error);
-    return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500);
+    return jsonResponse({ error: "Failed to retrieve rank", details: error.message }, 500, corsHeaders);
   }
 }
 
@@ -444,34 +469,34 @@ async function refreshSingleRank(puuid, env) {
   return result;
 }
 
-async function getUserOptions(puuid, env) {
+async function getUserOptions(puuid, env, corsHeaders) {
   try {
     const result = await env.DB.prepare(
       "SELECT show_peak, animate_badge, plus_active FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(puuid).first();
     
     if (!result) {
-      return jsonResponse({ error: "User not found" }, 404);
+      return jsonResponse({ error: "User not found" }, 404, corsHeaders);
     }
     
     return jsonResponse({
       show_peak: Boolean(result.show_peak),
       animate_badge: Boolean(result.animate_badge),
       plus_active: Boolean(result.plus_active)
-    });
+    }, 200, corsHeaders);
   } catch (error) {
     console.error(`Error fetching options for ${puuid}:`, error);
-    return jsonResponse({ error: "Failed to retrieve options", details: error.message }, 500);
+    return jsonResponse({ error: "Failed to retrieve options", details: error.message }, 500, corsHeaders);
   }
 }
 
-async function updateUserOptions(request, env) {
+async function updateUserOptions(request, env, corsHeaders) {
   try {
     const body = await request.json();
     const { puuid, twitch_username, show_peak, animate_badge } = body;
     
     if (!puuid || !twitch_username) {
-      return jsonResponse({ error: "PUUID and Twitch username are required" }, 400);
+      return jsonResponse({ error: "PUUID and Twitch username are required" }, 400, corsHeaders);
     }
     
     // Verify PUUID and Twitch username match, get plus_active in single query
@@ -480,11 +505,11 @@ async function updateUserOptions(request, env) {
     ).bind(puuid, twitch_username.toLowerCase()).first();
     
     if (!userResult) {
-      return jsonResponse({ error: "User not found or credentials do not match" }, 403);
+      return jsonResponse({ error: "User not found or credentials do not match" }, 403, corsHeaders);
     }
     
     if (!userResult.plus_active) {
-      return jsonResponse({ error: "Premium subscription required to modify options" }, 403);
+      return jsonResponse({ error: "Premium subscription required to modify options" }, 403, corsHeaders);
     }
     
     // Build update query dynamically based on provided fields
@@ -502,7 +527,7 @@ async function updateUserOptions(request, env) {
     }
     
     if (updates.length === 0) {
-      return jsonResponse({ error: "No options provided to update" }, 400);
+      return jsonResponse({ error: "No options provided to update" }, 400, corsHeaders);
     }
     
     params.push(puuid);
@@ -519,10 +544,10 @@ async function updateUserOptions(request, env) {
       show_peak: Boolean(updatedResult.show_peak),
       animate_badge: Boolean(updatedResult.animate_badge),
       plus_active: Boolean(updatedResult.plus_active)
-    });
+    }, 200, corsHeaders);
   } catch (error) {
     console.error(`Error updating user options:`, error);
-    return jsonResponse({ error: "Failed to update options", details: error.message }, 500);
+    return jsonResponse({ error: "Failed to update options", details: error.message }, 500, corsHeaders);
   }
 }
 

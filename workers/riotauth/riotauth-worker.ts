@@ -453,19 +453,48 @@ function formatPeakRankForDatabase(peakRank: any): { tier: string; division: str
 // Create a new router
 const router = Router();
 
-// Add CORS headers to all responses
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Max-Age': '86400',
-};
+// Allowed origins for CORS
+const allowedOrigins = [
+  'https://www.eloward.com',
+  'https://eloward.com',
+  'http://localhost:3000'  // Development
+];
+
+// Helper function to generate CORS headers based on the request
+function getCorsHeaders(request: Request) {
+  const origin = request.headers.get('Origin');
+  
+  // Allow browser extensions (they send chrome-extension:// or moz-extension:// origins)
+  const isExtensionOrigin = origin && (
+    origin.startsWith('chrome-extension://') || 
+    origin.startsWith('moz-extension://')
+  );
+  
+  // Allow specific domains or extension origins
+  const allowedOrigin = (origin && allowedOrigins.includes(origin)) || isExtensionOrigin 
+    ? origin 
+    : allowedOrigins[0];
+
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin || allowedOrigins[0],
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+  };
+}
 
 // Define the standard redirect URI throughout the app
 const STANDARD_REDIRECT_URI = "https://www.eloward.com/riot/auth/redirect";
 
 // Add a helper function for consistent CORS responses
-function corsResponse(status: number, data: any): Response {
+function corsResponse(status: number, data: any, request?: Request): Response {
+  const corsHeaders = request ? getCorsHeaders(request) : {
+    'Access-Control-Allow-Origin': allowedOrigins[0],
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+  };
+  
   return new Response(
     JSON.stringify(data),
     {
@@ -479,10 +508,10 @@ function corsResponse(status: number, data: any): Response {
 }
 
 // Handle OPTIONS requests for CORS preflight
-router.options('*', () => {
+router.options('*', (request) => {
   return new Response(null, {
     status: 204,
-    headers: corsHeaders,
+    headers: getCorsHeaders(request),
   });
 });
 
@@ -510,6 +539,7 @@ router.get('/auth/redirect', async (request, env) => {
 
     // Handle error case
     if (error) {
+      const corsHeaders = getCorsHeaders(request);
       return new Response(`
         <html>
           <head>
@@ -571,6 +601,7 @@ router.get('/auth/redirect', async (request, env) => {
     
     // Validate required parameters
     if (!code || !state) {
+      const corsHeaders = getCorsHeaders(request);
       return new Response(`
         <html>
           <head>
@@ -632,6 +663,7 @@ router.get('/auth/redirect', async (request, env) => {
     
     // Should not reach here for success cases due to redirect above
   } catch (error) {
+    const corsHeaders = getCorsHeaders(request);
     return new Response(`
       <html>
         <head><title>Authentication Failed</title></head>
@@ -1033,17 +1065,11 @@ router.delete('/disconnect', async (request: Request, env: Env) => {
 });
 
 // Catch-all route for 404s
-router.all('*', () => {
-  return new Response(JSON.stringify({ 
+router.all('*', (request) => {
+  return corsResponse(404, { 
     error: 'not_found',
     error_description: 'Endpoint not found' 
-  }), {
-    status: 404,
-    headers: { 
-      'Content-Type': 'application/json',
-      ...corsHeaders
-    }
-  });
+  }, request);
 });
 
 
