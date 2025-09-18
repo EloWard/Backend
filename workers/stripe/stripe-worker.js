@@ -2,7 +2,7 @@
 import Stripe from 'stripe';
 
 // Allowed origins for CORS
-const allowedOrigins = ['https://www.eloward.com', 'https://eloward.com'];
+const allowedOrigins = ['https://www.eloward.com', 'https://eloward.com', 'http://localhost:3000'];
 
 // Helper function to generate CORS headers based on the request
 function getCorsHeaders(request) {

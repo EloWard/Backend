@@ -8,6 +8,7 @@
 const allowedOrigins = [
   'https://www.eloward.com', 
   'https://eloward.com',
+  'http://localhost:3000',  // Development
   'https://www.twitch.tv'  // FFZ addon access
 ];
 
@@ -130,7 +131,17 @@ export default usersWorker;
  */
 function getCorsHeaders(request) {
   const origin = request.headers.get('Origin');
-  const allowedOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
+  
+  // Allow browser extensions (they send chrome-extension:// or moz-extension:// origins)
+  const isExtensionOrigin = origin && (
+    origin.startsWith('chrome-extension://') || 
+    origin.startsWith('moz-extension://')
+  );
+  
+  // Allow specific domains or extension origins
+  const allowedOrigin = allowedOrigins.includes(origin) || isExtensionOrigin 
+    ? origin 
+    : allowedOrigins[0];
 
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
