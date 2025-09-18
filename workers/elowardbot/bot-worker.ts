@@ -163,6 +163,58 @@ async function validateToken(env: Env, token: string) {
   }
 }
 
+// Dashboard and config routes for frontend
+router.post('/bot/config_id', async (req: Request, env: Env) => {
+  try {
+    const body = await req.json().catch(() => ({} as any));
+    const twitch_id = String(body?.twitch_id || '');
+    if (!twitch_id) return json(400, { error: 'twitch_id required' });
+    
+    const cfg = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template, 
+             enforcement_mode, min_rank_tier, min_rank_division
+      FROM twitch_bot_users WHERE twitch_id = ?
+    `).bind(twitch_id).first();
+    
+    if (!cfg) return json(404, { error: 'not found' });
+    
+    return json(200, cfg);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
+router.post('/dashboard/init', async (req: Request, env: Env) => {
+  try {
+    const body = await req.json().catch(() => ({} as any));
+    const twitch_id = String(body?.twitch_id || '');
+    if (!twitch_id) return json(400, { error: 'twitch_id required' });
+    
+    const cfg = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template,
+             enforcement_mode, min_rank_tier, min_rank_division
+      FROM twitch_bot_users WHERE twitch_id = ?
+    `).bind(twitch_id).first();
+    
+    const bot_config = cfg ? {
+      channel_login: cfg.channel_login,
+      bot_enabled: !!cfg.bot_enabled,
+      timeout_seconds: cfg.timeout_seconds,
+      reason_template: cfg.reason_template,
+      enforcement_mode: cfg.enforcement_mode || 'has_rank',
+      min_rank_tier: cfg.min_rank_tier || null,
+      min_rank_division: cfg.min_rank_division ?? null
+    } : null;
+    
+    return json(200, { 
+      bot_active: !!(cfg && cfg.bot_enabled), 
+      bot_config 
+    });
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
 // Main worker routes
 router.post('/irc/reload', async (_req: Request, env: Env, ctx: ExecutionContext) => {
   try {
@@ -245,13 +297,35 @@ router.get('/irc/health', async (req: Request, env: Env) => {
 });
 
 // Main worker handler
+// Allowed origins for CORS
+const allowedOrigins = [
+  'https://www.eloward.com',
+  'https://eloward.com', 
+  'http://localhost:3000'  // Development
+];
+
+// Helper function to generate CORS headers based on the request
+function getCorsHeaders(request: Request) {
+  const origin = request.headers.get('Origin');
+  const allowedOrigin = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
+
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+  };
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const corsHeaders = getCorsHeaders(request);
+    
     const addCors = (res: Response) => {
       const headers = new Headers(res.headers);
-      headers.set('Access-Control-Allow-Origin', '*');
-      headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      for (const [key, value] of Object.entries(corsHeaders)) {
+        headers.set(key, value);
+      }
       return new Response(res.body, {
         status: res.status,
         statusText: res.statusText,
