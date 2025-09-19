@@ -1,12 +1,15 @@
 /**
- * EloWard Bot Worker - Production Grade
- * Always-on Twitch IRC connection with immediate message processing
- * Optimized for high-volume chat monitoring and real-time timeouts
+ * EloWard Twitch Bot - Production Grade Single-DO Architecture
+ * 
+ * CRITICAL: Removed all hibernation complexity for always-on reliability
+ * - Single Durable Object with direct IRC connection
+ * - Immediate message processing (no forwarding/proxying)  
+ * - Production-grade error handling and auto-recovery
+ * - Zero-downtime channel management
  */
 
 import { Router } from 'itty-router';
 
-// Minimal Cloudflare Workers types
 type KVNamespace = {
   get: (key: string, type?: 'text' | 'json' | 'arrayBuffer' | 'stream') => Promise<any>;
   put: (key: string, value: string, options?: Record<string, any>) => Promise<void>;
@@ -20,7 +23,7 @@ interface DurableObjectState {
     put: (key: string, value: any) => Promise<void>; 
     delete: (key: string) => Promise<void> 
   }; 
-  setAlarm?(when: number): void 
+  setAlarm?(when: number): void;
 }
 interface DurableObjectNamespace { 
   idFromName(name: string): any; 
@@ -39,14 +42,11 @@ interface Env {
   TWITCH_CLIENT_ID: string;
   TWITCH_CLIENT_SECRET: string;
   WORKER_PUBLIC_URL: string;
-  EVENTSUB_SECRET: string;
   BOT_KV: KVNamespace;
   RANK_WORKER: Fetcher;
-  BOT_MANAGER: DurableObjectNamespace;
-  IRC_CLIENT: DurableObjectNamespace;
+  TWITCH_BOT: DurableObjectNamespace;  // Single DO binding
   DB: D1Database;
   SITE_BASE_URL?: string;
-  INTERNAL_WRITE_KEY?: string;
   BOT_WRITE_KEY?: string;
 }
 
@@ -68,9 +68,7 @@ function log(msg: string, obj?: any): void {
   }
 }
 
-// OAuth and token management (keeping existing logic)
-const BOT_SCOPES = 'chat:read chat:edit moderator:manage:banned_users';
-
+// Token management
 async function getBotUserAndToken(env: Env) {
   const startTime = Date.now();
   log('[getBotUserAndToken] START');
@@ -89,17 +87,15 @@ async function getBotUserAndToken(env: Env) {
       keys: Object.keys(stored)
     });
 
-    // Handle both storage formats: direct tokens or nested tokens
+    // Handle both storage formats
     let access_token, refresh_token, expires_at, user;
     
     if (stored.tokens) {
-      // New format: { user: {...}, tokens: { access_token, refresh_token, expires_at } }
       access_token = stored.tokens.access_token;
       refresh_token = stored.tokens.refresh_token;
       expires_at = stored.tokens.expires_at;
       user = stored.user;
     } else {
-      // Old format: { access_token, refresh_token, expires_at, user }
       access_token = stored.access_token;
       refresh_token = stored.refresh_token;
       expires_at = stored.expires_at;
@@ -118,7 +114,6 @@ async function getBotUserAndToken(env: Env) {
       needsRefresh,
       userLogin: user?.login,
       userIdAvailable: !!user?.id,
-      userIdValue: user?.id,
       fullUserObject: user
     });
 
@@ -127,13 +122,13 @@ async function getBotUserAndToken(env: Env) {
       const refreshed = await refreshBotToken(env, refresh_token);
       if (refreshed) {
         const duration = Date.now() - startTime;
-        log('[getBotUserAndToken] END - Refreshed', { duration, hasUser: !!refreshed.user, userLogin: refreshed.user?.login, tokenLength: refreshed.access?.length });
+        log('[getBotUserAndToken] END - Refreshed', { duration, hasUser: !!refreshed.user, userLogin: refreshed.user?.login, userId: refreshed.user?.id, tokenLength: refreshed.access?.length });
         return refreshed;
       }
     }
 
     const duration = Date.now() - startTime;
-    log('[getBotUserAndToken] END - Success', { duration, hasUser: !!user, userLogin: user?.login, tokenLength: access_token?.length });
+    log('[getBotUserAndToken] END - Success', { duration, hasUser: !!user, userLogin: user?.login, userId: user?.id, tokenLength: access_token?.length });
     return { access: access_token, refresh: refresh_token, user };
   } catch (e) {
     const duration = Date.now() - startTime;
@@ -175,12 +170,12 @@ async function refreshBotToken(env: Env, refreshToken: string) {
       return null;
     }
 
-    // Store in consistent nested format to match existing storage
+    // Store in consistent format
     const tokenData = {
       user,
       tokens: {
         access_token: data.access_token,
-        refresh_token: data.refresh_token || refreshToken, // Keep existing refresh token if not provided
+        refresh_token: data.refresh_token || refreshToken,
         expires_at: Date.now() + data.expires_in * 1000,
       }
     };
@@ -213,7 +208,7 @@ async function validateToken(env: Env, token: string) {
   }
 }
 
-// Dashboard and config routes for frontend
+// Dashboard routes
 router.post('/bot/config_id', async (req: Request, env: Env) => {
   try {
     const body = await req.json().catch(() => ({} as any));
@@ -265,19 +260,41 @@ router.post('/dashboard/init', async (req: Request, env: Env) => {
   }
 });
 
-// Main worker routes
+// Simplified bot control - no complex chains
+router.post('/irc/connect', async (_req: Request, env: Env, ctx: ExecutionContext) => {
+  try {
+    log('[Bot] /irc/connect called');
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    ctx.waitUntil(env.TWITCH_BOT.get(id).fetch('https://do/connect', { method: 'POST' }));
+    return json(202, { accepted: true });
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'connect failed' });
+  }
+});
+
 router.post('/irc/reload', async (_req: Request, env: Env, ctx: ExecutionContext) => {
   try {
     log('[Bot] /irc/reload called');
-    const id = env.BOT_MANAGER.idFromName('manager');
-    ctx.waitUntil(env.BOT_MANAGER.get(id).fetch('https://do/reload', { method: 'POST' }));
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    ctx.waitUntil(env.TWITCH_BOT.get(id).fetch('https://do/reload', { method: 'POST' }));
     return json(202, { accepted: true });
   } catch (e: any) {
     return json(500, { error: e?.message || 'reload failed' });
   }
 });
 
-// Dynamic channel management - no service interruption
+router.get('/irc/health', async (req: Request, env: Env) => {
+  try {
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    const response = await env.TWITCH_BOT.get(id).fetch('https://do/health');
+    const health = await response.json();
+    return json(200, health);
+  } catch (e) {
+    return json(500, { error: 'Health check failed' });
+  }
+});
+
+// Zero-downtime channel management
 router.post('/irc/channel/add', async (req: Request, env: Env, ctx: ExecutionContext) => {
   try {
     const body = await req.json();
@@ -289,8 +306,8 @@ router.post('/irc/channel/add', async (req: Request, env: Env, ctx: ExecutionCon
     
     log('[Bot] Adding channel dynamically', { channel_login, twitch_id });
     
-    const id = env.IRC_CLIENT.idFromName('irc:0');
-    const response = await env.IRC_CLIENT.get(id).fetch('https://do/channel/add', {
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    const response = await env.TWITCH_BOT.get(id).fetch('https://do/channel/add', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channel_login, twitch_id }),
@@ -314,8 +331,8 @@ router.post('/irc/channel/remove', async (req: Request, env: Env, ctx: Execution
     
     log('[Bot] Removing channel dynamically', { channel_login });
     
-    const id = env.IRC_CLIENT.idFromName('irc:0');
-    const response = await env.IRC_CLIENT.get(id).fetch('https://do/channel/remove', {
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    const response = await env.TWITCH_BOT.get(id).fetch('https://do/channel/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channel_login }),
@@ -328,33 +345,13 @@ router.post('/irc/channel/remove', async (req: Request, env: Env, ctx: Execution
   }
 });
 
-router.get('/irc/health', async (req: Request, env: Env) => {
-  if (!env.IRC_CLIENT) {
-    return json(500, { error: 'IRC_CLIENT not configured' });
-  }
-
-  const shardId = new URL(req.url).searchParams.get('shard') || '0';
-  const id = env.IRC_CLIENT.idFromName(`irc:${shardId}`);
-  const stub = env.IRC_CLIENT.get(id);
-  
-  try {
-    const response = await stub.fetch('https://do/health');
-    const health = await response.json();
-    return json(200, { shard: shardId, ...health });
-  } catch (e) {
-    return json(500, { error: 'Health check failed', shard: shardId });
-  }
-});
-
-// Main worker handler
-// Allowed origins for CORS
+// CORS handling
 const allowedOrigins = [
   'https://www.eloward.com',
   'https://eloward.com', 
-  'http://localhost:3000'  // Development
+  'http://localhost:3000'
 ];
 
-// Helper function to generate CORS headers based on the request
 function getCorsHeaders(request: Request) {
   const origin = request.headers.get('Origin');
   const allowedOrigin = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
@@ -391,77 +388,20 @@ const worker = {
 
 export default worker;
 
-// Production BotManager - simplified
-export class BotManager {
-  state: DurableObjectState;
-  env: Env;
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-  }
-
-  async fetch(req: Request): Promise<Response> {
-    const url = new URL(req.url);
-    
-    if (req.method === 'POST' && url.pathname === '/reload') {
-      return this.handleReload();
-    }
-    
-    return json(404, { error: 'not found' });
-  }
-
-  async handleReload() {
-    const startTime = Date.now();
-    console.log('[BotManager] Reload initiated');
-    
-    try {
-      // Get enabled channels
-      const channels = await this.getEnabledChannels();
-      console.log('[BotManager] Loaded channels', { count: channels.length });
-      
-      // Simple single-shard assignment for production
-      const shardId = 0;
-      const id = this.env.IRC_CLIENT!.idFromName(`irc:${shardId}`);
-      const stub = this.env.IRC_CLIENT!.get(id);
-      
-      // Assign channels
-      await stub.fetch('https://do/assign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channels }),
-      });
-      
-      // Establish connection
-      await stub.fetch('https://do/connect', { method: 'POST' });
-      
-      const duration = Date.now() - startTime;
-      console.log('[BotManager] Reload completed', { channels: channels.length, duration });
-      
-      return json(200, { ok: true, channels: channels.length, duration });
-    } catch (e) {
-      console.error('[BotManager] Reload failed:', e);
-      return json(500, { error: String(e) });
-    }
-  }
-
-  async getEnabledChannels() {
-    const result = await this.env.DB.prepare(`
-      SELECT channel_name as channel_login, twitch_id 
-      FROM twitch_bot_users 
-      WHERE bot_enabled = 1
-    `).all();
-    
-    return result.results || [];
-  }
-}
-
-// Production IRC Client - always-on, optimized
-export class IrcClientShard {
+/**
+ * PRODUCTION-GRADE SINGLE TWITCH BOT
+ * 
+ * This is the complete bot implementation in a single Durable Object:
+ * - Direct IRC connection with no proxy/forwarding layers
+ * - Immediate message processing (no hibernation delays)
+ * - Robust auto-recovery and reconnection
+ * - Zero-downtime channel management
+ */
+export class TwitchBot {
   state: DurableObjectState;
   env: Env;
   
-  // Core connection
+  // Connection state
   ws: WebSocket | null = null;
   connecting = false;
   ready = false;
@@ -469,6 +409,7 @@ export class IrcClientShard {
   
   // Bot identity  
   botLogin: string | null = null;
+  botUserId: string | null = null;
   botToken: string | null = null;
   
   // Channel management
@@ -477,48 +418,61 @@ export class IrcClientShard {
   channelIdByLogin: Map<string, string> = new Map();
   modChannels: Set<string> = new Set();
   
-  // Connection management
+  // Connection health
   keepaliveInterval: any = null;
   reconnectAttempts = 0;
-  maxReconnectAttempts = 5;
+  maxReconnectDelay = 30000; // 30 seconds max
   
   // Production metrics
   messagesProcessed = 0;
   timeoutsIssued = 0;
-  timeoutsFailed = 0;
   lastActivity = 0;
-  
-  // Circuit breaker for timeout operations
-  timeoutFailures = 0;
-  lastTimeoutFailure = 0;
-  timeoutCircuitOpen = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     
-    // Restore state
-    this.reloadStateFromStorage().catch(console.error);
+    log('[TwitchBot] 🚀 Starting production bot');
     
-    // Set 5-minute maintenance alarm
-    if (typeof this.state.setAlarm === 'function') {
-      try { 
-        this.state.setAlarm(Date.now() + 300_000);
-      } catch (e) {
-        console.error('[IRC] Failed to set alarm:', e);
+    // Immediate state restoration and connection
+    this.initialize();
+  }
+
+  async initialize() {
+    try {
+      // Restore state immediately
+      await this.restoreState();
+      
+      // Auto-connect immediately if we have channels
+      if (this.assignedChannels.length > 0) {
+        this.connectToTwitch().catch(e => {
+          log('[TwitchBot] ❌ Initial connection failed', { error: String(e) });
+        });
       }
+      
+      // Set maintenance alarm (5 minutes)
+      if (typeof this.state.setAlarm === 'function') {
+        try { 
+          this.state.setAlarm(Date.now() + 300_000);
+          log('[TwitchBot] ✅ Maintenance alarm set');
+        } catch (e) {
+          log('[TwitchBot] ❌ Failed to set alarm', { error: String(e) });
+        }
+      }
+    } catch (e) {
+      log('[TwitchBot] ❌ Initialization failed', { error: String(e) });
     }
   }
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     
-    if (req.method === 'POST' && url.pathname === '/assign') {
-      return this.handleAssign(req);
-    }
-    
     if (req.method === 'POST' && url.pathname === '/connect') {
       return this.handleConnect();
+    }
+    
+    if (req.method === 'POST' && url.pathname === '/reload') {
+      return this.handleReload();
     }
     
     if (req.method === 'GET' && url.pathname === '/health') {
@@ -536,41 +490,18 @@ export class IrcClientShard {
     return json(404, { error: 'not found' });
   }
 
-  async handleAssign(req: Request) {
-    try {
-      const body = await req.json();
-      this.assignedChannels = body.channels || [];
-      this.channelSet = new Set(this.assignedChannels.map((c: any) => `#${c.channel_login}`));
-      
-      // Build channel ID mapping
-      this.channelIdByLogin.clear();
-      for (const c of this.assignedChannels) {
-        if (c.twitch_id) {
-          this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
-        }
-      }
-      
-      // Save to storage
-      await this.saveStateToStorage();
-      
-      log('[IRC] Channels assigned', { count: this.assignedChannels.length });
-      return json(200, { assigned: this.assignedChannels.length });
-    } catch (e) {
-      console.error('[IRC] Assign failed:', e);
-      return json(500, { error: String(e) });
-    }
-  }
-
   async handleConnect() {
     try {
+      log('[TwitchBot] Manual connect requested');
+      await this.loadChannelsFromDatabase();
       await this.connectToTwitch();
       return json(200, { 
         connected: true, 
         channels: this.assignedChannels.length,
-        timestamp: Date.now() 
+        timestamp: new Date().toISOString()
       });
     } catch (e) {
-      console.error('[IRC] Connection failed:', e);
+      log('[TwitchBot] ❌ Manual connect failed', { error: String(e) });
       return json(500, { 
         error: 'Connection failed', 
         message: String(e) 
@@ -578,12 +509,38 @@ export class IrcClientShard {
     }
   }
 
+  async handleReload() {
+    try {
+      log('[TwitchBot] Reload requested');
+      await this.loadChannelsFromDatabase();
+      
+      // Reconnect if needed
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        await this.connectToTwitch();
+      } else if (this.ready) {
+        // Just rejoin channels if already connected
+        this.joinAllChannels();
+      }
+      
+      return json(200, { 
+        reloaded: true, 
+        channels: this.assignedChannels.length,
+        timestamp: new Date().toISOString()
+      });
+    } catch (e) {
+      log('[TwitchBot] ❌ Reload failed', { error: String(e) });
+      return json(500, { error: String(e) });
+    }
+  }
+
   async handleHealthCheck() {
     const now = Date.now();
     const connectionAge = this.connectionStartTime ? now - this.connectionStartTime : 0;
+    const wsState = this.ws ? this.ws.readyState : -1;
     
-    return json(200, {
-      connected: !!this.ws && this.ws.readyState === WebSocket.OPEN,
+    // Detailed health status
+    const health = {
+      connected: wsState === WebSocket.OPEN,
       ready: this.ready,
       channels: this.assignedChannels.length,
       modChannels: this.modChannels.size,
@@ -591,11 +548,20 @@ export class IrcClientShard {
       messagesProcessed: this.messagesProcessed,
       timeoutsIssued: this.timeoutsIssued,
       lastActivity: this.lastActivity,
-      reconnectAttempts: this.reconnectAttempts
-    });
+      reconnectAttempts: this.reconnectAttempts,
+      botLogin: this.botLogin,
+      wsReadyState: wsState,
+      wsReadyStates: { 0: 'CONNECTING', 1: 'OPEN', 2: 'CLOSING', 3: 'CLOSED' },
+      timestamp: new Date().toISOString(),
+      // Diagnostics
+      channelList: this.assignedChannels.map(c => c.channel_login).slice(0, 10),
+      modChannelList: Array.from(this.modChannels).slice(0, 10)
+    };
+    
+    return json(200, health);
   }
 
-  // Dynamic channel addition - zero downtime
+  // Zero-downtime channel management
   async handleAddChannel(req: Request) {
     try {
       const body = await req.json();
@@ -622,11 +588,11 @@ export class IrcClientShard {
       // Join immediately if connected
       if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.sendRaw(`JOIN #${channel_login}`);
-        log('[IRC] Dynamically joined channel', { channel: channel_login });
+        log('[TwitchBot] ✅ Dynamically joined channel', { channel: channel_login });
       }
       
       // Save state
-      await this.saveStateToStorage();
+      await this.saveState();
       
       return json(200, { 
         message: 'Channel added successfully', 
@@ -634,12 +600,11 @@ export class IrcClientShard {
         totalChannels: this.assignedChannels.length 
       });
     } catch (e) {
-      console.error('[IRC] Add channel failed:', e);
+      log('[TwitchBot] ❌ Add channel failed', { error: String(e) });
       return json(500, { error: String(e) });
     }
   }
 
-  // Dynamic channel removal - zero downtime  
   async handleRemoveChannel(req: Request) {
     try {
       const body = await req.json();
@@ -649,7 +614,7 @@ export class IrcClientShard {
         return json(400, { error: 'channel_login required' });
       }
       
-      // Remove from assigned channels
+      // Remove from all data structures
       this.assignedChannels = this.assignedChannels.filter(c => c.channel_login !== channel_login);
       this.channelSet.delete(`#${channel_login}`);
       this.channelIdByLogin.delete(channel_login);
@@ -658,11 +623,11 @@ export class IrcClientShard {
       // Leave immediately if connected
       if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.sendRaw(`PART #${channel_login}`);
-        log('[IRC] Dynamically left channel', { channel: channel_login });
+        log('[TwitchBot] ✅ Dynamically left channel', { channel: channel_login });
       }
       
       // Save state
-      await this.saveStateToStorage();
+      await this.saveState();
       
       return json(200, { 
         message: 'Channel removed successfully', 
@@ -670,83 +635,111 @@ export class IrcClientShard {
         totalChannels: this.assignedChannels.length 
       });
     } catch (e) {
-      console.error('[IRC] Remove channel failed:', e);
+      log('[TwitchBot] ❌ Remove channel failed', { error: String(e) });
       return json(500, { error: String(e) });
     }
   }
 
-  // Direct Twitch IRC connection with robust error handling
+  // Load channels from database
+  async loadChannelsFromDatabase() {
+    try {
+      const result = await this.env.DB.prepare(`
+        SELECT channel_name as channel_login, twitch_id 
+        FROM twitch_bot_users 
+        WHERE bot_enabled = 1
+      `).all();
+      
+      const dbChannels = result.results || [];
+      this.assignedChannels = dbChannels as any[];
+      this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
+      
+      // Build channel ID mapping
+      this.channelIdByLogin.clear();
+      for (const c of this.assignedChannels) {
+        if (c.twitch_id) {
+          this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
+        }
+      }
+      
+      await this.saveState();
+      
+      log('[TwitchBot] ✅ Channels loaded from database', { count: this.assignedChannels.length });
+    } catch (e) {
+      log('[TwitchBot] ❌ Failed to load channels from database', { error: String(e) });
+    }
+  }
+
+  // DIRECT IRC CONNECTION - No proxying, no hibernation complexity
   async connectToTwitch() {
     if (this.connecting || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
-      log('[IRC] Connection already in progress or established');
+      log('[TwitchBot] Connection already in progress or established');
       return;
     }
     
     try {
+      log('[TwitchBot] 🔌 Connecting to Twitch IRC...');
+      
+      // Get bot credentials
       const bot = await getBotUserAndToken(this.env);
-      if (!bot?.user?.login || !bot?.access) {
+      if (!bot?.user?.login || !bot?.access || !bot?.user?.id) {
         throw new Error('Bot credentials not available');
       }
       
       this.botLogin = String(bot.user.login).toLowerCase();
+      this.botUserId = String(bot.user.id);
       this.botToken = bot.access;
       this.connecting = true;
       this.connectionStartTime = Date.now();
       
-      log('[IRC] Connecting to Twitch IRC', { 
+      log('[TwitchBot] 🔑 Bot credentials loaded', { 
         login: this.botLogin,
+        userId: this.botUserId,
         tokenLength: this.botToken?.length || 0 
       });
       
-      // Add connection timeout
+      // Direct WebSocket connection
+      this.ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      
+      // Connection timeout
       const connectionTimeout = setTimeout(() => {
         if (this.connecting) {
-          log('[IRC] ❌ Connection timeout after 10 seconds');
+          log('[TwitchBot] ❌ Connection timeout');
           this.handleDisconnection();
         }
-      }, 10000);
-      
-      this.ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      }, 15000); // 15 second timeout
       
       this.ws.addEventListener('open', () => {
         clearTimeout(connectionTimeout);
-        log('[IRC] ✅ WebSocket connected', { 
+        log('[TwitchBot] ✅ WebSocket connected to Twitch IRC', { 
           login: this.botLogin,
           connectionTime: Date.now() - this.connectionStartTime 
         });
         
-        // Authenticate with error handling
-        try {
-          const authToken = this.botToken!.startsWith('oauth:') ? this.botToken : `oauth:${this.botToken}`;
-          this.sendRaw(`PASS ${authToken}`);
-          this.sendRaw(`NICK ${this.botLogin}`);
-          this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
-          
-          this.connecting = false;
-          this.reconnectAttempts = 0;
-          this.startKeepalive();
-        } catch (authError) {
-          log('[IRC] ❌ Authentication failed', { error: String(authError) });
-          this.handleDisconnection();
-        }
+        // Authenticate immediately
+        const authToken = this.botToken!.startsWith('oauth:') ? this.botToken : `oauth:${this.botToken}`;
+        this.sendRaw(`PASS ${authToken}`);
+        this.sendRaw(`NICK ${this.botLogin}`);
+        this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+        log('[TwitchBot] 🔐 Authentication sent');
+        
+        this.connecting = false;
+        this.reconnectAttempts = 0;
+        this.startKeepalive();
       });
       
       this.ws.addEventListener('message', (event) => {
-        try {
-          this.lastActivity = Date.now();
-          this.messagesProcessed++;
-          const messageData = String(event.data || '');
-          if (messageData) {
-            this.handleIrcMessage(messageData);
-          }
-        } catch (msgError) {
-          log('[IRC] ❌ Message handling error', { error: String(msgError) });
+        this.lastActivity = Date.now();
+        this.messagesProcessed++;
+        const messageData = String(event.data || '');
+        
+        if (messageData.trim()) {
+          this.handleIrcMessage(messageData);
         }
       });
       
       this.ws.addEventListener('close', (event) => {
         clearTimeout(connectionTimeout);
-        log('[IRC] Connection closed', { 
+        log('[TwitchBot] 🔌 Connection closed', { 
           code: event.code, 
           reason: event.reason || 'No reason provided',
           wasClean: event.wasClean,
@@ -757,7 +750,7 @@ export class IrcClientShard {
       
       this.ws.addEventListener('error', (event) => {
         clearTimeout(connectionTimeout);
-        log('[IRC] ❌ WebSocket error', { 
+        log('[TwitchBot] ❌ WebSocket error', { 
           error: String(event),
           readyState: this.ws?.readyState 
         });
@@ -766,88 +759,89 @@ export class IrcClientShard {
       
     } catch (e) {
       this.connecting = false;
-      log('[IRC] ❌ Connection setup failed', { error: String(e) });
+      log('[TwitchBot] ❌ Connection setup failed', { error: String(e) });
       throw e;
     }
   }
 
   sendRaw(line: string) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      log('[IRC] ❌ Cannot send - WebSocket not ready', { 
+      log('[TwitchBot] ❌ Cannot send - WebSocket not ready', { 
         hasWebSocket: !!this.ws,
         readyState: this.ws?.readyState,
-        line: line.substring(0, 50) + (line.length > 50 ? '...' : '')
+        line: line.substring(0, 50)
       });
       return;
     }
     
     try {
       this.ws.send(line);
-      // Only log non-PING/PONG messages to reduce noise
+      // Only log important messages (not PING/PONG spam)
       if (!line.startsWith('PING') && !line.startsWith('PONG')) {
-        log('[IRC] >> SENT', { line });
+        log('[TwitchBot] >> SENT', { line });
       }
     } catch (e) {
-      log('[IRC] ❌ Send failed', { line, error: String(e) });
+      log('[TwitchBot] ❌ Send failed', { line: line.substring(0, 50), error: String(e) });
     }
   }
 
   startKeepalive() {
-    if (this.keepaliveInterval) {
-      clearInterval(this.keepaliveInterval);
-    }
+    this.stopKeepalive();
     
+    log('[TwitchBot] 🔄 Anti-hibernation keepalive started');
     this.keepaliveInterval = setInterval(() => {
+      const connectionAge = Date.now() - this.connectionStartTime;
+      log('[TwitchBot] 🔄 Anti-hibernation keepalive', { 
+        connectionAge, 
+        messagesProcessed: this.messagesProcessed, 
+        timeoutsIssued: this.timeoutsIssued 
+      });
+      
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.sendRaw('PING :keepalive');
+      } else {
+        log('[TwitchBot] ❌ Keepalive check failed - WebSocket not ready');
       }
-    }, 30000); // 30 seconds
+    }, 30000); // Every 30 seconds
+  }
+
+  stopKeepalive() {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
   }
 
   handleDisconnection() {
-    log('[IRC] Handling disconnection', { 
+    log('[TwitchBot] 🔌 Handling disconnection', { 
       wasReady: this.ready,
       wasConnecting: this.connecting,
-      reconnectAttempts: this.reconnectAttempts,
-      maxAttempts: this.maxReconnectAttempts
+      reconnectAttempts: this.reconnectAttempts
     });
     
     this.ready = false;
     this.connecting = false;
+    this.stopKeepalive();
     
-    if (this.keepaliveInterval) {
-      clearInterval(this.keepaliveInterval);
-      this.keepaliveInterval = null;
-      log('[IRC] Keepalive interval cleared');
-    }
+    // Exponential backoff reconnection
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
+    this.reconnectAttempts++;
     
-    // Reconnect with exponential backoff
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-      this.reconnectAttempts++;
-      
-      log('[IRC] Scheduling reconnection', { 
-        attempt: this.reconnectAttempts,
-        delayMs: delay,
-        maxAttempts: this.maxReconnectAttempts 
+    log('[TwitchBot] 🔄 Scheduling reconnection', { 
+      attempt: this.reconnectAttempts,
+      delayMs: delay
+    });
+    
+    setTimeout(() => {
+      log('[TwitchBot] 🔄 Attempting reconnection', { attempt: this.reconnectAttempts });
+      this.connectToTwitch().catch((e) => {
+        log('[TwitchBot] ❌ Reconnection failed', { attempt: this.reconnectAttempts, error: String(e) });
       });
-      
-      setTimeout(() => {
-        log('[IRC] Attempting reconnection', { attempt: this.reconnectAttempts });
-        this.connectToTwitch().catch((e) => {
-          log('[IRC] ❌ Reconnection failed', { attempt: this.reconnectAttempts, error: String(e) });
-        });
-      }, delay);
-    } else {
-      log('[IRC] ❌ Max reconnection attempts reached - giving up', { 
-        maxAttempts: this.maxReconnectAttempts 
-      });
-    }
+    }, delay);
   }
 
-  // IRC message handling with detailed logging
+  // IRC MESSAGE PROCESSING - The core of the bot
   handleIrcMessage(data: string) {
-    // Handle both \n and \r\n line endings properly
     const lines = data.trim().split(/\r?\n/).filter(line => line.length > 0);
     
     for (const line of lines) {
@@ -855,97 +849,79 @@ export class IrcClientShard {
       if (line.startsWith('PING ')) {
         const pongResponse = line.replace('PING', 'PONG');
         this.sendRaw(pongResponse);
-        log('[IRC] PING/PONG keepalive', { ping: line.trim(), pong: pongResponse });
+        log('[TwitchBot] 🏓 PONG response sent');
         continue;
       }
       
       // Parse IRC message
       const msg = this.parseIrc(line.trim());
       if (!msg) {
-        log('[IRC] Failed to parse message', { rawLine: line.substring(0, 100) + (line.length > 100 ? '...' : '') });
+        log('[TwitchBot] ❌ Failed to parse message', { rawLine: line.substring(0, 100) });
         continue;
       }
       
-      // Log all IRC messages for debugging
-      log('[IRC] Message received', { 
+      log('[TwitchBot] Message received', { 
         command: msg.command, 
-        channel: msg.params[0], 
+        channel: msg.params?.[0], 
         user: msg.prefix?.split('!')[0],
         tags: msg.tags ? Object.keys(msg.tags) : [],
         fullMessage: { command: msg.command, params: msg.params, prefix: msg.prefix },
-        rawLine: line.substring(0, 200) + (line.length > 200 ? '...' : '')
+        rawLine: line.substring(0, 200)
       });
       
-      // Handle authentication errors first
-      if (msg.command === 'NOTICE' && msg.params?.[1]?.includes('Login unsuccessful')) {
-        log('[IRC] ❌ Authentication failed', { notice: msg.params?.[1] });
-        this.handleDisconnection();
-        continue;
-      }
-      if (msg.command === '464') { // ERR_PASSWDMISMATCH
-        log('[IRC] ❌ Password mismatch error');
-        this.handleDisconnection();
+      // Handle authentication success
+      if (msg.command === '001') {
+        this.ready = true;
+        this.reconnectAttempts = 0;
+        log('[TwitchBot] ✅ Authentication successful - bot is ready', { 
+          botLogin: this.botLogin,
+          connectionTime: Date.now() - this.connectionStartTime,
+          assignedChannels: this.assignedChannels.length,
+          modChannels: Array.from(this.modChannels)
+        });
+        
+        // Join all assigned channels
+        this.joinAllChannels();
         continue;
       }
       
-      // Mark ready on welcome or global user state
-      if (msg.command === '001' || msg.command === 'GLOBALUSERSTATE') {
-        if (!this.ready) {
-          this.ready = true;
-          this.reconnectAttempts = 0; // Reset reconnection counter on successful connection
-          log('[IRC] ✅ Authentication successful - bot is ready', { 
-            botLogin: this.botLogin,
-            connectionTime: Date.now() - this.connectionStartTime,
-            assignedChannels: this.assignedChannels.length
-          });
-          this.joinChannels();
-        }
-        // Ensure echo-message capability so we receive our own PRIVMSG (helps testing)
-        this.sendRaw('CAP REQ :twitch.tv/echo-message');
-        continue;
-      } else if (msg.command === 'JOIN' && msg.prefix?.includes(this.botLogin!)) {
-        // Bot successfully joined a channel
-        const channel = msg.params[0];
-        log('[IRC] ✅ Successfully joined channel', { 
-          channel, 
-          totalChannels: this.channelSet.size,
-          botLogin: this.botLogin 
-        });
-      } else if (msg.command === 'USERSTATE') {
-        // Check mod permissions when bot joins or sends messages
-        const channel = msg.params[0];
+      // Track mod permissions
+      if (msg.command === 'USERSTATE') {
+        const channel = msg.params?.[0];
         const isMod = msg.tags?.mod === '1';
-        const wasMod = this.modChannels.has(channel);
         
-        if (isMod && !wasMod) {
-          this.modChannels.add(channel);
-          log('[IRC] ✅ Gained mod permissions', { channel, totalModChannels: this.modChannels.size });
-        } else if (!isMod && wasMod) {
-          this.modChannels.delete(channel);
-          log('[IRC] ❌ Lost mod permissions', { channel, totalModChannels: this.modChannels.size });
-        } else if (isMod) {
-          log('[IRC] Confirmed mod permissions', { channel });
-        } else {
-          log('[IRC] ⚠️ No mod permissions in channel', { channel });
+        if (channel) {
+          if (isMod) {
+            this.modChannels.add(channel);
+            log('[TwitchBot] Confirmed mod permissions', { channel });
+          } else {
+            log('[TwitchBot] ❌ No mod permissions', { channel });
+          }
         }
-        
-        this.saveStateToStorage();
-      } else if (msg.command === 'PRIVMSG') {
-        // Handle chat message - this is where timeouts happen
+        continue;
+      }
+      
+      // Handle chat messages - THE CRITICAL PATH
+      if (msg.command === 'PRIVMSG') {
         this.handlePrivmsg(msg);
-      } else if (msg.command === 'NOTICE') {
-        // Handle Twitch notices (errors, confirmations)
-        const channel = msg.params[0];
-        const notice = msg.params[1];
-        const msgId = msg.tags?.['msg-id'];
-        log('[IRC] Twitch notice received', { channel, notice, msgId });
+        continue;
+      }
+      
+      // Handle other IRC events
+      if (msg.command === 'JOIN' && msg.prefix?.includes(this.botLogin!)) {
+        const channel = msg.params?.[0];
+        log('[TwitchBot] ✅ Successfully joined channel', { 
+          channel, 
+          totalChannels: this.channelSet.size
+        });
       }
     }
   }
 
+  // PRIVMSG HANDLER - Where timeouts happen
   async handlePrivmsg(msg: any) {
-    const channel = msg.params[0];
-    const message = msg.params[1];
+    const channel = msg.params?.[0];
+    const message = msg.params?.[1];
     const user = msg.prefix?.split('!')[0];
     
     log('[PRIVMSG] 🔍 Raw message analysis', {
@@ -955,15 +931,13 @@ export class IrcClientShard {
       parsedChannel: channel,
       parsedMessage: message,
       parsedUser: user,
-      messagePreview: message?.substring(0, 50) + (message?.length > 50 ? '...' : '')
+      messagePreview: message?.substring(0, 50)
     });
     
     if (!user || !channel) {
       log('[PRIVMSG] ❌ Invalid message format', { 
         hasUser: !!user, 
-        hasChannel: !!channel,
-        userValue: user,
-        channelValue: channel
+        hasChannel: !!channel
       });
       return;
     }
@@ -987,7 +961,7 @@ export class IrcClientShard {
       return;
     }
     
-    // Check if bot has mod permissions
+    // Check mod permissions
     if (!this.modChannels.has(channel)) {
       log('[PRIVMSG] ⚠️ No mod permissions in channel', { 
         channel: chanLogin, 
@@ -1000,12 +974,8 @@ export class IrcClientShard {
     // Get channel config
     log('[PRIVMSG] Checking channel configuration', { channel: chanLogin });
     const config = await this.getChannelConfig(chanLogin);
-    if (!config) {
-      log('[PRIVMSG] ❌ Channel config not found', { channel: chanLogin });
-      return;
-    }
-    if (!config.bot_enabled) {
-      log('[PRIVMSG] ⚠️ Bot disabled in channel config', { channel: chanLogin });
+    if (!config || !config.bot_enabled) {
+      log('[PRIVMSG] ❌ Channel not enabled', { channel: chanLogin, hasConfig: !!config });
       return;
     }
     
@@ -1015,7 +985,7 @@ export class IrcClientShard {
       has_reason_template: !!config.reason_template 
     });
     
-    // Check rank
+    // Check user rank
     log('[PRIVMSG] Checking user rank', { user, channel: chanLogin });
     const hasRank = await this.checkUserRank(user);
     if (hasRank) {
@@ -1025,7 +995,7 @@ export class IrcClientShard {
     
     log('[PRIVMSG] ❌ User lacks required rank - issuing timeout', { user, channel: chanLogin });
     
-    // Issue timeout
+    // TIMEOUT THE USER
     await this.timeoutUser(chanLogin, user, config.timeout_seconds || 20, config.reason_template);
   }
 
@@ -1038,7 +1008,9 @@ export class IrcClientShard {
         hasRankWorker: !!this.env.RANK_WORKER
       });
       
-      const response = await this.env.RANK_WORKER.fetch(new Request(`https://internal/api/ranks/lol/${username}`));
+      const response = await this.env.RANK_WORKER.fetch(
+        new Request(`https://internal/api/ranks/lol/${username}`)
+      );
       const duration = Date.now() - startTime;
       
       log('[RANK] 📊 Rank API response received', {
@@ -1051,28 +1023,16 @@ export class IrcClientShard {
       });
       
       if (response.ok) {
-        try {
-          const data = await response.json();
-          log('[RANK] ✅ User has valid rank', { 
-            username, 
-            status: response.status, 
-            duration,
-            rankData: data
-          });
-          return true;
-        } catch (jsonError) {
-          log('[RANK] ⚠️ Valid response but JSON parse failed', {
-            username,
-            jsonError: String(jsonError)
-          });
-          return true; // Assume valid if we got 200 but can't parse
-        }
+        const data = await response.json();
+        log('[RANK] ✅ User has valid rank', { 
+          username, 
+          status: response.status, 
+          duration,
+          rankData: data
+        });
+        return true;
       } else {
-        let errorText = 'Unknown error';
-        try {
-          errorText = await response.text();
-        } catch {}
-        
+        const errorText = await response.text().catch(() => 'Unknown error');
         log('[RANK] ❌ User lacks required rank', { 
           username, 
           status: response.status, 
@@ -1086,9 +1046,7 @@ export class IrcClientShard {
       log('[RANK] ❌ Rank check failed with error', { 
         username, 
         error: String(e), 
-        duration,
-        errorName: e?.constructor?.name,
-        errorMessage: e?.message
+        duration
       });
       return false;
     }
@@ -1125,27 +1083,9 @@ export class IrcClientShard {
     }
   }
 
-  async timeoutUser(channelLogin: string, userLogin: string, duration: number, reason: string) {
+  async timeoutUser(channelLogin: string, userLogin: string, duration: number, reason?: string) {
     const startTime = Date.now();
     const timeoutId = `${channelLogin}:${userLogin}:${Date.now()}`;
-    
-    // Circuit breaker: if too many recent failures, skip timeout
-    if (this.timeoutCircuitOpen) {
-      const timeSinceLastFailure = Date.now() - this.lastTimeoutFailure;
-      if (timeSinceLastFailure < 60000) { // 1 minute circuit breaker
-        log('[TIMEOUT] ⚡ Circuit breaker OPEN - skipping timeout', { 
-          timeoutId,
-          failures: this.timeoutFailures,
-          timeSinceLastFailure 
-        });
-        return;
-      } else {
-        // Reset circuit breaker after cooldown
-        this.timeoutCircuitOpen = false;
-        this.timeoutFailures = 0;
-        log('[TIMEOUT] ⚡ Circuit breaker RESET', { timeoutId });
-      }
-    }
     
     try {
       log('[TIMEOUT] Starting timeout process', { 
@@ -1173,17 +1113,8 @@ export class IrcClientShard {
         fullBotObject: bot
       });
       
-      if (!bot?.access) {
-        log('[TIMEOUT] ❌ No bot access token available', { timeoutId });
-        return;
-      }
-      if (!bot?.user?.id) {
-        log('[TIMEOUT] ❌ No bot user ID available', { 
-          timeoutId,
-          hasUser: !!bot?.user,
-          userObject: bot?.user,
-          missingIdField: 'user.id is missing or falsy'
-        });
+      if (!bot?.access || !bot?.user?.id) {
+        log('[TIMEOUT] ❌ Bot credentials not available', { timeoutId });
         return;
       }
       
@@ -1240,7 +1171,7 @@ export class IrcClientShard {
       log('[TIMEOUT] ✅ User ID obtained', { timeoutId, user: userLogin, userId });
       
       // Issue timeout via Helix API
-      const timeoutReason = reason || `${duration}s timeout: not enough elo to speak. Link your EloWard at https://www.eloward.com`;
+      const timeoutReason = reason || `{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}`.replace('{seconds}', String(duration)).replace('{site}', this.env.SITE_BASE_URL || 'https://www.eloward.com');
       const timeoutUrl = `https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${channelId}&moderator_id=${bot.user.id}`;
       
       log('[TIMEOUT] Issuing timeout via Helix API', { 
@@ -1284,16 +1215,6 @@ export class IrcClientShard {
         });
       } else {
         const errorText = await timeoutResponse.text();
-        this.timeoutsFailed++;
-        this.timeoutFailures++;
-        this.lastTimeoutFailure = Date.now();
-        
-        // Open circuit breaker if too many failures
-        if (this.timeoutFailures >= 5) {
-          this.timeoutCircuitOpen = true;
-          log('[TIMEOUT] ⚡ Circuit breaker OPENED due to failures', { failures: this.timeoutFailures });
-        }
-        
         log('[TIMEOUT] ❌ Timeout failed', { 
           timeoutId,
           channel: channelLogin, 
@@ -1301,42 +1222,35 @@ export class IrcClientShard {
           userId,
           status: timeoutResponse.status,
           error: errorText,
-          processingTime: totalDuration,
-          totalFailures: this.timeoutsFailed
+          processingTime: totalDuration
         });
       }
     } catch (e) {
       const totalDuration = Date.now() - startTime;
-      this.timeoutsFailed++;
-      this.timeoutFailures++;
-      this.lastTimeoutFailure = Date.now();
-      
-      // Open circuit breaker if too many failures
-      if (this.timeoutFailures >= 5) {
-        this.timeoutCircuitOpen = true;
-        log('[TIMEOUT] ⚡ Circuit breaker OPENED due to crashes', { failures: this.timeoutFailures });
-      }
-      
       log('[TIMEOUT] ❌ Timeout process crashed', { 
         timeoutId,
         channel: channelLogin, 
         user: userLogin, 
         error: String(e),
-        processingTime: totalDuration,
-        totalFailures: this.timeoutsFailed
+        processingTime: totalDuration
       });
     }
   }
 
-  joinChannels() {
-    log('[IRC] Joining all assigned channels', { 
+  joinAllChannels() {
+    if (this.assignedChannels.length === 0) {
+      log('[TwitchBot] No channels to join');
+      return;
+    }
+    
+    log('[TwitchBot] Joining all assigned channels', { 
       channelCount: this.channelSet.size,
       channels: Array.from(this.channelSet) 
     });
     
     for (const channel of this.channelSet) {
       this.sendRaw(`JOIN ${channel}`);
-      log('[IRC] Sent JOIN command', { channel });
+      log('[TwitchBot] Sent JOIN command', { channel });
     }
   }
 
@@ -1347,7 +1261,7 @@ export class IrcClientShard {
     // Parse tags (@key=value;key2=value2)
     if (rest.startsWith('@')) {
       const sp = rest.indexOf(' ');
-      if (sp === -1) return null; // Invalid format
+      if (sp === -1) return null;
       const rawTags = rest.slice(1, sp);
       rest = rest.slice(sp + 1);
       msg.tags = {};
@@ -1360,7 +1274,7 @@ export class IrcClientShard {
     // Parse prefix (:nick!user@host)
     if (rest.startsWith(':')) {
       const sp = rest.indexOf(' ');
-      if (sp === -1) return null; // Invalid format
+      if (sp === -1) return null;
       msg.prefix = rest.slice(1, sp);
       rest = rest.slice(sp + 1);
     }
@@ -1368,7 +1282,6 @@ export class IrcClientShard {
     // Parse command
     const sp = rest.indexOf(' ');
     if (sp === -1) {
-      // Command only, no params
       msg.command = rest;
       return msg;
     }
@@ -1378,20 +1291,16 @@ export class IrcClientShard {
     
     // Parse parameters
     if (rest.startsWith(':')) {
-      // Trailing parameter (everything after :)
       msg.params = [rest.slice(1)];
     } else {
-      // Multiple parameters
       const parts: string[] = [];
       while (rest) {
         if (rest.startsWith(':')) {
-          // Trailing parameter found
           parts.push(rest.slice(1));
           break;
         }
         const idx = rest.indexOf(' ');
         if (idx === -1) {
-          // Last parameter
           parts.push(rest);
           break;
         }
@@ -1404,51 +1313,107 @@ export class IrcClientShard {
     return msg;
   }
 
-  async saveStateToStorage() {
-    const startTime = Date.now();
+  async saveState() {
     try {
       await Promise.all([
-        this.state.storage.put('assigned', this.assignedChannels),
+        this.state.storage.put('assignedChannels', this.assignedChannels),
         this.state.storage.put('modChannels', Array.from(this.modChannels))
       ]);
       
-      const duration = Date.now() - startTime;
-      log('[IRC] ✅ State saved to storage', { 
+      log('[TwitchBot] ✅ State saved to storage', { 
         channels: this.assignedChannels.length,
-        modChannels: this.modChannels.size,
-        duration 
+        modChannels: this.modChannels.size
       });
     } catch (e) {
-      const duration = Date.now() - startTime;
-      log('[IRC] ❌ Save state failed', { error: String(e), duration });
-      // Don't throw - this is not critical for operation
+      log('[TwitchBot] ❌ Save state failed', { error: String(e) });
     }
   }
 
-  async reloadStateFromStorage() {
+  async restoreState() {
     try {
-      const stored = await this.state.storage.get('assigned') as any[];
+      const stored = await this.state.storage.get('assignedChannels') as any[];
       if (stored) {
         this.assignedChannels = stored;
         this.channelSet = new Set(this.assignedChannels.map(c => `#${c.channel_login}`));
         this.channelIdByLogin.clear();
+        
         for (const c of this.assignedChannels) {
           if (c.twitch_id) {
             this.channelIdByLogin.set(c.channel_login, String(c.twitch_id));
           }
         }
+        
+        log('[TwitchBot] ✅ Channels restored from storage', { 
+          count: this.assignedChannels.length,
+          channels: this.assignedChannels.map(c => c.channel_login)
+        });
       }
       
       const modChannels = await this.state.storage.get('modChannels') as string[];
       if (modChannels) {
         this.modChannels = new Set(modChannels);
+        log('[TwitchBot] ✅ Mod channels restored from storage', { 
+          count: this.modChannels.size,
+          modChannels: Array.from(this.modChannels)
+        });
       }
     } catch (e) {
-      console.error('[IRC] Reload state failed:', e);
+      log('[TwitchBot] ❌ Restore state failed', { error: String(e) });
     }
   }
 
-  // Automatic channel discovery - sync with database every 5 minutes
+  // Maintenance alarm - 5 minutes
+  async alarm() {
+    const startTime = Date.now();
+    log('[TwitchBot] 🔧 Maintenance alarm fired', {
+      connected: this.ws?.readyState === WebSocket.OPEN,
+      ready: this.ready,
+      channels: this.assignedChannels.length,
+      lastActivity: this.lastActivity ? Date.now() - this.lastActivity : null,
+      messagesProcessed: this.messagesProcessed,
+      timeoutsIssued: this.timeoutsIssued
+    });
+    
+    try {
+      // Restore state from storage
+      await this.restoreState();
+      
+      // Sync channels from database (zero-downtime discovery)
+      await this.syncChannelsFromDatabase();
+      
+      // Ensure connection is healthy
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        log('[TwitchBot] Connection unhealthy - attempting reconnection');
+        this.connectToTwitch().catch(e => {
+          log('[TwitchBot] ❌ Maintenance reconnect failed', { error: String(e) });
+        });
+      } else if (this.ready && this.assignedChannels.length > 0) {
+        // Verify all channels are joined
+        this.joinAllChannels();
+      }
+      
+      log('[TwitchBot] 🔧 Maintenance completed', { 
+        duration: Date.now() - startTime,
+        channels: this.assignedChannels.length
+      });
+    } catch (e) {
+      log('[TwitchBot] ❌ Maintenance failed', { 
+        error: String(e), 
+        duration: Date.now() - startTime 
+      });
+    }
+    
+    // Re-arm alarm for next maintenance
+    if (typeof this.state.setAlarm === 'function') {
+      try { 
+        this.state.setAlarm(Date.now() + 300_000); // 5 minutes
+      } catch (e) {
+        log('[TwitchBot] ❌ Failed to re-arm alarm', { error: String(e) });
+      }
+    }
+  }
+
+  // Zero-downtime channel sync
   async syncChannelsFromDatabase() {
     try {
       const result = await this.env.DB.prepare(`
@@ -1461,25 +1426,26 @@ export class IrcClientShard {
       const currentChannels = new Set(this.assignedChannels.map(c => c.channel_login));
       
       // Find new channels to add
-      const newChannels = dbChannels.filter(c => !currentChannels.has(c.channel_login));
+      const newChannels = dbChannels.filter(c => !currentChannels.has((c as any).channel_login));
       
-      // Find channels to remove (disabled in database)
-      const dbChannelSet = new Set(dbChannels.map(c => c.channel_login));
+      // Find channels to remove
+      const dbChannelSet = new Set(dbChannels.map(c => (c as any).channel_login));
       const channelsToRemove = this.assignedChannels.filter(c => !dbChannelSet.has(c.channel_login));
       
       // Add new channels
       for (const channel of newChannels) {
-        this.assignedChannels.push(channel);
-        this.channelSet.add(`#${channel.channel_login}`);
+        const ch = channel as any;
+        this.assignedChannels.push(ch);
+        this.channelSet.add(`#${ch.channel_login}`);
         
-        if (channel.twitch_id) {
-          this.channelIdByLogin.set(channel.channel_login, String(channel.twitch_id));
+        if (ch.twitch_id) {
+          this.channelIdByLogin.set(ch.channel_login, String(ch.twitch_id));
         }
         
         // Join immediately if connected
         if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.sendRaw(`JOIN #${channel.channel_login}`);
-          log('[IRC] Auto-joined new channel', { channel: channel.channel_login });
+          this.sendRaw(`JOIN #${ch.channel_login}`);
+          log('[TwitchBot] ✅ Auto-joined new channel', { channel: ch.channel_login });
         }
       }
       
@@ -1493,50 +1459,21 @@ export class IrcClientShard {
         // Leave immediately if connected
         if (this.ready && this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.sendRaw(`PART #${channel.channel_login}`);
-          log('[IRC] Auto-left disabled channel', { channel: channel.channel_login });
+          log('[TwitchBot] ✅ Auto-left disabled channel', { channel: channel.channel_login });
         }
       }
       
       // Save state if changes were made
       if (newChannels.length > 0 || channelsToRemove.length > 0) {
-        await this.saveStateToStorage();
-        log('[IRC] Channel sync completed', { 
+        await this.saveState();
+        log('[TwitchBot] 🔄 Channel sync completed', { 
           added: newChannels.length, 
           removed: channelsToRemove.length,
           total: this.assignedChannels.length 
         });
       }
     } catch (e) {
-      console.error('[IRC] Channel sync failed:', e);
-    }
-  }
-
-  // Maintenance alarm
-  async alarm() {
-    log('[IRC] Maintenance check');
-    
-    await this.reloadStateFromStorage();
-    
-    // Auto-sync new channels from database (zero-downtime channel discovery)
-    await this.syncChannelsFromDatabase();
-    
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      try {
-        await this.connectToTwitch();
-      } catch (e) {
-        console.error('[IRC] Maintenance reconnect failed:', e);
-      }
-    } else if (this.ready && this.assignedChannels.length > 0) {
-      this.joinChannels();
-    }
-    
-    // Re-arm alarm
-    if (typeof this.state.setAlarm === 'function') {
-      try { 
-        this.state.setAlarm(Date.now() + 300_000); // 5 minutes
-      } catch (e) {
-        console.error('[IRC] Failed to set alarm:', e);
-      }
+      log('[TwitchBot] ❌ Channel sync failed', { error: String(e) });
     }
   }
 }
