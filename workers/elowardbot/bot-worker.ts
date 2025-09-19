@@ -116,7 +116,10 @@ async function getBotUserAndToken(env: Env) {
       expiresAt: expires_at,
       expiresInMinutes,
       needsRefresh,
-      userLogin: user?.login
+      userLogin: user?.login,
+      userIdAvailable: !!user?.id,
+      userIdValue: user?.id,
+      fullUserObject: user
     });
 
     if (needsRefresh && refresh_token) {
@@ -868,7 +871,9 @@ export class IrcClientShard {
         command: msg.command, 
         channel: msg.params[0], 
         user: msg.prefix?.split('!')[0],
-        tags: msg.tags ? Object.keys(msg.tags) : []
+        tags: msg.tags ? Object.keys(msg.tags) : [],
+        fullMessage: { command: msg.command, params: msg.params, prefix: msg.prefix },
+        rawLine: line.substring(0, 200) + (line.length > 200 ? '...' : '')
       });
       
       // Handle authentication errors first
@@ -943,8 +948,23 @@ export class IrcClientShard {
     const message = msg.params[1];
     const user = msg.prefix?.split('!')[0];
     
+    log('[PRIVMSG] 🔍 Raw message analysis', {
+      fullParams: msg.params,
+      prefix: msg.prefix,
+      tags: msg.tags,
+      parsedChannel: channel,
+      parsedMessage: message,
+      parsedUser: user,
+      messagePreview: message?.substring(0, 50) + (message?.length > 50 ? '...' : '')
+    });
+    
     if (!user || !channel) {
-      log('[PRIVMSG] ❌ Invalid message format', { hasUser: !!user, hasChannel: !!channel });
+      log('[PRIVMSG] ❌ Invalid message format', { 
+        hasUser: !!user, 
+        hasChannel: !!channel,
+        userValue: user,
+        channelValue: channel
+      });
       return;
     }
     
@@ -953,7 +973,9 @@ export class IrcClientShard {
       channel: chanLogin, 
       user, 
       messageLength: message?.length || 0,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      assignedChannels: this.assignedChannels.map(c => c.channel_login),
+      modChannels: Array.from(this.modChannels)
     });
     
     // Skip privileged users
@@ -1010,20 +1032,64 @@ export class IrcClientShard {
   async checkUserRank(username: string): Promise<boolean> {
     const startTime = Date.now();
     try {
-      log('[RANK] Checking user rank', { username });
+      log('[RANK] 🔍 Starting rank check', { 
+        username,
+        requestUrl: `https://internal/api/ranks/lol/${username}`,
+        hasRankWorker: !!this.env.RANK_WORKER
+      });
+      
       const response = await this.env.RANK_WORKER.fetch(new Request(`https://internal/api/ranks/lol/${username}`));
       const duration = Date.now() - startTime;
       
+      log('[RANK] 📊 Rank API response received', {
+        username,
+        status: response.status,
+        ok: response.ok,
+        duration,
+        headers: Object.fromEntries(response.headers.entries()),
+        statusText: response.statusText
+      });
+      
       if (response.ok) {
-        log('[RANK] ✅ User has valid rank', { username, status: response.status, duration });
-        return true;
+        try {
+          const data = await response.json();
+          log('[RANK] ✅ User has valid rank', { 
+            username, 
+            status: response.status, 
+            duration,
+            rankData: data
+          });
+          return true;
+        } catch (jsonError) {
+          log('[RANK] ⚠️ Valid response but JSON parse failed', {
+            username,
+            jsonError: String(jsonError)
+          });
+          return true; // Assume valid if we got 200 but can't parse
+        }
       } else {
-        log('[RANK] ❌ User lacks required rank', { username, status: response.status, duration });
+        let errorText = 'Unknown error';
+        try {
+          errorText = await response.text();
+        } catch {}
+        
+        log('[RANK] ❌ User lacks required rank', { 
+          username, 
+          status: response.status, 
+          duration,
+          errorText: errorText.substring(0, 200)
+        });
         return false;
       }
     } catch (e) {
       const duration = Date.now() - startTime;
-      log('[RANK] ❌ Rank check failed with error', { username, error: String(e), duration });
+      log('[RANK] ❌ Rank check failed with error', { 
+        username, 
+        error: String(e), 
+        duration,
+        errorName: e?.constructor?.name,
+        errorMessage: e?.message
+      });
       return false;
     }
   }
@@ -1092,12 +1158,32 @@ export class IrcClientShard {
       
       // Get bot credentials
       const bot = await getBotUserAndToken(this.env);
+      
+      log('[TIMEOUT] 🔍 Bot credentials detailed check', {
+        timeoutId,
+        hasBotObject: !!bot,
+        hasAccess: !!bot?.access,
+        hasUser: !!bot?.user,
+        hasUserId: !!bot?.user?.id,
+        userLogin: bot?.user?.login,
+        userId: bot?.user?.id,
+        accessTokenLength: bot?.access?.length || 0,
+        botObjectKeys: bot ? Object.keys(bot) : [],
+        userObjectKeys: bot?.user ? Object.keys(bot.user) : [],
+        fullBotObject: bot
+      });
+      
       if (!bot?.access) {
         log('[TIMEOUT] ❌ No bot access token available', { timeoutId });
         return;
       }
       if (!bot?.user?.id) {
-        log('[TIMEOUT] ❌ No bot user ID available', { timeoutId });
+        log('[TIMEOUT] ❌ No bot user ID available', { 
+          timeoutId,
+          hasUser: !!bot?.user,
+          userObject: bot?.user,
+          missingIdField: 'user.id is missing or falsy'
+        });
         return;
       }
       
