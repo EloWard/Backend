@@ -82,7 +82,30 @@ async function getBotUserAndToken(env: Env) {
       return null;
     }
 
-    const { access_token, refresh_token, expires_at, user } = stored;
+    log('[getBotUserAndToken] Raw stored data structure', { 
+      hasTokensProperty: !!stored.tokens,
+      hasDirectAccess: !!stored.access_token,
+      hasUser: !!stored.user,
+      keys: Object.keys(stored)
+    });
+
+    // Handle both storage formats: direct tokens or nested tokens
+    let access_token, refresh_token, expires_at, user;
+    
+    if (stored.tokens) {
+      // New format: { user: {...}, tokens: { access_token, refresh_token, expires_at } }
+      access_token = stored.tokens.access_token;
+      refresh_token = stored.tokens.refresh_token;
+      expires_at = stored.tokens.expires_at;
+      user = stored.user;
+    } else {
+      // Old format: { access_token, refresh_token, expires_at, user }
+      access_token = stored.access_token;
+      refresh_token = stored.refresh_token;
+      expires_at = stored.expires_at;
+      user = stored.user;
+    }
+
     const now = Date.now();
     const expiresInMinutes = expires_at ? Math.floor((expires_at - now) / 60000) : 0;
     const needsRefresh = expires_at && now >= expires_at - 300000; // 5min buffer
@@ -92,7 +115,8 @@ async function getBotUserAndToken(env: Env) {
       hasRefresh: !!refresh_token,
       expiresAt: expires_at,
       expiresInMinutes,
-      needsRefresh
+      needsRefresh,
+      userLogin: user?.login
     });
 
     if (needsRefresh && refresh_token) {
@@ -116,7 +140,10 @@ async function getBotUserAndToken(env: Env) {
 }
 
 async function refreshBotToken(env: Env, refreshToken: string) {
+  const startTime = Date.now();
   try {
+    log('[refreshBotToken] Starting token refresh');
+    
     const response = await fetch('https://id.twitch.tv/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -129,25 +156,45 @@ async function refreshBotToken(env: Env, refreshToken: string) {
     });
 
     if (!response.ok) {
-      log('[refreshBotToken] Failed', { status: response.status });
+      const errorText = await response.text().catch(() => 'Unknown error');
+      log('[refreshBotToken] ❌ Token refresh failed', { 
+        status: response.status, 
+        error: errorText,
+        duration: Date.now() - startTime 
+      });
       return null;
     }
 
     const data = await response.json();
     const user = await validateToken(env, data.access_token);
-    if (!user) return null;
+    if (!user) {
+      log('[refreshBotToken] ❌ Token validation failed');
+      return null;
+    }
 
+    // Store in consistent nested format to match existing storage
     const tokenData = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-      expires_at: Date.now() + data.expires_in * 1000,
       user,
+      tokens: {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || refreshToken, // Keep existing refresh token if not provided
+        expires_at: Date.now() + data.expires_in * 1000,
+      }
     };
 
     await env.BOT_KV.put('bot_tokens', JSON.stringify(tokenData));
-    return { access: data.access_token, refresh: data.refresh_token, user };
+    
+    const duration = Date.now() - startTime;
+    log('[refreshBotToken] ✅ Token refresh successful', { 
+      tokenLength: data.access_token.length,
+      expiresIn: data.expires_in,
+      duration 
+    });
+    
+    return { access: data.access_token, refresh: data.refresh_token || refreshToken, user };
   } catch (e) {
-    log('[refreshBotToken] Error', { error: String(e) });
+    const duration = Date.now() - startTime;
+    log('[refreshBotToken] ❌ Token refresh crashed', { error: String(e), duration });
     return null;
   }
 }
@@ -435,7 +482,13 @@ export class IrcClientShard {
   // Production metrics
   messagesProcessed = 0;
   timeoutsIssued = 0;
+  timeoutsFailed = 0;
   lastActivity = 0;
+  
+  // Circuit breaker for timeout operations
+  timeoutFailures = 0;
+  lastTimeoutFailure = 0;
+  timeoutCircuitOpen = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -619,62 +672,100 @@ export class IrcClientShard {
     }
   }
 
-  // Direct Twitch IRC connection
+  // Direct Twitch IRC connection with robust error handling
   async connectToTwitch() {
     if (this.connecting || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
+      log('[IRC] Connection already in progress or established');
       return;
     }
     
-    const bot = await getBotUserAndToken(this.env);
-    if (!bot?.user?.login || !bot?.access) {
-      throw new Error('Bot credentials not available');
-    }
-    
-    this.botLogin = String(bot.user.login).toLowerCase();
-    this.botToken = bot.access;
-    this.connecting = true;
-    this.connectionStartTime = Date.now();
-    
-    log('[IRC] Connecting to Twitch IRC', { login: this.botLogin });
-    
-    this.ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
-    
-    this.ws.addEventListener('open', () => {
-      log('[IRC] Connected', { 
+    try {
+      const bot = await getBotUserAndToken(this.env);
+      if (!bot?.user?.login || !bot?.access) {
+        throw new Error('Bot credentials not available');
+      }
+      
+      this.botLogin = String(bot.user.login).toLowerCase();
+      this.botToken = bot.access;
+      this.connecting = true;
+      this.connectionStartTime = Date.now();
+      
+      log('[IRC] Connecting to Twitch IRC', { 
         login: this.botLogin,
-        connectionTime: Date.now() - this.connectionStartTime 
+        tokenLength: this.botToken?.length || 0 
       });
       
-      // Authenticate
-      const authToken = this.botToken!.startsWith('oauth:') ? this.botToken : `oauth:${this.botToken}`;
-      this.sendRaw(`PASS ${authToken}`);
-      this.sendRaw(`NICK ${this.botLogin}`);
-      this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+      // Add connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (this.connecting) {
+          log('[IRC] ❌ Connection timeout after 10 seconds');
+          this.handleDisconnection();
+        }
+      }, 10000);
       
+      this.ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      
+      this.ws.addEventListener('open', () => {
+        clearTimeout(connectionTimeout);
+        log('[IRC] ✅ WebSocket connected', { 
+          login: this.botLogin,
+          connectionTime: Date.now() - this.connectionStartTime 
+        });
+        
+        // Authenticate with error handling
+        try {
+          const authToken = this.botToken!.startsWith('oauth:') ? this.botToken : `oauth:${this.botToken}`;
+          this.sendRaw(`PASS ${authToken}`);
+          this.sendRaw(`NICK ${this.botLogin}`);
+          this.sendRaw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+          
+          this.connecting = false;
+          this.reconnectAttempts = 0;
+          this.startKeepalive();
+        } catch (authError) {
+          log('[IRC] ❌ Authentication failed', { error: String(authError) });
+          this.handleDisconnection();
+        }
+      });
+      
+      this.ws.addEventListener('message', (event) => {
+        try {
+          this.lastActivity = Date.now();
+          this.messagesProcessed++;
+          const messageData = String(event.data || '');
+          if (messageData) {
+            this.handleIrcMessage(messageData);
+          }
+        } catch (msgError) {
+          log('[IRC] ❌ Message handling error', { error: String(msgError) });
+        }
+      });
+      
+      this.ws.addEventListener('close', (event) => {
+        clearTimeout(connectionTimeout);
+        log('[IRC] Connection closed', { 
+          code: event.code, 
+          reason: event.reason || 'No reason provided',
+          wasClean: event.wasClean,
+          connectionAge: Date.now() - this.connectionStartTime
+        });
+        this.handleDisconnection();
+      });
+      
+      this.ws.addEventListener('error', (event) => {
+        clearTimeout(connectionTimeout);
+        log('[IRC] ❌ WebSocket error', { 
+          error: String(event),
+          readyState: this.ws?.readyState 
+        });
+        this.handleDisconnection();
+      });
+      
+    } catch (e) {
       this.connecting = false;
-      this.reconnectAttempts = 0;
-      this.startKeepalive();
-    });
-    
-    this.ws.addEventListener('message', (event) => {
-      this.lastActivity = Date.now();
-      this.messagesProcessed++;
-      this.handleIrcMessage(String(event.data));
-    });
-    
-    this.ws.addEventListener('close', (event) => {
-      log('[IRC] Connection closed', { 
-        code: event.code, 
-        reason: event.reason,
-        wasClean: event.wasClean 
-      });
-      this.handleDisconnection();
-    });
-    
-    this.ws.addEventListener('error', (event) => {
-      log('[IRC] Connection error', { error: String(event) });
-      this.handleDisconnection();
-    });
+      log('[IRC] ❌ Connection setup failed', { error: String(e) });
+      throw e;
+    }
   }
 
   sendRaw(line: string) {
@@ -753,7 +844,8 @@ export class IrcClientShard {
 
   // IRC message handling with detailed logging
   handleIrcMessage(data: string) {
-    const lines = data.trim().split('\n');
+    // Handle both \n and \r\n line endings properly
+    const lines = data.trim().split(/\r?\n/).filter(line => line.length > 0);
     
     for (const line of lines) {
       // Handle PING immediately
@@ -765,9 +857,9 @@ export class IrcClientShard {
       }
       
       // Parse IRC message
-      const msg = this.parseIrc(line);
+      const msg = this.parseIrc(line.trim());
       if (!msg) {
-        log('[IRC] Failed to parse message', { rawLine: line });
+        log('[IRC] Failed to parse message', { rawLine: line.substring(0, 100) + (line.length > 100 ? '...' : '') });
         continue;
       }
       
@@ -779,11 +871,33 @@ export class IrcClientShard {
         tags: msg.tags ? Object.keys(msg.tags) : []
       });
       
-      if (msg.command === '001') {
-        // Successfully authenticated to Twitch IRC
-        log('[IRC] ✅ Authentication successful - bot is ready');
-        this.ready = true;
-        this.joinChannels();
+      // Handle authentication errors first
+      if (msg.command === 'NOTICE' && msg.params?.[1]?.includes('Login unsuccessful')) {
+        log('[IRC] ❌ Authentication failed', { notice: msg.params?.[1] });
+        this.handleDisconnection();
+        continue;
+      }
+      if (msg.command === '464') { // ERR_PASSWDMISMATCH
+        log('[IRC] ❌ Password mismatch error');
+        this.handleDisconnection();
+        continue;
+      }
+      
+      // Mark ready on welcome or global user state
+      if (msg.command === '001' || msg.command === 'GLOBALUSERSTATE') {
+        if (!this.ready) {
+          this.ready = true;
+          this.reconnectAttempts = 0; // Reset reconnection counter on successful connection
+          log('[IRC] ✅ Authentication successful - bot is ready', { 
+            botLogin: this.botLogin,
+            connectionTime: Date.now() - this.connectionStartTime,
+            assignedChannels: this.assignedChannels.length
+          });
+          this.joinChannels();
+        }
+        // Ensure echo-message capability so we receive our own PRIVMSG (helps testing)
+        this.sendRaw('CAP REQ :twitch.tv/echo-message');
+        continue;
       } else if (msg.command === 'JOIN' && msg.prefix?.includes(this.botLogin!)) {
         // Bot successfully joined a channel
         const channel = msg.params[0];
@@ -949,6 +1063,24 @@ export class IrcClientShard {
     const startTime = Date.now();
     const timeoutId = `${channelLogin}:${userLogin}:${Date.now()}`;
     
+    // Circuit breaker: if too many recent failures, skip timeout
+    if (this.timeoutCircuitOpen) {
+      const timeSinceLastFailure = Date.now() - this.lastTimeoutFailure;
+      if (timeSinceLastFailure < 60000) { // 1 minute circuit breaker
+        log('[TIMEOUT] ⚡ Circuit breaker OPEN - skipping timeout', { 
+          timeoutId,
+          failures: this.timeoutFailures,
+          timeSinceLastFailure 
+        });
+        return;
+      } else {
+        // Reset circuit breaker after cooldown
+        this.timeoutCircuitOpen = false;
+        this.timeoutFailures = 0;
+        log('[TIMEOUT] ⚡ Circuit breaker RESET', { timeoutId });
+      }
+    }
+    
     try {
       log('[TIMEOUT] Starting timeout process', { 
         timeoutId, 
@@ -1066,6 +1198,16 @@ export class IrcClientShard {
         });
       } else {
         const errorText = await timeoutResponse.text();
+        this.timeoutsFailed++;
+        this.timeoutFailures++;
+        this.lastTimeoutFailure = Date.now();
+        
+        // Open circuit breaker if too many failures
+        if (this.timeoutFailures >= 5) {
+          this.timeoutCircuitOpen = true;
+          log('[TIMEOUT] ⚡ Circuit breaker OPENED due to failures', { failures: this.timeoutFailures });
+        }
+        
         log('[TIMEOUT] ❌ Timeout failed', { 
           timeoutId,
           channel: channelLogin, 
@@ -1073,17 +1215,29 @@ export class IrcClientShard {
           userId,
           status: timeoutResponse.status,
           error: errorText,
-          processingTime: totalDuration
+          processingTime: totalDuration,
+          totalFailures: this.timeoutsFailed
         });
       }
     } catch (e) {
       const totalDuration = Date.now() - startTime;
+      this.timeoutsFailed++;
+      this.timeoutFailures++;
+      this.lastTimeoutFailure = Date.now();
+      
+      // Open circuit breaker if too many failures
+      if (this.timeoutFailures >= 5) {
+        this.timeoutCircuitOpen = true;
+        log('[TIMEOUT] ⚡ Circuit breaker OPENED due to crashes', { failures: this.timeoutFailures });
+      }
+      
       log('[TIMEOUT] ❌ Timeout process crashed', { 
         timeoutId,
         channel: channelLogin, 
         user: userLogin, 
         error: String(e),
-        processingTime: totalDuration
+        processingTime: totalDuration,
+        totalFailures: this.timeoutsFailed
       });
     }
   }
@@ -1100,37 +1254,88 @@ export class IrcClientShard {
     }
   }
 
-  parseIrc(line: string) {
-    const match = line.match(/^(?:@([^ ]+) )?(?::([^ ]+) )?([^ ]+)(?: (.+))?$/);
-    if (!match) return null;
+  parseIrc(line: string): { tags?: Record<string, string>; prefix?: string; command: string; params: string[] } | null {
+    let rest = line;
+    const msg: any = { params: [] };
     
-    const [, tagsStr, prefix, command, paramsStr] = match;
-    
-    const tags: any = {};
-    if (tagsStr) {
-      for (const tag of tagsStr.split(';')) {
-        const [key, value] = tag.split('=');
-        tags[key] = value || '';
+    // Parse tags (@key=value;key2=value2)
+    if (rest.startsWith('@')) {
+      const sp = rest.indexOf(' ');
+      if (sp === -1) return null; // Invalid format
+      const rawTags = rest.slice(1, sp);
+      rest = rest.slice(sp + 1);
+      msg.tags = {};
+      for (const part of rawTags.split(';')) {
+        const [k, v] = part.split('=');
+        msg.tags[k] = v || '';
       }
     }
     
-    const params = paramsStr ? paramsStr.split(' ') : [];
-    if (paramsStr?.includes(' :')) {
-      const colonIndex = paramsStr.indexOf(' :');
-      const beforeColon = paramsStr.substring(0, colonIndex).split(' ');
-      const afterColon = paramsStr.substring(colonIndex + 2);
-      return { tags, prefix, command, params: [...beforeColon, afterColon] };
+    // Parse prefix (:nick!user@host)
+    if (rest.startsWith(':')) {
+      const sp = rest.indexOf(' ');
+      if (sp === -1) return null; // Invalid format
+      msg.prefix = rest.slice(1, sp);
+      rest = rest.slice(sp + 1);
     }
     
-    return { tags, prefix, command, params };
+    // Parse command
+    const sp = rest.indexOf(' ');
+    if (sp === -1) {
+      // Command only, no params
+      msg.command = rest;
+      return msg;
+    }
+    
+    msg.command = rest.slice(0, sp);
+    rest = rest.slice(sp + 1);
+    
+    // Parse parameters
+    if (rest.startsWith(':')) {
+      // Trailing parameter (everything after :)
+      msg.params = [rest.slice(1)];
+    } else {
+      // Multiple parameters
+      const parts: string[] = [];
+      while (rest) {
+        if (rest.startsWith(':')) {
+          // Trailing parameter found
+          parts.push(rest.slice(1));
+          break;
+        }
+        const idx = rest.indexOf(' ');
+        if (idx === -1) {
+          // Last parameter
+          parts.push(rest);
+          break;
+        }
+        parts.push(rest.slice(0, idx));
+        rest = rest.slice(idx + 1);
+      }
+      msg.params = parts;
+    }
+    
+    return msg;
   }
 
   async saveStateToStorage() {
+    const startTime = Date.now();
     try {
-      await this.state.storage.put('assigned', this.assignedChannels);
-      await this.state.storage.put('modChannels', Array.from(this.modChannels));
+      await Promise.all([
+        this.state.storage.put('assigned', this.assignedChannels),
+        this.state.storage.put('modChannels', Array.from(this.modChannels))
+      ]);
+      
+      const duration = Date.now() - startTime;
+      log('[IRC] ✅ State saved to storage', { 
+        channels: this.assignedChannels.length,
+        modChannels: this.modChannels.size,
+        duration 
+      });
     } catch (e) {
-      console.error('[IRC] Save state failed:', e);
+      const duration = Date.now() - startTime;
+      log('[IRC] ❌ Save state failed', { error: String(e), duration });
+      // Don't throw - this is not critical for operation
     }
   }
 
