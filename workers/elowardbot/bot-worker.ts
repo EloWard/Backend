@@ -127,9 +127,49 @@ async function getBotUserAndToken(env: Env) {
       }
     }
 
+    // Normalize user object to ensure consistent structure (id instead of user_id)
+    let normalizedUser = user;
+    if (user && user.user_id && !user.id) {
+      normalizedUser = {
+        ...user,
+        id: user.user_id,
+        display_name: user.display_name || user.login
+      };
+      
+      // Update stored token with normalized format to prevent future issues
+      try {
+        const updateData = stored.tokens ? {
+          user: normalizedUser,
+          tokens: {
+            access_token: access_token,
+            refresh_token: refresh_token,
+            expires_at: expires_at
+          }
+        } : {
+          access_token: access_token,
+          refresh_token: refresh_token,
+          expires_at: expires_at,
+          user: normalizedUser
+        };
+        
+        env.BOT_KV.put('bot_tokens', JSON.stringify(updateData)).catch(e => 
+          log('[getBotUserAndToken] KV update failed', { error: String(e) })
+        );
+      } catch (e) {
+        log('[getBotUserAndToken] Failed to update stored token format', { error: String(e) });
+      }
+    }
+
     const duration = Date.now() - startTime;
-    log('[getBotUserAndToken] END - Success', { duration, hasUser: !!user, userLogin: user?.login, userId: user?.id, tokenLength: access_token?.length });
-    return { access: access_token, refresh: refresh_token, user };
+    log('[getBotUserAndToken] END - Success', { 
+      duration, 
+      hasUser: !!normalizedUser, 
+      userLogin: normalizedUser?.login, 
+      userId: normalizedUser?.id,
+      tokenLength: access_token?.length,
+      normalizedFromUserId: !!(user?.user_id && !user?.id)
+    });
+    return { access: access_token, refresh: refresh_token, user: normalizedUser };
   } catch (e) {
     const duration = Date.now() - startTime;
     log('[getBotUserAndToken] END - Error', { duration, error: String(e) });
@@ -164,11 +204,22 @@ async function refreshBotToken(env: Env, refreshToken: string) {
     }
 
     const data = await response.json();
-    const user = await validateToken(env, data.access_token);
-    if (!user) {
+    const validationResponse = await validateToken(env, data.access_token);
+    if (!validationResponse) {
       log('[refreshBotToken] ❌ Token validation failed');
       return null;
     }
+
+    // Normalize user object to have consistent structure (id instead of user_id)
+    const user = {
+      id: validationResponse.user_id,
+      login: validationResponse.login,
+      display_name: validationResponse.login,
+      // Keep original validation data for completeness
+      client_id: validationResponse.client_id,
+      scopes: validationResponse.scopes,
+      expires_in: validationResponse.expires_in
+    };
 
     // Store in consistent format
     const tokenData = {
@@ -186,6 +237,8 @@ async function refreshBotToken(env: Env, refreshToken: string) {
     log('[refreshBotToken] ✅ Token refresh successful', { 
       tokenLength: data.access_token.length,
       expiresIn: data.expires_in,
+      userId: user.id,
+      userLogin: user.login,
       duration 
     });
     
@@ -729,13 +782,13 @@ export class TwitchBot {
         this.startKeepalive();
       });
       
-      this.ws.addEventListener('message', (event) => {
+      this.ws.addEventListener('message', async (event) => {
         this.lastActivity = Date.now();
         this.messagesProcessed++;
         const messageData = String(event.data || '');
         
         if (messageData.trim()) {
-          this.handleIrcMessage(messageData);
+          await this.handleIrcMessage(messageData);
         }
       });
       
@@ -843,7 +896,7 @@ export class TwitchBot {
   }
 
   // IRC MESSAGE PROCESSING - The core of the bot
-  handleIrcMessage(data: string) {
+  async handleIrcMessage(data: string) {
     const lines = data.trim().split(/\r?\n/).filter(line => line.length > 0);
     
     for (const line of lines) {
@@ -905,7 +958,15 @@ export class TwitchBot {
       
       // Handle chat messages - THE CRITICAL PATH
       if (msg.command === 'PRIVMSG') {
-        this.handlePrivmsg(msg);
+        try {
+          await this.handlePrivmsg(msg);
+        } catch (e) {
+          log('[PRIVMSG] ❌ Handler crashed', { 
+            error: String(e), 
+            message: msg.params?.[1]?.substring(0, 50),
+            user: msg.prefix?.split('!')[0]
+          });
+        }
         continue;
       }
       

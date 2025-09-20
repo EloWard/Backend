@@ -23,3 +23,5 @@ DATABASE_URL
 # Any manual scripts with hardcoded secrets
 *-local.js
 *-secret.js
+
+*.pem
