@@ -15,6 +15,7 @@ type KVNamespace = {
   put: (key: string, value: string, options?: Record<string, any>) => Promise<void>;
 };
 type ExecutionContext = { waitUntil(promise: Promise<any>): void; passThroughOnException(): void };
+type ScheduledEvent = { cron: string; scheduledTime: number; };
 
 interface Fetcher { fetch: (request: Request) => Promise<Response> }
 interface DurableObjectState { 
@@ -420,6 +421,86 @@ router.post('/check-message', async (req: Request, env: Env) => {
   }
 });
 
+// PRODUCTION TOKEN ENDPOINT - IRC Bot Token Sync
+router.get('/token', async (req: Request, env: Env) => {
+  try {
+    log('[TOKEN-SYNC] IRC bot requesting current token');
+    
+    // Get current valid token (with automatic refresh if needed)
+    const tokenData = await getBotUserAndToken(env);
+    
+    if (!tokenData?.access || !tokenData?.user) {
+      log('[TOKEN-SYNC] ❌ No valid bot token available');
+      return json(500, { 
+        error: 'No valid bot token available',
+        shouldReauth: true 
+      });
+    }
+    
+    // Calculate expiration info for IRC bot - get from stored tokens
+    const storedTokens = await env.BOT_KV.get('bot_tokens', 'json');
+    const expiresAt = storedTokens?.tokens?.expires_at || 0;
+    const expiresInMinutes = Math.floor((expiresAt - Date.now()) / 60000);
+    const needsRefreshSoon = expiresInMinutes < 30; // Warn if expires in 30min
+    
+    log('[TOKEN-SYNC] ✅ Providing fresh token to IRC bot', { 
+      userLogin: tokenData.user.login,
+      userId: tokenData.user.id,
+      expiresInMinutes,
+      needsRefreshSoon
+    });
+    
+    return json(200, {
+      token: tokenData.access.startsWith('oauth:') ? tokenData.access : `oauth:${tokenData.access}`,
+      user: {
+        login: tokenData.user.login,
+        id: tokenData.user.id,
+        display_name: tokenData.user.display_name
+      },
+      expires_at: expiresAt,
+      expires_in_minutes: expiresInMinutes,
+      needs_refresh_soon: needsRefreshSoon,
+      timestamp: Date.now()
+    });
+  } catch (e: any) {
+    log('[TOKEN-SYNC] ❌ Token sync failed', { error: String(e) });
+    return json(500, { error: 'Token sync failed', detail: e?.message });
+  }
+});
+
+// PRODUCTION TOKEN REFRESH ENDPOINT - Force refresh for maintenance
+router.post('/token/refresh', async (req: Request, env: Env) => {
+  try {
+    log('[TOKEN-REFRESH] Manual token refresh requested');
+    
+    const currentTokens = await env.BOT_KV.get('bot_tokens', 'json');
+    if (!currentTokens?.tokens?.refresh_token) {
+      return json(400, { error: 'No refresh token available' });
+    }
+    
+    const refreshed = await refreshBotToken(env, currentTokens.tokens.refresh_token);
+    if (!refreshed) {
+      return json(500, { error: 'Token refresh failed' });
+    }
+    
+    log('[TOKEN-REFRESH] ✅ Token refresh successful');
+    
+    // Get expiration from storage since user object doesn't have expires_at
+    const updatedTokens = await env.BOT_KV.get('bot_tokens', 'json');
+    const expiresAt = updatedTokens?.tokens?.expires_at || 0;
+    
+    return json(200, {
+      success: true,
+      user: refreshed.user.login,
+      expires_in_minutes: Math.floor((expiresAt - Date.now()) / 60000),
+      timestamp: Date.now()
+    });
+  } catch (e: any) {
+    log('[TOKEN-REFRESH] ❌ Manual refresh failed', { error: String(e) });
+    return json(500, { error: 'Refresh failed', detail: e?.message });
+  }
+});
+
 router.get('/channels', async (_req: Request, env: Env) => {
   try {
     log('[IRC-INTEGRATION] Channel list requested by IRC bot');
@@ -474,6 +555,75 @@ const worker = {
     const res = await router.handle(request, env, ctx).catch((e: any) => json(500, { error: 'internal', detail: e?.message }));
     return addCors(res);
   },
+
+  // PRODUCTION MAINTENANCE - Scheduled token refresh during low-traffic hours
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    try {
+      log('[MAINTENANCE] Scheduled maintenance started', { 
+        cron: event.cron,
+        scheduledTime: new Date(event.scheduledTime).toISOString()
+      });
+
+      // Check current token status
+      const currentTokens = await env.BOT_KV.get('bot_tokens', 'json');
+      if (!currentTokens?.tokens?.refresh_token) {
+        log('[MAINTENANCE] ❌ No refresh token available for maintenance');
+        return;
+      }
+
+      // Calculate token expiration
+      const expiresAt = currentTokens.tokens.expires_at || 0;
+      const expiresInHours = Math.floor((expiresAt - Date.now()) / 3600000);
+      const shouldRefresh = expiresInHours < 12; // Refresh if expires in next 12 hours
+
+      log('[MAINTENANCE] Token status check', {
+        expiresAt: new Date(expiresAt).toISOString(),
+        expiresInHours,
+        shouldRefresh
+      });
+
+      if (shouldRefresh) {
+        log('[MAINTENANCE] 🔄 Performing proactive token refresh');
+        
+        const refreshed = await refreshBotToken(env, currentTokens.tokens.refresh_token);
+        if (refreshed) {
+        // Get updated token expiration from storage
+        const updatedTokens = await env.BOT_KV.get('bot_tokens', 'json');
+        const newExpiresAt = updatedTokens?.tokens?.expires_at || 0;
+        
+        log('[MAINTENANCE] ✅ Token refresh successful', {
+          userLogin: refreshed.user?.login,
+          newExpiresInHours: Math.floor((newExpiresAt - Date.now()) / 3600000)
+        });
+        } else {
+          log('[MAINTENANCE] ❌ Token refresh failed during maintenance');
+        }
+      } else {
+        log('[MAINTENANCE] ⏭️ Token refresh not needed', { expiresInHours });
+      }
+
+      // Health check on bot
+      try {
+        const id = env.TWITCH_BOT.idFromName('twitch-bot');
+        const healthResponse = await env.TWITCH_BOT.get(id).fetch('https://do/health');
+        const health = await healthResponse.json();
+        
+        log('[MAINTENANCE] Bot health check', {
+          connected: health.connected,
+          ready: health.ready,
+          channels: health.channels,
+          messagesProcessed: health.messagesProcessed,
+          timeoutsIssued: health.timeoutsIssued
+        });
+      } catch (e) {
+        log('[MAINTENANCE] ❌ Bot health check failed', { error: String(e) });
+      }
+
+      log('[MAINTENANCE] Scheduled maintenance completed');
+    } catch (e) {
+      log('[MAINTENANCE] ❌ Maintenance failed', { error: String(e) });
+    }
+  }
 };
 
 export default worker;
