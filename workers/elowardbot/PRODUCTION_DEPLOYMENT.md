@@ -1,56 +1,55 @@
 # Production-Grade Twitch Bot Deployment Guide
 
-## ✅ PROBLEM SOLVED: Root Cause Analysis
+## 🏗️ **Hybrid Architecture** 
 
-**The Issue**: Your bot was using hibernatable WebSockets and complex multi-DO architecture that created failure points. Messages would stop being processed after hibernation or connection disruptions.
+**The Solution**: Clean hybrid architecture for maximum reliability:
+- ✅ **IRC Bot** (AWS Lightsail) - Maintains persistent IRC connection
+- ✅ **CF Worker** (Cloudflare) - Handles business logic, tokens, timeouts
+- ✅ **HTTP API Integration** - Simple, reliable communication between components
+- ✅ **Automatic token management** with proactive refresh
+- ✅ **Zero-downtime channel management** via database
 
-**The Solution**: Complete architectural simplification:
-- ❌ Removed hibernation complexity (you don't need it for high-volume chat)
-- ❌ Removed BotManager → IrcClientShard chains  
-- ❌ Removed hibernatable WebSocket forwarding
-- ✅ Single `TwitchBot` Durable Object with direct IRC connection
-- ✅ Always-on architecture for immediate message processing
-- ✅ Robust auto-recovery with exponential backoff
+## 🚀 Deploy Hybrid Architecture
 
-## 🚀 Deploy the New Architecture
-
-### 1. Deploy to Production
+### 1. Deploy Cloudflare Worker
 ```bash
 cd /Users/sunnywang/Desktop/EloWard/Backend/workers/elowardbot
 wrangler deploy
 ```
 
-### 2. Initialize the Bot
+### 2. Deploy IRC Bot to AWS Lightsail
 ```bash
-# Connect and load channels
-curl -X POST https://eloward-bot.unleashai.workers.dev/irc/connect
-
-# Or reload existing state  
-curl -X POST https://eloward-bot.unleashai.workers.dev/irc/reload
+cd /Users/sunnywang/Desktop/EloWard/EloWardBot
+npm run deploy
 ```
 
-### 3. Monitor Health
+### 3. Verify Integration
 ```bash
-# Get detailed health status
+# Check CF Worker health
 curl -s https://eloward-bot.unleashai.workers.dev/irc/health | jq .
+
+# Check IRC bot logs
+npm run logs
 ```
 
 ## 📊 Expected Health Response
+
+**CF Worker Health:**
 ```json
 {
-  "connected": true,
-  "ready": true, 
-  "channels": 1,
-  "modChannels": 1,
-  "connectionAge": 45000,
-  "messagesProcessed": 127,
-  "timeoutsIssued": 3,
-  "lastActivity": 1695089761,
-  "reconnectAttempts": 0,
-  "botLogin": "elowardbot",
-  "wsReadyState": 1,
-  "timestamp": "2025-09-19T04:12:41.234Z"
+  "worker_status": "healthy",
+  "architecture": "hybrid",
+  "enabled_channels": 3,
+  "timestamp": "2025-09-20T04:12:41.234Z"
 }
+```
+
+**IRC Bot Health:** (from `npm run logs`)
+```
+✅ Connected to Twitch IRC successfully!
+✅ Joined 3 channels: [ 'channel1', 'channel2', 'channel3' ]
+🔍 Token health check { expiresInMinutes: 720, needsRefresh: false }
+✅ Processed message for user in channel: timeout
 ```
 
 ## 🔧 Zero-Downtime Channel Management
