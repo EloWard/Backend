@@ -2,7 +2,9 @@
 const allowedOrigins = [
   'https://www.eloward.com',
   'https://eloward.com',
-  'http://localhost:3000'  // Development
+  'https://www.twitch.tv',     // FFZ add-ons run in Twitch context
+  'https://twitch.tv',         // FFZ add-ons run in Twitch context
+  'http://localhost:3000'      // Development
 ];
 
 // Helper function to generate CORS headers based on the request

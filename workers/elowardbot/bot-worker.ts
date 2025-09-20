@@ -348,7 +348,9 @@ router.post('/irc/channel/remove', async (req: Request, env: Env, ctx: Execution
 // CORS handling
 const allowedOrigins = [
   'https://www.eloward.com',
-  'https://eloward.com', 
+  'https://eloward.com',
+  'https://www.twitch.tv',   // FFZ add-ons run in Twitch context
+  'https://twitch.tv',       // FFZ add-ons run in Twitch context
   'http://localhost:3000'
 ];
 
