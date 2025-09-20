@@ -398,6 +398,41 @@ router.post('/irc/channel/remove', async (req: Request, env: Env, ctx: Execution
   }
 });
 
+// IRC Bot Integration Endpoints
+router.post('/check-message', async (req: Request, env: Env) => {
+  try {
+    const { channel, user, message } = await req.json();
+    
+    log('[IRC-INTEGRATION] Message received from IRC bot', { channel, user, messageLength: message?.length });
+    
+    // Use the same logic from your TwitchBot Durable Object
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    const response = await env.TWITCH_BOT.get(id).fetch('https://do/check-message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel, user, message })
+    });
+    
+    const result = await response.json();
+    return json(response.ok ? 200 : 500, result);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'check message failed' });
+  }
+});
+
+router.get('/channels', async (_req: Request, env: Env) => {
+  try {
+    log('[IRC-INTEGRATION] Channel list requested by IRC bot');
+    
+    const id = env.TWITCH_BOT.idFromName('twitch-bot');
+    const response = await env.TWITCH_BOT.get(id).fetch('https://do/channels');
+    const result = await response.json();
+    return json(response.ok ? 200 : 500, result);
+  } catch (e: any) {
+    return json(500, { error: e?.message || 'get channels failed' });
+  }
+});
+
 // CORS handling
 const allowedOrigins = [
   'https://www.eloward.com',
@@ -540,6 +575,14 @@ export class TwitchBot {
     
     if (req.method === 'POST' && url.pathname === '/channel/remove') {
       return this.handleRemoveChannel(req);
+    }
+    
+    if (req.method === 'POST' && url.pathname === '/check-message') {
+      return this.handleCheckMessage(req);
+    }
+    
+    if (req.method === 'GET' && url.pathname === '/channels') {
+      return this.handleGetChannels();
     }
     
     return json(404, { error: 'not found' });
@@ -691,6 +734,57 @@ export class TwitchBot {
       });
     } catch (e) {
       log('[TwitchBot] ❌ Remove channel failed', { error: String(e) });
+      return json(500, { error: String(e) });
+    }
+  }
+
+  // IRC Bot Integration Handlers
+  async handleCheckMessage(req: Request) {
+    try {
+      const { channel, user, message } = await req.json();
+      
+      if (!channel || !user) {
+        return json(400, { error: 'channel and user required' });
+      }
+      
+      log('[IRC-INTEGRATION] Processing message from IRC bot', { 
+        channel, 
+        user, 
+        messageLength: message?.length 
+      });
+      
+      // Use the same message processing logic as PRIVMSG handler
+      const config = await this.getChannelConfig(channel);
+      if (!config) {
+        return json(200, { action: 'skip', reason: 'channel not configured' });
+      }
+      
+      // Check user rank
+      const hasRank = await this.checkUserRank(user);
+      if (hasRank) {
+        return json(200, { action: 'allow', reason: 'user has valid rank' });
+      }
+      
+      // Issue timeout
+      await this.timeoutUser(channel, user, config.timeout_seconds || 20, config.reason_template);
+      return json(200, { action: 'timeout', reason: 'insufficient rank', duration: config.timeout_seconds || 20 });
+      
+    } catch (e) {
+      log('[IRC-INTEGRATION] ❌ Check message failed', { error: String(e) });
+      return json(500, { error: String(e) });
+    }
+  }
+  
+  async handleGetChannels() {
+    try {
+      const channels = this.assignedChannels.map(c => c.channel_login);
+      return json(200, { 
+        channels,
+        count: channels.length,
+        timestamp: new Date().toISOString()
+      });
+    } catch (e) {
+      log('[IRC-INTEGRATION] ❌ Get channels failed', { error: String(e) });
       return json(500, { error: String(e) });
     }
   }
