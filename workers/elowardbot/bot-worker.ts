@@ -37,6 +37,7 @@ interface Env {
   DB: D1Database;
   SITE_BASE_URL?: string;
   BOT_WRITE_KEY?: string;
+  IRC_BOT_WEBHOOK_URL?: string; // URL for IRC bot webhook (e.g., http://35.94.69.109:3000)
 }
 
 const router = Router();
@@ -69,9 +70,9 @@ function log(level: 'error' | 'warn' | 'info' | 'debug', msg: string, obj?: any)
   // Only log errors and warnings in production to reduce noise and improve performance
   if (level === 'error' || level === 'warn' || level === 'info') {
     const timestamp = new Date().toISOString();
-    if (obj) {
+  if (obj) {
       console.log(`[${level.toUpperCase()}] [${timestamp}] ${msg}`, obj);
-    } else {
+  } else {
       console.log(`[${level.toUpperCase()}] [${timestamp}] ${msg}`);
     }
   }
@@ -131,6 +132,51 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
   return u as { id: string; login: string; display_name: string };
 }
 
+// Webhook notification to IRC bot for immediate channel reload
+async function notifyIrcBotChannelChange(env: Env, action: 'enable' | 'disable', channelLogin?: string) {
+  if (!env.IRC_BOT_WEBHOOK_URL) {
+    log('debug', 'IRC bot webhook URL not configured - skipping notification');
+    return;
+  }
+
+  try {
+    const webhookUrl = `${env.IRC_BOT_WEBHOOK_URL}/reload-channels`;
+    log('info', 'Notifying IRC bot of channel change', { action, channelLogin, webhookUrl });
+    
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        action, 
+        channel: channelLogin, 
+        timestamp: new Date().toISOString() 
+      })
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      log('info', 'IRC bot webhook notification successful', { 
+        action, 
+        channelLogin, 
+        channels: result.channels?.length || 0 
+      });
+    } else {
+      log('warn', 'IRC bot webhook notification failed', { 
+        action, 
+        channelLogin, 
+        status: response.status,
+        statusText: response.statusText 
+      });
+    }
+  } catch (e) {
+    log('warn', 'IRC bot webhook notification error', { 
+      action, 
+      channelLogin, 
+      error: String(e) 
+    });
+  }
+}
+
 // Simple channel enable function - matches existing codebase patterns
 async function enableChannelForUser(env: Env, channel_login: string, twitch_id: string) {
   const login = channel_login.toLowerCase();
@@ -151,6 +197,9 @@ async function enableChannelForUser(env: Env, channel_login: string, twitch_id: 
   }
   
   log('info', 'Channel enabled via OAuth', { login, twitch_id });
+  
+  // Notify IRC bot immediately for instant channel join
+  await notifyIrcBotChannelChange(env, 'enable', login);
 }
 
 // Helper function to timeout user via Twitch Helix API
@@ -278,14 +327,14 @@ async function getBotUserAndToken(env: Env) {
       };
       
       // Update stored token with normalized format to prevent future issues
-      const updateData = stored.tokens ? {
-        user: normalizedUser,
+        const updateData = stored.tokens ? {
+          user: normalizedUser,
         tokens: { access_token, refresh_token, expires_at }
       } : {
         access_token, refresh_token, expires_at, user: normalizedUser
-      };
-      
-      env.BOT_KV.put('bot_tokens', JSON.stringify(updateData)).catch(e => 
+        };
+        
+        env.BOT_KV.put('bot_tokens', JSON.stringify(updateData)).catch(e => 
         log('warn', 'Failed to update normalized token format', { error: String(e) })
       );
     }
@@ -510,6 +559,13 @@ router.post('/bot/enable_internal', async (req: Request, env: Env) => {
     `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
     
     log('info', 'Bot enabled internally', { twitch_id, channel_login });
+    
+    // Notify IRC bot immediately for instant channel join
+    const channelName = cfg?.channel_login || channel_login;
+    if (channelName) {
+      await notifyIrcBotChannelChange(env, 'enable', channelName);
+    }
+    
     return json(200, cfg);
   } catch (e: any) {
     log('error', 'Internal enable failed', { error: String(e) });
@@ -554,6 +610,13 @@ router.post('/bot/disable_internal', async (req: Request, env: Env) => {
     `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
     
     log('info', 'Bot disabled internally', { twitch_id, channel_login });
+    
+    // Notify IRC bot immediately for instant channel leave
+    const channelName = cfg?.channel_login || channel_login;
+    if (channelName) {
+      await notifyIrcBotChannelChange(env, 'disable', channelName);
+    }
+    
     return json(200, cfg);
   } catch (e: any) {
     log('error', 'Internal disable failed', { error: String(e) });
@@ -656,15 +719,15 @@ router.post('/bot/config_internal', async (req: Request, env: Env) => {
 // Channel management (database-only for hybrid architecture)
 router.post('/irc/channel/add', async (req: Request, env: Env) => {
   let channel_login: string | undefined;
-  try {
-    const body = await req.json();
+    try {
+      const body = await req.json();
     ({ channel_login } = body);
     const { twitch_id } = body;
-    
-    if (!channel_login) {
-      return json(400, { error: 'channel_login required' });
-    }
-    
+      
+      if (!channel_login) {
+        return json(400, { error: 'channel_login required' });
+      }
+      
     // Enable channel in database - IRC bot will pick it up automatically
     await env.DB.prepare(`
       UPDATE twitch_bot_users 
@@ -674,8 +737,11 @@ router.post('/irc/channel/add', async (req: Request, env: Env) => {
     
     log('info', 'Channel enabled in database', { channel_login, twitch_id });
     
-    return json(200, { 
-      message: 'Channel enabled - IRC bot will join automatically',
+    // Notify IRC bot immediately for instant channel join
+    await notifyIrcBotChannelChange(env, 'enable', channel_login.toLowerCase());
+      
+      return json(200, { 
+      message: 'Channel enabled - IRC bot notified to join immediately',
       channel_login,
       twitch_id 
     });
@@ -687,14 +753,14 @@ router.post('/irc/channel/add', async (req: Request, env: Env) => {
 
 router.post('/irc/channel/remove', async (req: Request, env: Env) => {
   let channel_login: string | undefined;
-  try {
-    const body = await req.json();
+    try {
+      const body = await req.json();
     ({ channel_login } = body);
-    
-    if (!channel_login) {
-      return json(400, { error: 'channel_login required' });
-    }
-    
+      
+      if (!channel_login) {
+        return json(400, { error: 'channel_login required' });
+      }
+      
     // Disable channel in database - IRC bot will leave automatically
     await env.DB.prepare(`
       UPDATE twitch_bot_users 
@@ -704,8 +770,11 @@ router.post('/irc/channel/remove', async (req: Request, env: Env) => {
     
     log('info', 'Channel disabled in database', { channel_login });
     
-    return json(200, { 
-      message: 'Channel disabled - IRC bot will leave automatically',
+    // Notify IRC bot immediately for instant channel leave
+    await notifyIrcBotChannelChange(env, 'disable', channel_login.toLowerCase());
+      
+      return json(200, { 
+      message: 'Channel disabled - IRC bot notified to leave immediately',
       channel_login
     });
   } catch (e: any) {
@@ -716,20 +785,20 @@ router.post('/irc/channel/remove', async (req: Request, env: Env) => {
 
 // IRC Bot Integration - Core message processing endpoint
 router.post('/check-message', async (req: Request, env: Env) => {
-  try {
-    const { channel, user, message } = await req.json();
-    
-    if (!channel || !user) {
-      return json(400, { error: 'channel and user required' });
-    }
-    
+    try {
+      const { channel, user, message } = await req.json();
+      
+      if (!channel || !user) {
+        return json(400, { error: 'channel and user required' });
+      }
+      
     // Get channel configuration
     const config = await env.DB.prepare(`
       SELECT * FROM twitch_bot_users 
       WHERE channel_name = ? AND bot_enabled = 1
     `).bind(channel.toLowerCase()).first();
     
-    if (!config) {
+      if (!config) {
       return json(200, { action: 'skip', reason: 'channel not configured or disabled' });
     }
     
@@ -753,7 +822,7 @@ router.post('/check-message', async (req: Request, env: Env) => {
         // Execute timeout via Helix API
         await timeoutUser(env, channel, user, duration, reason);
         
-        return json(200, { 
+      return json(200, { 
           action: 'timeout', 
           reason: 'insufficient rank', 
           duration 
@@ -868,6 +937,29 @@ router.get('/channels', async (_req: Request, env: Env) => {
   }
 });
 
+// Legacy endpoint - kept for backward compatibility but webhooks are now primary method
+router.post('/channels/reload', async (_req: Request, env: Env) => {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT channel_name FROM twitch_bot_users 
+      WHERE bot_enabled = 1 
+      ORDER BY channel_name
+    `).all();
+    
+    const channels = (result.results || []).map((row: any) => row.channel_name);
+    
+    return json(200, { 
+      message: 'Channel reload handled via webhooks - this endpoint shows current state',
+      channels,
+      count: channels.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (e: any) {
+    log('error', 'Channel reload endpoint failed', { error: String(e) });
+    return json(500, { error: 'Failed to get channel state' });
+  }
+});
+
 // Basic health check endpoint
 router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }));
 
@@ -930,11 +1022,12 @@ router.get('/oauth/callback', async (req: Request, env: Env) => {
           Location: `${env.WORKER_PUBLIC_URL}/oauth/done?actor=bot&login=${user.login}` 
         } 
       });
-    } else {
+      } else {
       // Broadcaster OAuth: enable bot for this channel using production pattern
       try {
         await enableChannelForUser(env, user.login, user.id);
-      } catch (e) {
+        log('info', 'Broadcaster OAuth completed successfully', { login: user.login });
+    } catch (e) {
         log('warn', 'Failed to enable bot for broadcaster', { 
           login: user.login, 
           error: String(e) 
@@ -1065,7 +1158,7 @@ const worker = {
       // Check enabled channels count
       const channelCount = await getEnabledChannelCount(env);
       log('info', 'Maintenance completed', { enabledChannels: channelCount });
-    } catch (e) {
+      } catch (e) {
       log('error', 'Scheduled maintenance failed', { error: String(e) });
     }
   }
