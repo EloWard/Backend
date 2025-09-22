@@ -377,6 +377,208 @@ router.get('/irc/health', async (_req: Request, env: Env) => {
   });
 });
 
+// Internal authentication for trusted endpoints
+function internalAuthOk(env: Env, req: Request): boolean {
+  const provided = req.headers.get('X-Internal-Auth') || '';
+  const expected = env.BOT_WRITE_KEY || '';
+  return Boolean(expected) && provided === expected;
+}
+
+// Helper function to normalize roman numerals to numbers
+function romanOrNumberToDivision(div: any): number {
+  if (typeof div === 'string') {
+    const upper = div.toUpperCase();
+    if (upper === 'I') return 1;
+    if (upper === 'II') return 2;
+    if (upper === 'III') return 3;
+    if (upper === 'IV') return 4;
+  }
+  const n = Number(div);
+  if (!isFinite(n) || n < 1) return 4; // default worst
+  return Math.max(1, Math.min(4, n));
+}
+
+// Internal endpoints for dashboard (authenticated with BOT_WRITE_KEY)
+router.post('/bot/enable_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
+  
+  try {
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    
+    if (!twitch_id && !channel_login) {
+      return json(400, { error: 'twitch_id or channel_login required' });
+    }
+    
+    // Enable bot for the channel
+    let result;
+    if (twitch_id) {
+      result = await env.DB.prepare(`
+        UPDATE twitch_bot_users 
+        SET bot_enabled = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE twitch_id = ?
+      `).bind(twitch_id).run();
+    } else {
+      result = await env.DB.prepare(`
+        UPDATE twitch_bot_users 
+        SET bot_enabled = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE channel_name = ?
+      `).bind(channel_login!.toLowerCase()).run();
+    }
+    
+    // Get the updated config
+    const cfg = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template,
+             enforcement_mode, min_rank_tier, min_rank_division
+      FROM twitch_bot_users 
+      WHERE twitch_id = ? OR channel_name = ?
+    `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
+    
+    log('info', 'Bot enabled internally', { twitch_id, channel_login });
+    return json(200, cfg);
+  } catch (e: any) {
+    log('error', 'Internal enable failed', { error: String(e) });
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
+router.post('/bot/disable_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
+  
+  try {
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    
+    if (!twitch_id && !channel_login) {
+      return json(400, { error: 'twitch_id or channel_login required' });
+    }
+    
+    // Disable bot for the channel
+    let result;
+    if (twitch_id) {
+      result = await env.DB.prepare(`
+        UPDATE twitch_bot_users 
+        SET bot_enabled = 0, updated_at = CURRENT_TIMESTAMP
+        WHERE twitch_id = ?
+      `).bind(twitch_id).run();
+    } else {
+      result = await env.DB.prepare(`
+        UPDATE twitch_bot_users 
+        SET bot_enabled = 0, updated_at = CURRENT_TIMESTAMP
+        WHERE channel_name = ?
+      `).bind(channel_login!.toLowerCase()).run();
+    }
+    
+    // Get the updated config
+    const cfg = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template,
+             enforcement_mode, min_rank_tier, min_rank_division
+      FROM twitch_bot_users 
+      WHERE twitch_id = ? OR channel_name = ?
+    `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
+    
+    log('info', 'Bot disabled internally', { twitch_id, channel_login });
+    return json(200, cfg);
+  } catch (e: any) {
+    log('error', 'Internal disable failed', { error: String(e) });
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
+router.post('/bot/config_internal', async (req: Request, env: Env) => {
+  if (!internalAuthOk(env, req)) return json(401, { error: 'unauthorized' });
+  
+  try {
+    const body = await req.json().catch(() => ({}));
+    const twitch_id = body?.twitch_id as string | undefined;
+    const channel_login = body?.channel_login as string | undefined;
+    
+    if (!twitch_id && !channel_login) {
+      return json(400, { error: 'twitch_id or channel_login required' });
+    }
+    
+    // Build update patch
+    const patch: any = {};
+    if (typeof body.timeout_seconds === 'number') patch.timeout_seconds = body.timeout_seconds;
+    if (typeof body.reason_template === 'string') patch.reason_template = body.reason_template;
+    if (typeof body.bot_enabled === 'number' || typeof body.bot_enabled === 'boolean') {
+      patch.bot_enabled = body.bot_enabled ? 1 : 0;
+    }
+    if (typeof body.enforcement_mode === 'string') patch.enforcement_mode = String(body.enforcement_mode);
+    
+    if (body.min_rank_tier !== undefined) {
+      patch.min_rank_tier = body.min_rank_tier == null ? null : String(body.min_rank_tier);
+    }
+    if (body.min_rank_division !== undefined) {
+      const d = body.min_rank_division;
+      patch.min_rank_division = d == null ? null : (typeof d === 'string' ? romanOrNumberToDivision(d) : Number(d));
+    }
+    
+    // Build update query dynamically
+    const updates: string[] = [];
+    const values: any[] = [];
+    
+    if (patch.timeout_seconds !== undefined) {
+      updates.push('timeout_seconds = ?');
+      values.push(patch.timeout_seconds);
+    }
+    if (patch.reason_template !== undefined) {
+      updates.push('reason_template = ?');
+      values.push(patch.reason_template);
+    }
+    if (patch.bot_enabled !== undefined) {
+      updates.push('bot_enabled = ?');
+      values.push(patch.bot_enabled);
+    }
+    if (patch.enforcement_mode !== undefined) {
+      updates.push('enforcement_mode = ?');
+      values.push(patch.enforcement_mode);
+    }
+    if (patch.min_rank_tier !== undefined) {
+      updates.push('min_rank_tier = ?');
+      values.push(patch.min_rank_tier);
+    }
+    if (patch.min_rank_division !== undefined) {
+      updates.push('min_rank_division = ?');
+      values.push(patch.min_rank_division);
+    }
+    
+    if (updates.length === 0) {
+      return json(400, { error: 'No valid updates provided' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    
+    // Update the record
+    let updateQuery;
+    if (twitch_id) {
+      updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE twitch_id = ?`;
+      values.push(twitch_id);
+    } else {
+      updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
+      values.push(channel_login!.toLowerCase());
+    }
+    
+    await env.DB.prepare(updateQuery).bind(...values).run();
+    
+    // Get the updated config
+    const cfg = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template,
+             enforcement_mode, min_rank_tier, min_rank_division
+      FROM twitch_bot_users 
+      WHERE twitch_id = ? OR channel_name = ?
+    `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
+    
+    log('info', 'Bot config updated internally', { twitch_id, channel_login, updates: Object.keys(patch) });
+    return json(200, cfg);
+  } catch (e: any) {
+    log('error', 'Internal config update failed', { error: String(e) });
+    return json(500, { error: e?.message || 'error' });
+  }
+});
+
 // Channel management (database-only for hybrid architecture)
 router.post('/irc/channel/add', async (req: Request, env: Env) => {
   let channel_login: string | undefined;
@@ -591,6 +793,9 @@ router.get('/channels', async (_req: Request, env: Env) => {
     return json(500, { error: 'Failed to get channels' });
   }
 });
+
+// Basic health check endpoint
+router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }));
 
 // CORS handling
 const allowedOrigins = [
