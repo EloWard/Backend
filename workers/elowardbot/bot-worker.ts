@@ -41,6 +41,21 @@ interface Env {
 
 const router = Router();
 
+// OAuth Configuration
+const BOT_SCOPES = [
+  'chat:read',
+  'chat:edit',
+  'moderator:manage:banned_users', // Required for timeout/ban via Helix API
+];
+const BROADCASTER_SCOPES = ['channel:bot'];
+
+// OAuth URLs
+const AUTH_URL = 'https://id.twitch.tv/oauth2/authorize';
+const TOKEN_URL = 'https://id.twitch.tv/oauth2/token';
+
+// Helix API endpoints
+const HELIX_USERS = 'https://api.twitch.tv/helix/users';
+
 // Utility functions
 function json(status: number, obj: any): Response {
   return new Response(JSON.stringify(obj), {
@@ -77,6 +92,65 @@ async function getEnabledChannelCount(env: Env): Promise<number> {
     log('warn', 'Failed to get enabled channel count', { error: String(e) });
     return 0;
   }
+}
+
+// OAuth helper functions for token exchange
+async function exchangeCodeForToken(env: Env, code: string, redirectUri: string) {
+  const body = new URLSearchParams();
+  body.set('client_id', env.TWITCH_CLIENT_ID);
+  body.set('client_secret', env.TWITCH_CLIENT_SECRET);
+  body.set('code', code);
+  body.set('grant_type', 'authorization_code');
+  body.set('redirect_uri', redirectUri);
+  
+  const res = await fetch(TOKEN_URL, { method: 'POST', body });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(data.error_description || 'token exchange failed');
+  }
+  
+  return data as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+    scope: string[];
+  };
+}
+
+async function getUserFromToken(env: Env, userAccessToken: string) {
+  const res = await fetch(HELIX_USERS, {
+    headers: { 
+      Authorization: `Bearer ${userAccessToken}`, 
+      'Client-Id': env.TWITCH_CLIENT_ID 
+    },
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error('Failed to fetch user info');
+  const u = data.data?.[0];
+  if (!u) throw new Error('User not found');
+  return u as { id: string; login: string; display_name: string };
+}
+
+// Simple channel enable function - matches existing codebase patterns
+async function enableChannelForUser(env: Env, channel_login: string, twitch_id: string) {
+  const login = channel_login.toLowerCase();
+  
+  // Try UPDATE first (for existing channels)
+  const result = await env.DB.prepare(`
+    UPDATE twitch_bot_users 
+    SET bot_enabled = 1, updated_at = CURRENT_TIMESTAMP
+    WHERE twitch_id = ?
+  `).bind(twitch_id).run();
+  
+  // If no rows updated, INSERT new channel record with defaults
+  if ((result as any)?.meta?.changes === 0) {
+    await env.DB.prepare(`
+      INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode)
+      VALUES (?, ?, 1, 30, "{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}", "broadcaster,moderator,vip", "has_rank")
+    `).bind(twitch_id, login).run();
+  }
+  
+  log('info', 'Channel enabled via OAuth', { login, twitch_id });
 }
 
 // Helper function to timeout user via Twitch Helix API
@@ -797,6 +871,113 @@ router.get('/channels', async (_req: Request, env: Env) => {
 // Basic health check endpoint
 router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }));
 
+// OAuth Authorization Flow
+// Start OAuth: actor=bot | broadcaster
+router.get('/oauth/start', (req: Request, env: Env) => {
+  const url = new URL(req.url);
+  const actor = (url.searchParams.get('actor') || 'bot').toLowerCase();
+  const state = url.searchParams.get('state') || Math.random().toString(36).substring(2);
+  const redirectUri = `${env.WORKER_PUBLIC_URL}/oauth/callback`;
+  const scopes = actor === 'broadcaster' ? BROADCASTER_SCOPES : BOT_SCOPES;
+  
+  const auth = new URL(AUTH_URL);
+  auth.searchParams.set('client_id', env.TWITCH_CLIENT_ID);
+  auth.searchParams.set('redirect_uri', redirectUri);
+  auth.searchParams.set('response_type', 'code');
+  auth.searchParams.set('scope', scopes.join(' '));
+  auth.searchParams.set('state', `${actor}:${state}`);
+  
+  // Perform the redirect
+  return new Response(null, {
+    status: 302,
+    headers: { 'Location': auth.toString() }
+  });
+});
+
+// OAuth callback for both flows
+router.get('/oauth/callback', async (req: Request, env: Env) => {
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code');
+  const stateRaw = url.searchParams.get('state') || '';
+  const [actor] = stateRaw.split(':');
+  
+  if (!code || !actor) {
+    return json(400, { error: 'missing code/state' });
+  }
+  
+  const redirectUri = `${env.WORKER_PUBLIC_URL}/oauth/callback`;
+  
+  try {
+    const token = await exchangeCodeForToken(env, code, redirectUri);
+    const user = await getUserFromToken(env, token.access_token);
+
+    if (actor === 'bot') {
+      // Store bot tokens
+      const record = {
+        user,
+        tokens: {
+          access_token: token.access_token,
+          refresh_token: token.refresh_token || null,
+          expires_at: Date.now() + token.expires_in * 1000,
+        },
+      };
+      await env.BOT_KV.put('bot_tokens', JSON.stringify(record));
+      
+      // Redirect to success page
+      return new Response(null, { 
+        status: 302, 
+        headers: { 
+          Location: `${env.WORKER_PUBLIC_URL}/oauth/done?actor=bot&login=${user.login}` 
+        } 
+      });
+    } else {
+      // Broadcaster OAuth: enable bot for this channel using production pattern
+      try {
+        await enableChannelForUser(env, user.login, user.id);
+      } catch (e) {
+        log('warn', 'Failed to enable bot for broadcaster', { 
+          login: user.login, 
+          error: String(e) 
+        });
+      }
+
+      // Redirect back to dashboard
+      const redirect = env.SITE_BASE_URL 
+        ? `${env.SITE_BASE_URL}/dashboard?bot=enabled` 
+        : `${env.WORKER_PUBLIC_URL}/oauth/done?actor=broadcaster&login=${user.login}`;
+      
+      return new Response(null, { 
+        status: 302, 
+        headers: { Location: redirect } 
+      });
+    }
+  } catch (e: any) {
+    log('error', 'OAuth callback failed', { error: e?.message || 'unknown' });
+    return json(500, { error: e?.message || 'oauth failed' });
+  }
+});
+
+// Simple landing page after OAuth
+router.get('/oauth/done', (req: Request) => {
+  const url = new URL(req.url);
+  const actor = url.searchParams.get('actor');
+  const login = url.searchParams.get('login');
+  
+  const body = `<!doctype html>
+<meta charset="utf-8">
+<title>EloWard Bot</title>
+<body style="font-family:system-ui;padding:24px;text-align:center;max-width:600px;margin:0 auto">
+  <h2>✅ Connected ${actor}</h2>
+  <p><strong>${login}</strong> authorized successfully.</p>
+  <p>You can close this window and return to the EloWard dashboard.</p>
+  <style>body{background:#f8f9fa}h2{color:#28a745}p{color:#6c757d}</style>
+</body>`;
+  
+  return new Response(body, { 
+    headers: { 'Content-Type': 'text/html' } 
+  });
+});
+
 // CORS handling
 const allowedOrigins = [
   'https://www.eloward.com',
@@ -822,6 +1003,11 @@ const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const corsHeaders = getCorsHeaders(request);
     
+    // Handle OAuth redirects without CORS processing
+    if (request.url.includes('/oauth/')) {
+      return await router.handle(request, env, ctx).catch((e: any) => json(500, { error: 'internal', detail: e?.message }));
+    }
+
     const addCors = (res: Response) => {
       const headers = new Headers(res.headers);
       for (const [key, value] of Object.entries(corsHeaders)) {
