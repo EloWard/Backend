@@ -37,7 +37,12 @@ interface Env {
   DB: D1Database;
   SITE_BASE_URL?: string;
   BOT_WRITE_KEY?: string;
-  IRC_BOT_WEBHOOK_URL?: string; // URL for IRC bot webhook (e.g., http://35.94.69.109:3000)
+  // AWS messaging services
+  SQS_QUEUE_URL?: string;          // SQS queue URL for reliable messaging
+  REDIS_URL?: string;              // ElastiCache Redis URL for instant messaging
+  REDIS_TOKEN?: string;            // Redis authentication token
+  AWS_ACCESS_KEY_ID?: string;      // AWS credentials for SQS
+  AWS_SECRET_ACCESS_KEY?: string;  // AWS credentials for SQS
 }
 
 const router = Router();
@@ -132,49 +137,89 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
   return u as { id: string; login: string; display_name: string };
 }
 
-// Webhook notification to IRC bot for immediate channel reload
+// SQS + Redis notification to IRC bot for immediate channel reload
 async function notifyIrcBotChannelChange(env: Env, action: 'enable' | 'disable', channelLogin?: string) {
-  if (!env.IRC_BOT_WEBHOOK_URL) {
-    log('debug', 'IRC bot webhook URL not configured - skipping notification');
-    return;
-  }
+  const message = { 
+    action, 
+    channel: channelLogin, 
+    timestamp: new Date().toISOString() 
+  };
 
   try {
-    const webhookUrl = `${env.IRC_BOT_WEBHOOK_URL}/reload-channels`;
-    log('info', 'Notifying IRC bot of channel change', { action, channelLogin, webhookUrl });
-    
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        action, 
-        channel: channelLogin, 
-        timestamp: new Date().toISOString() 
-      })
-    });
+    // Send to both SQS (reliability) and Redis (speed) in parallel
+    await Promise.all([
+      sendToSQS(env, message),
+      sendToRedis(env, message)
+    ]);
 
-    if (response.ok) {
-      const result = await response.json();
-      log('info', 'IRC bot webhook notification successful', { 
-        action, 
-        channelLogin, 
-        channels: result.channels?.length || 0 
-      });
-    } else {
-      log('warn', 'IRC bot webhook notification failed', { 
-        action, 
-        channelLogin, 
-        status: response.status,
-        statusText: response.statusText 
-      });
-    }
+    log('info', 'IRC bot notification sent via SQS + Redis', { 
+      action, 
+      channelLogin 
+    });
   } catch (e) {
-    log('warn', 'IRC bot webhook notification error', { 
+    log('error', 'IRC bot notification failed', { 
       action, 
       channelLogin, 
       error: String(e) 
     });
   }
+}
+
+// Send message to SQS for guaranteed delivery
+async function sendToSQS(env: Env, message: any) {
+  if (!env.SQS_QUEUE_URL) {
+    log('debug', 'SQS not configured - skipping');
+    return;
+  }
+
+  const body = JSON.stringify(message);
+  const response = await fetch(`${env.SQS_QUEUE_URL}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-amz-json-1.0',
+      'X-Amz-Target': 'AWSSimpleQueueService.SendMessage'
+    },
+    body: JSON.stringify({
+      QueueUrl: env.SQS_QUEUE_URL,
+      MessageBody: body,
+      MessageAttributes: {
+        'ActionType': {
+          DataType: 'String',
+          StringValue: message.action
+        }
+      }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`SQS send failed: ${response.status}`);
+  }
+
+  log('info', 'Message sent to SQS', { action: message.action });
+}
+
+// Send message to Redis for instant delivery
+async function sendToRedis(env: Env, message: any) {
+  if (!env.REDIS_URL) {
+    log('debug', 'Redis not configured - skipping');
+    return;
+  }
+
+  // Use Redis REST API for Cloudflare Workers compatibility
+  const response = await fetch(`${env.REDIS_URL}/publish/eloward:bot:commands`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.REDIS_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(message)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Redis publish failed: ${response.status}`);
+  }
+
+  log('info', 'Message published to Redis', { action: message.action });
 }
 
 // Simple channel enable function - matches existing codebase patterns
