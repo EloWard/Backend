@@ -44,18 +44,39 @@ The extension and site use only the active endpoints listed below.
   - **Foreign Key**: `twitch_id` REFERENCES `users(twitch_id)` ON DELETE CASCADE
 
 ### lol_ranks
-- Purpose: Stores League of Legends rank data for Twitch viewers
+- Purpose: Stores League of Legends rank data for Twitch viewers with peak rank tracking
 - Primary Key: `riot_puuid` (TEXT)
 - Columns:
   - `riot_puuid` (TEXT): Riot player universal unique identifier (PRIMARY KEY)
   - `twitch_username` (TEXT): Twitch username (NOT NULL)
   - `riot_id` (TEXT): Riot ID (gameName#tagLine) (nullable)
-  - `rank_tier` (TEXT): Rank tier (e.g., IRON, BRONZE, SILVER) (NOT NULL)
-  - `rank_division` (TEXT): Rank division (e.g., I, II, III, IV) (nullable)
-  - `lp` (INTEGER): League points (default: 0)
+  - `rank_tier` (TEXT): Current rank tier (e.g., IRON, BRONZE, SILVER) (NOT NULL)
+  - `rank_division` (TEXT): Current rank division (e.g., I, II, III, IV) (nullable)
+  - `lp` (INTEGER): Current league points (default: 0)
   - `region` (TEXT): Riot API region (e.g., na1, euw1, kr) (nullable)
   - `last_updated` (INTEGER): Unix timestamp of last update (NOT NULL)
   - `plus_active` (BOOLEAN): Premium subscription status for badge display (default: 0)
+  - `peak_rank_tier` (TEXT): Highest rank tier achieved (nullable)
+  - `peak_rank_division` (TEXT): Highest rank division achieved (nullable)
+  - `peak_lp` (INTEGER): Highest LP achieved (nullable)
+  - `show_peak` (BOOLEAN): Whether to display peak rank instead of current rank (default: 0)
+  - `animate_badge` (BOOLEAN): Whether to show animated badge effects (default: 0)
+
+### twitch_bot_users
+- Purpose: Stores EloWardBot per-channel configuration with minimal PII
+- Primary Key: `twitch_id` (TEXT)
+- Columns:
+  - `twitch_id` (TEXT): Twitch user ID (PRIMARY KEY)
+  - `channel_name` (TEXT): Channel login name (optional, display only)
+  - `bot_enabled` (INTEGER): Whether bot is active for this channel (default: 0)
+  - `timeout_seconds` (INTEGER): Timeout duration in seconds (default: 30)
+  - `reason_template` (TEXT): Timeout message template (default includes placeholders)
+  - `ignore_roles` (TEXT): Comma-separated roles to ignore (default: "broadcaster,moderator,vip")
+  - `enforcement_mode` (TEXT): Enforcement strategy - 'has_rank' or 'min_rank' (default: 'has_rank')
+  - `min_rank_tier` (TEXT): Minimum rank tier required (e.g., 'GOLD', 'DIAMOND') (nullable)
+  - `min_rank_division` (INTEGER): Minimum rank division 1-4 for I-IV, null for Master+ (nullable)
+  - `created_at` (TIMESTAMP): When record was created (default: CURRENT_TIMESTAMP)
+  - `updated_at` (TIMESTAMP): When record was last updated (default: CURRENT_TIMESTAMP)
 
 ### stripe_events
 - Purpose: Tracks processed Stripe webhook events for idempotency protection
@@ -88,135 +109,98 @@ D1 Database
 - URL: https://eloward-riotauth.unleashai.workers.dev
 - Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`, `STRIPE_WORKER`
 - Endpoints:
-  - `POST /auth/complete` — Status: Active. Completes OAuth and stores rank (server-side only).
-  - `POST /riot/refreshrank` — Status: Active. Refreshes rank by PUUID (server-side only; no PUUID returned).
-  - `DELETE /disconnect` — Status: Active. Deletes rank by PUUID (server-side only).
-  - `GET /auth/redirect` — Status: Active. OAuth redirect handler.
+  - `POST /auth/complete` — Complete OAuth and store rank data
+  - `POST /riot/refreshrank` — Refresh rank by PUUID
+  - `DELETE /disconnect` — Delete rank data by PUUID
+  - `GET /auth/redirect` — OAuth redirect handler
 
 **Twitch Auth Worker** (`twitchauth-worker.ts`)
 - URL: https://eloward-twitchauth.unleashai.workers.dev
 - Service Bindings: `USERS_WORKER`
 - Endpoints:
-  - `GET /health` — Status: Active.
-  - `POST /twitch/auth` — Status: Active. Consolidated (code → user → register). No tokens returned to clients.
-  - `GET /auth/twitch/redirect` — Status: Active. OAuth redirect handler.
+  - `GET /health` — Health check
+  - `POST /twitch/auth` — Process Twitch OAuth and register user
+  - `GET /auth/twitch/redirect` — OAuth redirect handler
 
 #### Database Workers (Handle database operations only)
 
 **Rank Worker** (`rank-worker.js`)
 - URL: https://eloward-ranks.unleashai.workers.dev
-- Database Access: Direct D1 binding
+- Database: Direct D1 binding
 - Endpoints:
-  - `GET /api/ranks/lol/{username}` — Status: Active (public read). Returns sanitized fields; no PUUID.
-  - `POST /api/ranks/lol` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /api/ranks/lol/by-puuid` — Status: Active (read). Returns sanitized fields; no PUUID. Consider restricting to internal use.
-  - `DELETE /api/ranks/lol` — Status: Active (internal delete). Requires `X-Internal-Auth`.
+  - `GET /api/ranks/lol/{username}` — Get rank data by username
+  - `POST /api/ranks/lol` — Store/update rank (internal auth required)
+  - `POST /api/ranks/lol/by-puuid` — Get rank data by PUUID
+  - `DELETE /api/ranks/lol` — Delete rank data (internal auth required)
+  - `GET /api/options/{puuid}` — Get user display options
+  - `PUT /api/options` — Update display options (Plus required)
 
 **Users Worker** (`users-worker.js`)
 - URL: https://eloward-users.unleashai.workers.dev
-- Database Access: Direct D1 binding
+- Database: Direct D1 binding
 - Endpoints:
-  - `GET /health` — Status: Active.
-  - `POST /channelstatus/verify` — Status: Active (public read). Returns `{ active }` only.
-  - `POST /metrics/db_read` — Status: Active (public write).
-  - `POST /metrics/successful_lookup` — Status: Active (public write).
-  - `POST /user/register` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /user/lookup` — Status: Active (internal read). Requires `X-Internal-Auth`.
-  - `POST /user/riot-fallback` — Status: Active (public read). Returns consolidated riot and user data.
-  - `POST /dashboard/data_id` — Status: Active (public read). ID-based; includes user email for authenticated user.
-  - `POST /channel/active/update_id` — Status: Active (internal write). ID-based; requires `X-Internal-Auth`.
+  - `GET /health` — Health check
+  - `POST /channelstatus/verify` — Check if channel is active
+  - `POST /metrics/db_read` — Increment read counter
+  - `POST /metrics/successful_lookup` — Increment lookup counter
+  - `POST /user/register` — Register/update user (internal auth required)
+  - `POST /user/lookup` — Get user by Twitch ID (internal auth required)
+  - `POST /user/riot-fallback` — Get consolidated user + rank data
+  - `POST /dashboard/data_id` — Get dashboard data by Twitch ID
+  - `POST /channel/active/update_id` — Update channel status (internal auth required)
 
 #### Utility Workers
 
 **CDN Worker** (`cdn.js`)
 - URL: https://eloward-cdn.unleashai.workers.dev
-- Purpose: Serves rank badge images from R2 storage
+- Storage: R2 binding
 - Endpoints:
-  - `GET /{game}/{filename}` — Status: Active (public read). Static assets with long-lived caching.
+  - `GET /{game}/{filename}` — Serve badge images
 
 **Stripe Worker** (`stripe-worker.js`)
 - URL: https://eloward-stripe.unleashai.workers.dev
-- Purpose: Handles Stripe payments, webhooks, and subscription management
-- Database Access: Direct D1 binding
+- Database: Direct D1 binding
 - Endpoints:
-  - `POST /api/create-checkout-session` — Status: Active (public write). Creates checkout sessions with optional billing frequency toggle.
-  - `POST /api/create-portal-session` — Status: Active (public write).
-  - `POST /api/webhook` — Status: Active (webhook; raw body verification).
-  - `POST /subscription/status` — Status: Active (public read). Returns subscription status for badge display.
-  - `POST /subscription/upsert` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `GET /health?cleanup=true` — Status: Active (maintenance). Optional webhook event cleanup.
+  - `POST /api/create-checkout-session` — Create Stripe checkout
+  - `POST /api/create-portal-session` — Create customer portal
+  - `POST /api/webhook` — Process Stripe webhooks
+  - `POST /subscription/status` — Get subscription status
+  - `POST /subscription/upsert` — Update subscription (internal auth required)
+  - `GET /health` — Health check with optional cleanup
 
 #### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
 - URL: https://eloward-bot.unleashai.workers.dev
-- Purpose: Moderation bot control plane: OAuth, IRC ingestion, cooldowns (no EventSub/Helix in default mode)
-- Durable Objects: `BotManager` (orchestrates), `IrcShard` (cooldown), `IrcClientShard` (IRC WebSocket)
-- KV: `BOT_KV` for EloWardBot tokens
+- Architecture: Hybrid (CF Workers + AWS Lightsail IRC bot)
+- Storage: KV for bot tokens, D1 for channel config
+- Messaging: SQS + Redis for IRC bot sync
 - Endpoints:
-  - `GET /health` — Status: Active.
-  - `POST /bot/config_id` — Status: Active (public read). Returns sanitized config; omits `twitch_id`.
-  - `POST /bot/enable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /bot/disable_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /bot/config_internal` — Status: Active (internal write). Requires `X-Internal-Auth`.
-  - `POST /irc/start` / `POST /irc/reload` — Status: Active (internal). Starts/refreshes IRC client shards.
-  - `GET /bot/config/{login}` — Status: Deprecated (removed). Use `/bot/config_id`.
+  - `GET /health` — Health check with channel count
+  - `POST /bot/config_id` — Get bot config by Twitch ID
+  - `POST /dashboard/init` — Dashboard initialization data
+  - `POST /bot/enable_internal` — Enable bot (internal auth required)
+  - `POST /bot/disable_internal` — Disable bot (internal auth required)
+  - `POST /bot/config_internal` — Update bot config (internal auth required)
+  - `GET /token` — Get bot token for IRC client
+  - `POST /token/refresh` — Force token refresh
+  - `GET /channels` — List enabled channels for IRC bot
+  - `POST /check-message` — Process chat message
+  - `POST /irc/channel/add` — Enable channel
+  - `POST /irc/channel/remove` — Disable channel
+  - `GET /oauth/start` — Start OAuth flow
+  - `GET /oauth/callback` — Complete OAuth
 
-## Data Flow
+## Architecture Notes
 
-### Optimized Single-Call Riot Auth Flow (**ENHANCED** - 1 backend call)
-1. Extension → Riot OAuth (with enhanced state containing twitch_id + region)
-2. Riot → riotauth-worker `/auth/redirect` (with code + enhanced state)
-3. riotauth-worker → Complete auth processing (server-side):
-   - Exchanges code for tokens
-   - Gets PUUID from Riot Account API  
-   - Looks up channel_name from users-worker
-   - Fetches rank data from Riot League API
-   - Stores rank data via rank-worker
-4. riotauth-worker → Website redirect (with auth_complete=true)
-5. Website → Extension (via postMessage with success notification)
+- **Hybrid Bot**: Cloudflare Workers (control plane) + AWS Lightsail IRC bot
+- **Service Bindings**: Auth workers call database workers internally with `X-Internal-Auth`
+- **Peak Ranks**: Automatic tracking + OpGG seeding
+- **Token Management**: Server-side only, no client token exposure
 
-### Server-side Auth Flow (single call)
-1. Extension → `/auth/redirect`
-2. RiotAuth worker completes code exchange, fetches PUUID + rank, stores via Rank worker
-3. Website notifies extension
-
-### Rank Refresh Flow
-1. Extension → `/riot/refreshrank` (PUUID-only)
-2. RiotAuth → Rank worker lookup → Riot API → Rank worker update
-
-### Simplified Rank Refresh Flow
-1. Extension → riotauth-worker `/riot/refreshrank` (sends only PUUID)
-2. riotauth-worker → rank-worker `/api/ranks/lol/by-puuid` (looks up user data)
-3. riotauth-worker → Riot API (fetches current rank using server API key)
-4. riotauth-worker → rank-worker `/api/ranks/lol` (updates rank data)
-5. rank-worker → D1 Database
-
-### EloWard Bot Moderation Flow (IRC-only)
-1. Website dashboard → Bot worker OAuth (`/oauth/start?actor=bot`) to connect EloWardBot; tokens stored in KV
-2. Streamer connects (`/oauth/start?actor=broadcaster`) → auto-enable bot
-3. Dashboard internal toggle → `/irc/start` warms cooldowns and assigns channels to IRC client shards
-4. IrcClientShard connects to `wss://irc-ws.chat.twitch.tv` with PASS/NICK, CAP REQ tags/commands
-5. On PRIVMSG: load channel config, check rank via Ranks worker, consult cooldown DO
-6. If required: send `/timeout {user} {seconds} {reason}` as IRC PRIVMSG in-channel
-
-### User Data Flow
-1. Extension → twitchauth-worker (exchanges code server-side, no tokens returned to client)
-2. twitchauth-worker → users-worker (registers/updates user profile via internal auth)
-3. users-worker → D1 Database
-
-### Security Features
-- All client-side code only communicates with auth workers
-- Auth workers validate tokens before database operations (initial setup)
-- Database workers only accept requests from auth workers (via service bindings)
-- No direct client-to-database access
-- Token validation prevents unauthorized data manipulation
-- **ENHANCED**: Optimized single-call auth reduces backend calls from 2 to 1
-- **ENHANCED**: Enhanced state parameter with base64url encoding for security
-- **ENHANCED**: Backward compatibility with legacy state formats
-- **ENHANCED**: Graceful fallback to dual-call flow if optimization fails
-- **ENHANCED**: Server-side-only token handling reduces exposure surface
-- **ENHANCED**: Simplified refresh flow eliminates client-side token management
-- **ENHANCED**: Server-side API key usage reduces token exposure and refresh complexity
-- **ENHANCED**: PUUID-only refresh requires existing database entry (prevents unauthorized access)
+## Security
+- Service bindings prevent direct client-to-database access
+- Internal auth headers (`X-Internal-Auth`) required for write operations
+- Server-side token handling only
+- PUUID-based operations require existing database entries
 
 ##
 
@@ -242,6 +226,13 @@ D1 Database
 - INDEX: `riot_id` (for Riot ID lookups)
 - NOTE: `region` column stores Riot API region identifiers (e.g., na1, euw1, kr)
 - NOTE: `plus_active` column synced automatically from subscription changes
+- NOTE: Peak rank fields (`peak_rank_tier`, `peak_rank_division`, `peak_lp`) track historical highs
+- NOTE: Display options (`show_peak`, `animate_badge`) require Plus subscription
+
+### twitch_bot_users table
+- PRIMARY KEY: `twitch_id`
+- UNIQUE INDEX: `channel_name` (for channel lookups)
+- NOTE: Stores per-channel bot configuration and enforcement settings
 
 ### stripe_events table
 - PRIMARY KEY: `id`
