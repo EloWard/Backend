@@ -37,21 +37,22 @@ interface Env {
   DB: D1Database;
   SITE_BASE_URL?: string;
   BOT_WRITE_KEY?: string;
-  // AWS messaging services
-  SQS_QUEUE_URL?: string;          // SQS queue URL for reliable messaging
-  REDIS_URL?: string;              // ElastiCache Redis URL for instant messaging
-  REDIS_TOKEN?: string;            // Redis authentication token
-  AWS_ACCESS_KEY_ID?: string;      // AWS credentials for SQS
-  AWS_SECRET_ACCESS_KEY?: string;  // AWS credentials for SQS
+  // Production Redis for instant config updates
+  UPSTASH_REDIS_REST_URL?: string; // Redis REST API URL for Workers
+  UPSTASH_REDIS_REST_TOKEN?: string; // Redis REST API token
+  // HMAC security for bot communication
+  HMAC_SECRET?: string; // Shared secret for HMAC-signed requests from bot
 }
 
 const router = Router();
 
-// OAuth Configuration
+// OAuth Configuration - Required Helix Scopes per README
 const BOT_SCOPES = [
   'chat:read',
   'chat:edit',
-  'moderator:manage:banned_users', // Required for timeout/ban via Helix API
+  'moderator:manage:banned_users', // Required for timeout/ban actions via /moderation/bans
+  'channel:moderate', // Required for mod/broadcaster context  
+  // 'moderator:manage:chat_messages' // Optional: for message deletion if needed
 ];
 const BROADCASTER_SCOPES = ['channel:bot'];
 
@@ -137,89 +138,96 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
   return u as { id: string; login: string; display_name: string };
 }
 
-// SQS + Redis notification to IRC bot for immediate channel reload
-async function notifyIrcBotChannelChange(env: Env, action: 'enable' | 'disable', channelLogin?: string) {
-  const message = { 
-    action, 
-    channel: channelLogin, 
-    timestamp: new Date().toISOString() 
+// HMAC request validation for secure bot communication
+async function validateHmacRequest(env: Env, request: Request, body: string): Promise<boolean> {
+  if (!env.HMAC_SECRET) {
+    log('warn', 'HMAC_SECRET not configured - allowing request');
+    return true; // Allow if not configured (dev mode)
+  }
+
+  const signature = request.headers.get('X-HMAC-Signature');
+  const timestamp = request.headers.get('X-Timestamp');
+  
+  if (!signature || !timestamp) {
+    return false;
+  }
+
+  // Check timestamp window (±60s)
+  const now = Math.floor(Date.now() / 1000);
+  const requestTime = parseInt(timestamp);
+  if (Math.abs(now - requestTime) > 60) {
+    log('warn', 'HMAC request outside time window', { 
+      now, 
+      requestTime, 
+      diff: Math.abs(now - requestTime) 
+    });
+    return false;
+  }
+
+  // Verify HMAC signature using Web Crypto API
+  const method = request.method;
+  const path = new URL(request.url).pathname;
+  const payload = timestamp + method + path + body;
+  
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(env.HMAC_SECRET);
+  const messageData = encoder.encode(payload);
+  
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const signatureBuffer = await crypto.subtle.sign('HMAC', key, messageData);
+  const expectedSignature = Array.from(new Uint8Array(signatureBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  return signature === expectedSignature;
+}
+
+// Redis pub/sub for instant config propagation (1-3s target)
+async function publishConfigUpdate(env: Env, channelLogin: string, fields: any) {
+  if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
+    log('debug', 'Redis not configured - no instant updates');
+    return;
+  }
+
+  const message = {
+    type: 'config_update',
+    channel_login: channelLogin,
+    fields,
+    version: Date.now(),
+    updated_at: new Date().toISOString()
   };
 
   try {
-    // Send to both SQS (reliability) and Redis (speed) in parallel
-    await Promise.all([
-      sendToSQS(env, message),
-      sendToRedis(env, message)
-    ]);
+    const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/publish/eloward:config:updates`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(message)
+    });
 
-    log('info', 'IRC bot notification sent via SQS + Redis', { 
-      action, 
-      channelLogin 
+    if (!response.ok) {
+      throw new Error(`Redis publish failed: ${response.status}`);
+    }
+
+    log('info', 'Config update published to Redis', { 
+      channel: channelLogin, 
+      fields: Object.keys(fields) 
     });
   } catch (e) {
-    log('error', 'IRC bot notification failed', { 
-      action, 
-      channelLogin, 
+    log('error', 'Redis publish failed', { 
+      channel: channelLogin, 
       error: String(e) 
     });
   }
-}
-
-// Send message to SQS for guaranteed delivery
-async function sendToSQS(env: Env, message: any) {
-  if (!env.SQS_QUEUE_URL) {
-    log('debug', 'SQS not configured - skipping');
-    return;
-  }
-
-  const body = JSON.stringify(message);
-  const response = await fetch(`${env.SQS_QUEUE_URL}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-amz-json-1.0',
-      'X-Amz-Target': 'AWSSimpleQueueService.SendMessage'
-    },
-    body: JSON.stringify({
-      QueueUrl: env.SQS_QUEUE_URL,
-      MessageBody: body,
-      MessageAttributes: {
-        'ActionType': {
-          DataType: 'String',
-          StringValue: message.action
-        }
-      }
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`SQS send failed: ${response.status}`);
-  }
-
-  log('info', 'Message sent to SQS', { action: message.action });
-}
-
-// Send message to Redis for instant delivery
-async function sendToRedis(env: Env, message: any) {
-  if (!env.REDIS_URL) {
-    log('debug', 'Redis not configured - skipping');
-    return;
-  }
-
-  // Use Redis REST API for Cloudflare Workers compatibility
-  const response = await fetch(`${env.REDIS_URL}/publish/eloward:bot:commands`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.REDIS_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(message)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Redis publish failed: ${response.status}`);
-  }
-
-  log('info', 'Message published to Redis', { action: message.action });
 }
 
 // Simple channel enable function - matches existing codebase patterns
@@ -243,8 +251,8 @@ async function enableChannelForUser(env: Env, channel_login: string, twitch_id: 
   
   log('info', 'Channel enabled via OAuth', { login, twitch_id });
   
-  // Notify IRC bot immediately for instant channel join
-  await notifyIrcBotChannelChange(env, 'enable', login);
+  // Publish config update to Redis for instant bot notification (1-3s)
+  await publishConfigUpdate(env, login, { bot_enabled: true });
 }
 
 // Helper function to timeout user via Twitch Helix API
@@ -461,6 +469,143 @@ async function validateToken(env: Env, token: string) {
   }
 }
 
+// HMAC-secured endpoints for IRC bot communication
+router.post('/bot/config:get', async (req: Request, env: Env) => {
+  try {
+    const body = await req.text();
+    
+    // Validate HMAC signature
+    if (!(await validateHmacRequest(env, req, body))) {
+      return json(401, { error: 'Invalid HMAC signature' });
+    }
+    
+    const { channel_login } = JSON.parse(body || '{}');
+    if (!channel_login) return json(400, { error: 'channel_login required' });
+    
+    const config = await env.DB.prepare(`
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template, 
+             enforcement_mode, min_rank_tier, min_rank_division, ignore_roles
+      FROM twitch_bot_users WHERE channel_name = ?
+    `).bind(channel_login.toLowerCase()).first();
+    
+    if (!config) return json(404, { error: 'Channel not configured' });
+    
+    return json(200, {
+      channel_login: config.channel_login,
+      bot_enabled: !!config.bot_enabled,
+      timeout_seconds: config.timeout_seconds || 30,
+      reason_template: config.reason_template || '{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}',
+      enforcement_mode: config.enforcement_mode || 'has_rank',
+      min_rank_tier: config.min_rank_tier,
+      min_rank_division: config.min_rank_division,
+      ignore_roles: config.ignore_roles || 'broadcaster,moderator'
+    });
+  } catch (e: any) {
+    log('error', 'Bot config:get failed', { error: String(e) });
+    return json(500, { error: 'Config fetch failed' });
+  }
+});
+
+router.post('/bot/config:update', async (req: Request, env: Env) => {
+  try {
+    const body = await req.text();
+    
+    // Validate HMAC signature
+    if (!(await validateHmacRequest(env, req, body))) {
+      return json(401, { error: 'Invalid HMAC signature' });
+    }
+    
+    const { channel_login, fields } = JSON.parse(body || '{}');
+    if (!channel_login || !fields) {
+      return json(400, { error: 'channel_login and fields required' });
+    }
+    
+    // Build dynamic update query
+    const updates: string[] = [];
+    const values: any[] = [];
+    
+    if (fields.bot_enabled !== undefined) {
+      updates.push('bot_enabled = ?');
+      values.push(fields.bot_enabled ? 1 : 0);
+    }
+    if (fields.timeout_seconds !== undefined) {
+      updates.push('timeout_seconds = ?');
+      values.push(Number(fields.timeout_seconds) || 30);
+    }
+    if (fields.reason_template !== undefined) {
+      updates.push('reason_template = ?');
+      values.push(String(fields.reason_template).slice(0, 500));
+    }
+    if (fields.enforcement_mode !== undefined) {
+      updates.push('enforcement_mode = ?');
+      values.push(String(fields.enforcement_mode));
+    }
+    if (fields.min_rank_tier !== undefined) {
+      updates.push('min_rank_tier = ?');
+      values.push(fields.min_rank_tier);
+    }
+    if (fields.min_rank_division !== undefined) {
+      updates.push('min_rank_division = ?');
+      values.push(fields.min_rank_division);
+    }
+    
+    if (updates.length === 0) {
+      return json(400, { error: 'No valid updates provided' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    values.push(channel_login.toLowerCase());
+    
+    const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
+    await env.DB.prepare(updateQuery).bind(...values).run();
+    
+    // Publish to Redis for instant bot notification
+    await publishConfigUpdate(env, channel_login.toLowerCase(), fields);
+    
+    log('info', 'Bot config updated via HMAC', { channel_login, fields: Object.keys(fields) });
+    return json(200, { success: true, updated: Object.keys(fields) });
+  } catch (e: any) {
+    log('error', 'Bot config:update failed', { error: String(e) });
+    return json(500, { error: 'Config update failed' });
+  }
+});
+
+router.post('/rank:get', async (req: Request, env: Env) => {
+  try {
+    const body = await req.text();
+    
+    // Validate HMAC signature
+    if (!(await validateHmacRequest(env, req, body))) {
+      return json(401, { error: 'Invalid HMAC signature' });
+    }
+    
+    const { user_login } = JSON.parse(body || '{}');
+    if (!user_login) return json(400, { error: 'user_login required' });
+    
+    // Check rank via rank worker
+    const rankResponse = await env.RANK_WORKER.fetch(
+      new Request(`https://internal/api/ranks/lol/${user_login}`)
+    );
+    
+    if (rankResponse.ok) {
+      const rankData = await rankResponse.json();
+      return json(200, { 
+        has_rank: true, 
+        rank_data: rankData,
+        user_login 
+      });
+    } else {
+      return json(404, { 
+        has_rank: false, 
+        user_login 
+      });
+    }
+  } catch (e: any) {
+    log('error', 'Bot rank:get failed', { error: String(e) });
+    return json(500, { error: 'Rank check failed' });
+  }
+});
+
 // Dashboard routes
 router.post('/bot/config_id', async (req: Request, env: Env) => {
   try {
@@ -605,10 +750,10 @@ router.post('/bot/enable_internal', async (req: Request, env: Env) => {
     
     log('info', 'Bot enabled internally', { twitch_id, channel_login });
     
-    // Notify IRC bot immediately for instant channel join
+    // Publish config update to Redis for instant bot notification
     const channelName = cfg?.channel_login || channel_login;
     if (channelName) {
-      await notifyIrcBotChannelChange(env, 'enable', channelName);
+      await publishConfigUpdate(env, channelName, { bot_enabled: true });
     }
     
     return json(200, cfg);
@@ -656,10 +801,10 @@ router.post('/bot/disable_internal', async (req: Request, env: Env) => {
     
     log('info', 'Bot disabled internally', { twitch_id, channel_login });
     
-    // Notify IRC bot immediately for instant channel leave
+    // Publish config update to Redis for instant bot notification
     const channelName = cfg?.channel_login || channel_login;
     if (channelName) {
-      await notifyIrcBotChannelChange(env, 'disable', channelName);
+      await publishConfigUpdate(env, channelName, { bot_enabled: false });
     }
     
     return json(200, cfg);
@@ -754,6 +899,13 @@ router.post('/bot/config_internal', async (req: Request, env: Env) => {
     `).bind(twitch_id || '', channel_login?.toLowerCase() || '').first();
     
     log('info', 'Bot config updated internally', { twitch_id, channel_login, updates: Object.keys(patch) });
+    
+    // Publish config update to Redis for instant bot notification
+    const channelName = cfg?.channel_login || channel_login;
+    if (channelName) {
+      await publishConfigUpdate(env, channelName, patch);
+    }
+    
     return json(200, cfg);
   } catch (e: any) {
     log('error', 'Internal config update failed', { error: String(e) });
@@ -782,8 +934,8 @@ router.post('/irc/channel/add', async (req: Request, env: Env) => {
     
     log('info', 'Channel enabled in database', { channel_login, twitch_id });
     
-    // Notify IRC bot immediately for instant channel join
-    await notifyIrcBotChannelChange(env, 'enable', channel_login.toLowerCase());
+    // Publish config update to Redis for instant bot notification
+    await publishConfigUpdate(env, channel_login.toLowerCase(), { bot_enabled: true });
       
       return json(200, { 
       message: 'Channel enabled - IRC bot notified to join immediately',
@@ -815,8 +967,8 @@ router.post('/irc/channel/remove', async (req: Request, env: Env) => {
     
     log('info', 'Channel disabled in database', { channel_login });
     
-    // Notify IRC bot immediately for instant channel leave
-    await notifyIrcBotChannelChange(env, 'disable', channel_login.toLowerCase());
+    // Publish config update to Redis for instant bot notification
+    await publishConfigUpdate(env, channel_login.toLowerCase(), { bot_enabled: false });
       
       return json(200, { 
       message: 'Channel disabled - IRC bot notified to leave immediately',
@@ -828,68 +980,7 @@ router.post('/irc/channel/remove', async (req: Request, env: Env) => {
   }
 });
 
-// IRC Bot Integration - Core message processing endpoint
-router.post('/check-message', async (req: Request, env: Env) => {
-    try {
-      const { channel, user, message } = await req.json();
-      
-      if (!channel || !user) {
-        return json(400, { error: 'channel and user required' });
-      }
-      
-    // Get channel configuration
-    const config = await env.DB.prepare(`
-      SELECT * FROM twitch_bot_users 
-      WHERE channel_name = ? AND bot_enabled = 1
-    `).bind(channel.toLowerCase()).first();
-    
-      if (!config) {
-      return json(200, { action: 'skip', reason: 'channel not configured or disabled' });
-    }
-    
-    // Check user rank via rank worker
-    try {
-      const rankResponse = await env.RANK_WORKER.fetch(
-        new Request(`https://internal/api/ranks/lol/${user}`)
-      );
-      
-      if (rankResponse.ok) {
-        // User has valid rank - allow message
-        return json(200, { action: 'allow', reason: 'user has valid rank' });
-      } else {
-        // User lacks required rank - timeout
-        const duration = config.timeout_seconds || 20;
-        const reason = (config.reason_template || "{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}")
-          .replace('{seconds}', String(duration))
-          .replace('{site}', env.SITE_BASE_URL || 'https://www.eloward.com')
-          .replace('{user}', user);
-        
-        // Execute timeout via Helix API
-        await timeoutUser(env, channel, user, duration, reason);
-        
-      return json(200, { 
-          action: 'timeout', 
-          reason: 'insufficient rank', 
-          duration 
-        });
-      }
-    } catch (e) {
-      log('error', 'Rank check failed', { user, error: String(e) });
-      // On rank check failure, assume no rank and timeout
-      const duration = config.timeout_seconds || 20;
-      const reason = (config.reason_template || "{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}")
-        .replace('{seconds}', String(duration))
-        .replace('{site}', env.SITE_BASE_URL || 'https://www.eloward.com')
-        .replace('{user}', user);
-      
-      await timeoutUser(env, channel, user, duration, reason);
-      return json(200, { action: 'timeout', reason: 'rank check failed', duration });
-    }
-  } catch (e: any) {
-    log('error', 'Message check failed', { error: String(e) });
-    return json(500, { error: 'message processing failed' });
-  }
-});
+// Legacy endpoint - removed in favor of bot-side processing with caching
 
 // PRODUCTION TOKEN ENDPOINT - IRC Bot Token Sync
 router.get('/token', async (req: Request, env: Env) => {
