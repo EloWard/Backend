@@ -70,7 +70,7 @@ The extension and site use only the active endpoints listed below.
   - `channel_name` (TEXT): Channel login name (optional, display only)
   - `bot_enabled` (INTEGER): Whether bot is active for this channel (default: 0)
   - `timeout_seconds` (INTEGER): Timeout duration in seconds (default: 30)
-  - `reason_template` (TEXT): Timeout message template (default includes placeholders)
+  - `reason_template` (TEXT): Timeout message template (default: "not enough elo to speak. type !eloward")
   - `ignore_roles` (TEXT): Comma-separated roles to ignore (default: "broadcaster,moderator,vip")
   - `enforcement_mode` (TEXT): Enforcement strategy - 'has_rank' or 'min_rank' (default: 'has_rank')
   - `min_rank_tier` (TEXT): Minimum rank tier required (e.g., 'GOLD', 'DIAMOND') (nullable)
