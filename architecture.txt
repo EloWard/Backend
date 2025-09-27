@@ -182,7 +182,7 @@ D1 Database
   - `POST /bot/config_internal` — Update bot config (internal auth required)
   - `GET /token` — Get bot token for IRC client
   - `POST /token/refresh` — Force token refresh
-  - `GET /channels` — List enabled channels for IRC bot
+  - `GET /channels` — List ALL channels for IRC bot (always-on presence model)
   - `POST /check-message` — Process chat message
   - `POST /irc/channel/add` — Enable channel
   - `POST /irc/channel/remove` — Disable channel

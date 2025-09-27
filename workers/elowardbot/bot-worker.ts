@@ -1053,10 +1053,10 @@ router.post('/token/refresh', async (req: Request, env: Env) => {
 
 router.get('/channels', async (_req: Request, env: Env) => {
   try {
-    // Get enabled channels from database for IRC bot
+    // Get ALL channels from database for IRC bot (always-on presence model)
+    // Bot joins all channels and operates in Standby/Enforcing mode per channel config
     const result = await env.DB.prepare(`
       SELECT channel_name FROM twitch_bot_users 
-      WHERE bot_enabled = 1 
       ORDER BY channel_name
     `).all();
     
@@ -1076,9 +1076,9 @@ router.get('/channels', async (_req: Request, env: Env) => {
 // Legacy endpoint - kept for backward compatibility but webhooks are now primary method
 router.post('/channels/reload', async (_req: Request, env: Env) => {
   try {
+    // Always-on presence model: return ALL channels, bot manages Standby/Enforcing per channel
     const result = await env.DB.prepare(`
       SELECT channel_name FROM twitch_bot_users 
-      WHERE bot_enabled = 1 
       ORDER BY channel_name
     `).all();
     
