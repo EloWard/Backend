@@ -554,10 +554,18 @@ router.post('/bot/config:update', async (req: Request, env: Env) => {
     }
     
     updates.push('updated_at = CURRENT_TIMESTAMP');
-    values.push(channel_login.toLowerCase());
     
     const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
-    await env.DB.prepare(updateQuery).bind(...values).run();
+    const result = await env.DB.prepare(updateQuery).bind(...values, channel_login.toLowerCase()).run();
+    
+    // Verify update succeeded
+    if (!result.success || (result.meta?.changes === 0)) {
+      log('warn', 'Config update matched no rows', { 
+        channel_login, 
+        query: updateQuery.substring(0, 100),
+        changes: result.meta?.changes 
+      });
+    }
     
     // Publish to Redis for instant bot notification
     await publishConfigUpdate(env, channel_login.toLowerCase(), fields);
