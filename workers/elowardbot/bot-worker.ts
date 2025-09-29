@@ -478,7 +478,7 @@ async function validateToken(env: Env, token: string) {
 }
 
 // HMAC-secured endpoints for IRC bot communication
-router.post('/bot/config:get', async (req: Request, env: Env) => {
+router.post('/bot/config-get', async (req: Request, env: Env) => {
   console.log("🔍 CONFIG:GET ENDPOINT CALLED");
   try {
     const body = await req.text();
@@ -515,7 +515,7 @@ router.post('/bot/config:get', async (req: Request, env: Env) => {
   }
 });
 
-router.post('/bot/config:update', async (req: Request, env: Env) => {
+router.post('/bot/config-update', async (req: Request, env: Env) => {
   console.log("🚨 ENDPOINT CALLED: /bot/config:update");
   console.log("🔥 STARTING EXECUTION - About to read body");
   console.log("🔧 ENV CHECK:", typeof env, typeof env.DB, typeof env.HMAC_SECRET);
