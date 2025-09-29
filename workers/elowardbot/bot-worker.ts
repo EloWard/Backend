@@ -555,16 +555,39 @@ router.post('/bot/config:update', async (req: Request, env: Env) => {
     
     updates.push('updated_at = CURRENT_TIMESTAMP');
     
-    const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
-    const result = await env.DB.prepare(updateQuery).bind(...values, channel_login.toLowerCase()).run();
+    // Try to find the user record first to get the correct identifiers
+    const userRecord = await env.DB.prepare(`
+      SELECT twitch_id, channel_name FROM twitch_bot_users 
+      WHERE channel_name = ? OR LOWER(channel_name) = LOWER(?)
+    `).bind(channel_login.toLowerCase(), channel_login).first();
+
+    let result;
+    if (userRecord) {
+      // Update using the twitch_id from the found record (most reliable)
+      const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE twitch_id = ?`;
+      result = await env.DB.prepare(updateQuery).bind(...values, userRecord.twitch_id).run();
+      
+      log('info', 'Config update using twitch_id', { 
+        channel_login, 
+        twitch_id: userRecord.twitch_id,
+        db_channel_name: userRecord.channel_name
+      });
+    } else {
+      // Fallback to channel_name lookup (as before)
+      const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
+      result = await env.DB.prepare(updateQuery).bind(...values, channel_login.toLowerCase()).run();
+      
+      log('warn', 'Config update using channel_name fallback', { channel_login });
+    }
     
     // Verify update succeeded
     if (!result.success || (result.meta?.changes === 0)) {
-      log('warn', 'Config update matched no rows', { 
+      log('error', 'Config update matched no rows', { 
         channel_login, 
-        query: updateQuery.substring(0, 100),
+        userRecord: userRecord ? 'found' : 'not_found',
         changes: result.meta?.changes 
       });
+      return json(404, { error: 'Channel configuration not found' });
     }
     
     // Publish to Redis for instant bot notification
