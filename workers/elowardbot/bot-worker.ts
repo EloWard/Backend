@@ -140,20 +140,14 @@ async function getUserFromToken(env: Env, userAccessToken: string) {
 
 // HMAC request validation for secure bot communication
 async function validateHmacRequest(env: Env, request: Request, body: string): Promise<boolean> {
-  console.log("🔐 HMAC VALIDATION START");
-  
   if (!env.HMAC_SECRET) {
-    console.log("⚠️ HMAC_SECRET not configured - allowing request");
     return true; // Allow if not configured (dev mode)
   }
 
   const signature = request.headers.get('X-HMAC-Signature');
   const timestamp = request.headers.get('X-Timestamp');
   
-  console.log(`🔍 HMAC Headers - Signature: ${signature ? 'present' : 'missing'}, Timestamp: ${timestamp ? timestamp : 'missing'}`);
-  
   if (!signature || !timestamp) {
-    console.log("❌ HMAC FAIL: Missing headers");
     return false;
   }
 
@@ -191,10 +185,7 @@ async function validateHmacRequest(env: Env, request: Request, body: string): Pr
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 
-  const isValid = signature === expectedSignature;
-  console.log(`🔐 HMAC Result - Valid: ${isValid}, Expected: ${expectedSignature.substring(0, 16)}..., Got: ${signature.substring(0, 16)}...`);
-  
-  return isValid;
+  return signature === expectedSignature;
 }
 
 // Redis pub/sub for instant config propagation (1-3s target)
@@ -479,7 +470,6 @@ async function validateToken(env: Env, token: string) {
 
 // HMAC-secured endpoints for IRC bot communication
 router.post('/bot/config-get', async (req: Request, env: Env) => {
-  console.log("🔍 CONFIG:GET ENDPOINT CALLED");
   try {
     const body = await req.text();
     
@@ -516,21 +506,15 @@ router.post('/bot/config-get', async (req: Request, env: Env) => {
 });
 
 router.post('/bot/config-update', async (req: Request, env: Env) => {
-  console.log("🚨 ENDPOINT CALLED: /bot/config:update");
-  console.log("🔥 STARTING EXECUTION - About to read body");
-  console.log("🔧 ENV CHECK:", typeof env, typeof env.DB, typeof env.HMAC_SECRET);
   try {
     const body = await req.text();
-    console.log(`📝 BODY READ SUCCESSFULLY: "${body}"`);
     
     // Validate HMAC signature
     if (!(await validateHmacRequest(env, req, body))) {
       return json(401, { error: 'Invalid HMAC signature' });
     }
     
-    console.log("✅ HMAC VALIDATION PASSED - Parsing JSON");
     const { channel_login, fields } = JSON.parse(body || '{}');
-    console.log(`🎯 PARSED DATA - Channel: ${channel_login}, Fields: ${JSON.stringify(fields)}`);
     if (!channel_login || !fields) {
       return json(400, { error: 'channel_login and fields required' });
     }
@@ -570,33 +554,22 @@ router.post('/bot/config-update', async (req: Request, env: Env) => {
     
     updates.push('updated_at = CURRENT_TIMESTAMP');
     
-    // Debug: Log the raw request data
-    console.log(`🔧 CONFIG:UPDATE REQUEST - Channel: ${channel_login}, Fields: ${Object.keys(fields).join(',')}, Updates: ${updates.length}`);
-    
     // Try to find the user record first to get the correct identifiers
     const lookupQuery = `SELECT twitch_id, channel_name FROM twitch_bot_users WHERE channel_name = ? OR LOWER(channel_name) = LOWER(?)`;
     const userRecord = await env.DB.prepare(lookupQuery).bind(channel_login.toLowerCase(), channel_login).first();
 
-    console.log(`🔍 DATABASE LOOKUP - Channel: ${channel_login}, Found: ${!!userRecord}, DB Name: ${userRecord?.channel_name}, DB ID: ${userRecord?.twitch_id}`);
-
     let result;
-    let updateQuery;
     if (userRecord) {
       // Update using the twitch_id from the found record (most reliable)
-      updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE twitch_id = ?`;
+      const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE twitch_id = ?`;
       const bindValues = [...values, userRecord.twitch_id];
-      console.log(`🚀 EXECUTING UPDATE - Query: ${updateQuery}, Values: ${bindValues.length}, ID: ${userRecord.twitch_id}`);
       result = await env.DB.prepare(updateQuery).bind(...bindValues).run();
     } else {
       // Fallback to channel_name lookup (as before)
-      updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
+      const updateQuery = `UPDATE twitch_bot_users SET ${updates.join(', ')} WHERE channel_name = ?`;
       const bindValues = [...values, channel_login.toLowerCase()];
-      console.log(`⚠️ FALLBACK UPDATE - Query: ${updateQuery}, Values: ${bindValues.length}, Name: ${channel_login.toLowerCase()}`);
       result = await env.DB.prepare(updateQuery).bind(...bindValues).run();
     }
-    
-    // Debug: Log the result details
-    console.log(`📊 UPDATE RESULT - Success: ${result.success}, Changes: ${result.meta?.changes}, Duration: ${result.meta?.duration}ms`);
     
     // Verify update succeeded
     if (!result.success || (result.meta?.changes === 0)) {
@@ -604,9 +577,7 @@ router.post('/bot/config-update', async (req: Request, env: Env) => {
         channel_login, 
         user_found: !!userRecord,
         changes: result.meta?.changes,
-        success: result.success,
-        query: updateQuery,
-        updates: updates
+        success: result.success
       });
       return json(404, { error: 'Channel configuration not found' });
     }
@@ -614,11 +585,9 @@ router.post('/bot/config-update', async (req: Request, env: Env) => {
     // Publish to Redis for instant bot notification
     await publishConfigUpdate(env, channel_login.toLowerCase(), fields);
     
-    console.log("🏁 ENDPOINT COMPLETING SUCCESSFULLY");
     log('info', 'Bot config updated via HMAC', { channel_login, fields: Object.keys(fields) });
     return json(200, { success: true, updated: Object.keys(fields) });
   } catch (e: any) {
-    console.log(`💥 ENDPOINT ERROR: ${String(e)}`);
     log('error', 'Bot config:update failed', { error: String(e) });
     return json(500, { error: 'Config update failed' });
   }
@@ -1153,12 +1122,6 @@ router.post('/channels/reload', async (_req: Request, env: Env) => {
 // Basic health check endpoint
 router.get('/health', () => json(200, { status: 'ok', service: 'eloward-bot' }));
 
-// Debug test route
-router.post('/test-route', async (req: Request, env: Env) => {
-  console.log("🧪 TEST ROUTE CALLED!");
-  return json(200, { message: 'Test route works!' });
-});
-
 // Debug endpoint to check database state for a specific channel
 router.get('/debug/:channel', async (req: Request, env: Env) => {
   try {
@@ -1321,23 +1284,6 @@ function getCorsHeaders(request: Request) {
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // Debug: Log ALL incoming requests to see what's reaching the worker
-    const url = new URL(request.url);
-    console.log(`🌐 INCOMING REQUEST - Method: ${request.method}, Path: ${url.pathname}, Origin: ${request.headers.get('Origin') || 'none'}`);
-    
-    // Log raw request details for /bot/config:update
-    if (url.pathname === '/bot/config:update') {
-      console.log(`📧 RAW REQUEST DETAILS:`);
-      console.log(`   URL: ${request.url}`);
-      console.log(`   Method: ${request.method}`);
-      console.log(`   Headers:`, Object.fromEntries(request.headers.entries()));
-      
-      // Clone request to read body without consuming it
-      const requestClone = request.clone();
-      const body = await requestClone.text();
-      console.log(`   Body: "${body}"`);
-    }
-    
     const corsHeaders = getCorsHeaders(request);
     
     // Handle OAuth redirects without CORS processing
@@ -1359,21 +1305,10 @@ const worker = {
 
     if (request.method === 'OPTIONS') return addCors(json(200, {}));
     
-    console.log(`🎯 About to call router.handle for ${url.pathname}`);
-    
-    // Test if our route is properly registered
-    if (url.pathname === '/bot/config:update') {
-      console.log(`🔍 TESTING ROUTE REGISTRATION FOR /bot/config:update`);
-      console.log(`🧪 Router object type: ${typeof router}`);
-      console.log(`🧪 Router has handle method: ${typeof router.handle}`);
-    }
-    
     const res = await router.handle(request, env, ctx).catch((e: any) => {
-      console.log(`💥 ROUTER ERROR: ${String(e)}`);
-      console.log(`💥 ERROR STACK: ${e.stack}`);
+      log('error', 'Router error', { error: String(e), path: new URL(request.url).pathname });
       return json(500, { error: 'internal', detail: e?.message });
     });
-    console.log(`✅ Router returned status: ${res.status}`);
     return addCors(res);
   },
 
