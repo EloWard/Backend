@@ -236,7 +236,7 @@ async function enableChannelForUser(env: Env, channel_login: string, twitch_id: 
   // Try UPDATE first (for existing channels)
   const result = await env.DB.prepare(`
     UPDATE twitch_bot_users 
-    SET bot_enabled = 1, updated_at = CURRENT_TIMESTAMP
+    SET bot_enabled = 0, updated_at = CURRENT_TIMESTAMP
     WHERE twitch_id = ?
   `).bind(twitch_id).run();
   
@@ -244,95 +244,15 @@ async function enableChannelForUser(env: Env, channel_login: string, twitch_id: 
   if ((result as any)?.meta?.changes === 0) {
     await env.DB.prepare(`
       INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode)
-      VALUES (?, ?, 1, 30, "not enough elo to speak. type !eloward", "broadcaster,moderator,vip", "has_rank")
+      VALUES (?, ?, 0, 30, "not enough elo to speak. type !eloward", "broadcaster,moderator,vip", "has_rank")
     `).bind(twitch_id, login).run();
   }
   
-  log('info', 'Channel enabled via OAuth', { login, twitch_id });
-  
-  // Publish config update to Redis for instant bot notification (1-3s)
-  await publishConfigUpdate(env, login, { bot_enabled: true });
+  log('info', 'Channel connected via OAuth (default disabled)', { login, twitch_id });
+  // Optional: broadcast standby state to IRC bot (not strictly required)
+  await publishConfigUpdate(env, login, { bot_enabled: false });
 }
 
-// Helper function to timeout user via Twitch Helix API
-async function timeoutUser(env: Env, channelLogin: string, userLogin: string, duration: number, reason: string) {
-  try {
-    // Get bot credentials
-    const bot = await getBotUserAndToken(env);
-    if (!bot?.access || !bot?.user?.id) {
-      log('error', 'Bot credentials not available for timeout', { channel: channelLogin, user: userLogin });
-      return;
-    }
-    
-    // Get channel ID from database
-    const channelData = await env.DB.prepare(`
-      SELECT twitch_id FROM twitch_bot_users WHERE channel_name = ?
-    `).bind(channelLogin).first();
-    
-    if (!channelData?.twitch_id) {
-      log('error', 'Channel ID not found for timeout', { channel: channelLogin, user: userLogin });
-      return;
-    }
-    
-    // Get user ID from Twitch API
-    const userResponse = await fetch(`https://api.twitch.tv/helix/users?login=${userLogin}`, {
-      headers: {
-        'Authorization': `Bearer ${bot.access}`,
-        'Client-Id': env.TWITCH_CLIENT_ID,
-      },
-    });
-    
-    if (!userResponse.ok) {
-      log('error', 'Failed to get user ID for timeout', { user: userLogin, status: userResponse.status });
-      return;
-    }
-    
-    const userData = await userResponse.json();
-    const userId = userData.data?.[0]?.id;
-    if (!userId) {
-      log('error', 'User not found for timeout', { user: userLogin });
-      return;
-    }
-    
-    // Execute timeout via Helix API
-    const timeoutResponse = await fetch(
-      `https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${channelData.twitch_id}&moderator_id=${bot.user.id}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${bot.access}`,
-          'Client-Id': env.TWITCH_CLIENT_ID,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          data: {
-            user_id: userId,
-            duration,
-            reason,
-          },
-        }),
-      }
-    );
-    
-    if (timeoutResponse.ok) {
-      log('info', 'User timeout successful', { channel: channelLogin, user: userLogin, duration });
-    } else {
-      const errorText = await timeoutResponse.text();
-      log('error', 'User timeout failed', { 
-        channel: channelLogin, 
-        user: userLogin, 
-        status: timeoutResponse.status,
-        error: errorText 
-      });
-    }
-  } catch (e) {
-    log('error', 'Timeout process failed', { 
-      channel: channelLogin, 
-      user: userLogin, 
-      error: String(e) 
-    });
-  }
-}
 
 // Token management
 async function getBotUserAndToken(env: Env) {
