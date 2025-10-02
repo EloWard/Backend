@@ -177,13 +177,16 @@ D1 Database
   - `GET /health` — Health check with channel count
   - `POST /bot/config_id` — Get bot config by Twitch ID
   - `POST /dashboard/init` — Dashboard initialization data
+  - `POST /bot/config-get` — Get bot config (HMAC signed, used by IRC bot)
   - `POST /bot/config-update` — Update bot config (HMAC signed, used by Pages Function)
+  - `POST /rank:get` — Get rank data for user (HMAC signed, used by IRC bot)
   - `GET /token` — Get bot token for IRC client
   - `GET /channels` — List ALL channels for IRC bot (always-on presence with anti-spam rate limiting)
   - `POST /irc/channel/add` — Enable channel
   - `POST /irc/channel/remove` — Disable channel
   - `GET /oauth/start` — Start OAuth flow
   - `GET /oauth/callback` — Complete OAuth
+  - `GET /oauth/done` — OAuth completion landing page
 
 ## Architecture Notes
 
