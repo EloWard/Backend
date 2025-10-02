@@ -177,13 +177,9 @@ D1 Database
   - `GET /health` — Health check with channel count
   - `POST /bot/config_id` — Get bot config by Twitch ID
   - `POST /dashboard/init` — Dashboard initialization data
-  - `POST /bot/enable_internal` — Enable bot (internal auth required)
-  - `POST /bot/disable_internal` — Disable bot (internal auth required)
-  - `POST /bot/config_internal` — Update bot config (internal auth required)
+  - `POST /bot/config-update` — Update bot config (HMAC signed, used by Pages Function)
   - `GET /token` — Get bot token for IRC client
-  - `POST /token/refresh` — Force token refresh
   - `GET /channels` — List ALL channels for IRC bot (always-on presence with anti-spam rate limiting)
-  - `POST /check-message` — Process chat message
   - `POST /irc/channel/add` — Enable channel
   - `POST /irc/channel/remove` — Disable channel
   - `GET /oauth/start` — Start OAuth flow

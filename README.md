@@ -57,8 +57,8 @@ See `architecture.txt` for a deeper overview of routes, flows, and database sche
   - Key endpoints:
     - `GET /health`
     - `POST /bot/config_id` – Fetch config by Twitch ID
-    - `POST /bot/enable_internal` / `POST /bot/disable_internal` / `POST /bot/config_internal`
-    - `POST /irc/start` / `POST /irc/reload` – Bootstrap and reload IRC shards
+    - `POST /bot/config-update` — Update bot config (HMAC signed)
+    - `GET /channels` — List channels for IRC bot
   - Durable Objects: `BotManager` (orchestration), `IrcShard` (cooldowns), `IrcClientShard` (IRC WebSocket client)
 
 ## Local Development
