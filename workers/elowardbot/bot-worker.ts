@@ -229,8 +229,8 @@ async function publishConfigUpdate(env: Env, channelLogin: string, fields: any) 
   }
 }
 
-// Simple channel enable function - matches existing codebase patterns
-async function enableChannelForUser(env: Env, channel_login: string, twitch_id: string) {
+// Simple channel connect function - matches existing codebase patterns
+async function connectChannel(env: Env, channel_login: string, twitch_id: string) {
   const login = channel_login.toLowerCase();
   
   // Try UPDATE first (for existing channels)
@@ -1135,7 +1135,7 @@ router.get('/oauth/callback', async (req: Request, env: Env) => {
       } else {
       // Broadcaster OAuth: enable bot for this channel using production pattern
       try {
-        await enableChannelForUser(env, user.login, user.id);
+        await connectChannel(env, user.login, user.id);
         log('info', 'Broadcaster OAuth completed successfully', { login: user.login });
     } catch (e) {
         log('warn', 'Failed to enable bot for broadcaster', { 
