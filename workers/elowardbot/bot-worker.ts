@@ -243,8 +243,16 @@ async function connectChannel(env: Env, channel_login: string, twitch_id: string
   // If no rows updated, INSERT new channel record with defaults
   if ((result as any)?.meta?.changes === 0) {
     await env.DB.prepare(`
-      INSERT INTO twitch_bot_users (twitch_id, channel_name, bot_enabled, timeout_seconds, reason_template, ignore_roles, enforcement_mode)
-      VALUES (?, ?, 0, 30, "not enough elo to speak. type !eloward", "broadcaster,moderator,vip", "has_rank")
+      INSERT INTO twitch_bot_users (
+        twitch_id, channel_name, bot_enabled, timeout_seconds,
+        reason_has_rank, reason_min_rank,
+        ignore_roles, enforcement_mode
+      ) VALUES (
+        ?, ?, 0, 30,
+        "link your rank, go to eloward.com",
+        "you must be at least {tier}{division} to type",
+        "broadcaster,moderator,vip", "has_rank"
+      )
     `).bind(twitch_id, login).run();
   }
   
@@ -402,7 +410,8 @@ router.post('/bot/config-get', async (req: Request, env: Env) => {
     if (!channel_login) return json(400, { error: 'channel_login required' });
     
     const config = await env.DB.prepare(`
-      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template, 
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds,
+             reason_has_rank, reason_min_rank,
              enforcement_mode, min_rank_tier, min_rank_division, ignore_roles
       FROM twitch_bot_users WHERE channel_name = ?
     `).bind(channel_login.toLowerCase()).first();
@@ -413,7 +422,8 @@ router.post('/bot/config-get', async (req: Request, env: Env) => {
       channel_login: config.channel_login,
       bot_enabled: !!config.bot_enabled,
       timeout_seconds: config.timeout_seconds || 30,
-      reason_template: config.reason_template || 'not enough elo to speak. type !eloward',
+      reason_has_rank: config.reason_has_rank || 'link your rank, go to eloward.com',
+      reason_min_rank: config.reason_min_rank || 'you must be at least {tier}{division} to type',
       enforcement_mode: config.enforcement_mode || 'has_rank',
       min_rank_tier: config.min_rank_tier,
       min_rank_division: config.min_rank_division,
@@ -451,9 +461,13 @@ router.post('/bot/config-update', async (req: Request, env: Env) => {
       updates.push('timeout_seconds = ?');
       values.push(Number(fields.timeout_seconds) || 30);
     }
-    if (fields.reason_template !== undefined) {
-      updates.push('reason_template = ?');
-      values.push(String(fields.reason_template).slice(0, 500));
+    if (fields.reason_has_rank !== undefined) {
+      updates.push('reason_has_rank = ?');
+      values.push(String(fields.reason_has_rank).slice(0, 500));
+    }
+    if (fields.reason_min_rank !== undefined) {
+      updates.push('reason_min_rank = ?');
+      values.push(String(fields.reason_min_rank).slice(0, 500));
     }
     if (fields.enforcement_mode !== undefined) {
       updates.push('enforcement_mode = ?');
@@ -557,7 +571,8 @@ router.post('/bot/config_id', async (req: Request, env: Env) => {
     if (!twitch_id) return json(400, { error: 'twitch_id required' });
     
     const cfg = await env.DB.prepare(`
-      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template, 
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds,
+             reason_has_rank, reason_min_rank,
              enforcement_mode, min_rank_tier, min_rank_division
       FROM twitch_bot_users WHERE twitch_id = ?
     `).bind(twitch_id).first();
@@ -577,7 +592,8 @@ router.post('/dashboard/init', async (req: Request, env: Env) => {
     if (!twitch_id) return json(400, { error: 'twitch_id required' });
     
     const cfg = await env.DB.prepare(`
-      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds, reason_template,
+      SELECT channel_name AS channel_login, bot_enabled, timeout_seconds,
+             reason_has_rank, reason_min_rank,
              enforcement_mode, min_rank_tier, min_rank_division
       FROM twitch_bot_users WHERE twitch_id = ?
     `).bind(twitch_id).first();
@@ -586,7 +602,8 @@ router.post('/dashboard/init', async (req: Request, env: Env) => {
       channel_login: cfg.channel_login,
       bot_enabled: !!cfg.bot_enabled,
       timeout_seconds: cfg.timeout_seconds,
-      reason_template: cfg.reason_template,
+      reason_has_rank: cfg.reason_has_rank || 'link your rank, go to eloward.com',
+      reason_min_rank: cfg.reason_min_rank || 'you must be at least {tier}{division} to type',
       enforcement_mode: cfg.enforcement_mode || 'has_rank',
       min_rank_tier: cfg.min_rank_tier || null,
       min_rank_division: cfg.min_rank_division ?? null

@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS twitch_bot_users (
   channel_name TEXT,                           -- optional, display only
   bot_enabled INTEGER DEFAULT 0,
   timeout_seconds INTEGER DEFAULT 30,
-  reason_template TEXT DEFAULT "not enough elo to speak. type !eloward",
+  reason_has_rank TEXT DEFAULT "link your rank, go to eloward.com",
+  reason_min_rank TEXT DEFAULT "you must be at least {tier}{division} to type",
   ignore_roles TEXT DEFAULT "broadcaster,moderator,vip",
   enforcement_mode TEXT DEFAULT 'has_rank',    -- 'has_rank' | 'min_rank'
   min_rank_tier TEXT,                          -- e.g., 'GOLD', 'DIAMOND', 'MASTER'
