@@ -52,7 +52,7 @@ const BOT_SCOPES = [
   'chat:edit',
   'moderator:manage:banned_users', // Required for timeout/ban actions via /moderation/bans
   'channel:moderate', // Required for mod/broadcaster context
-  'user:edit:follows', // Required for auto-following channels
+  // Note: 'user:edit:follows' removed - Twitch deprecated programmatic follow API in July 2021
   // 'moderator:manage:chat_messages' // Optional: for message deletion if needed
 ];
 const BROADCASTER_SCOPES = ['channel:bot'];
@@ -756,81 +756,6 @@ router.get('/channels', async (_req: Request, env: Env) => {
   }
 });
 
-// Auto-follow endpoint for IRC bot (HMAC-secured)
-router.post('/bot/follow-channel', async (req: Request, env: Env) => {
-  try {
-    const body = await req.text();
-    
-    // Validate HMAC signature
-    if (!(await validateHmacRequest(env, req, body))) {
-      return json(401, { error: 'Invalid HMAC signature' });
-    }
-    
-    const { channel_login } = JSON.parse(body || '{}');
-    if (!channel_login) return json(400, { error: 'channel_login required' });
-    
-    // Get bot token
-    const tokenData = await getBotUserAndToken(env);
-    if (!tokenData?.access || !tokenData?.user) {
-      return json(500, { error: 'No valid bot token available' });
-    }
-    
-    // Get channel's user ID
-    const channelInfoResponse = await fetch(
-      `https://api.twitch.tv/helix/users?login=${encodeURIComponent(channel_login)}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${tokenData.access}`,
-          'Client-Id': env.TWITCH_CLIENT_ID
-        }
-      }
-    );
-    
-    if (!channelInfoResponse.ok) {
-      return json(500, { error: 'Failed to get channel info' });
-    }
-    
-    const channelData = await channelInfoResponse.json();
-    const channelUserId = channelData.data?.[0]?.id;
-    
-    if (!channelUserId) {
-      return json(404, { error: 'Channel not found' });
-    }
-    
-    // Follow the channel
-    const followResponse = await fetch(
-      `https://api.twitch.tv/helix/users/follows`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${tokenData.access}`,
-          'Client-Id': env.TWITCH_CLIENT_ID,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from_id: tokenData.user.id,
-          to_id: channelUserId
-        })
-      }
-    );
-    
-    if (followResponse.ok || followResponse.status === 204) {
-      log('info', 'Bot followed channel', { channel_login });
-      return json(200, { success: true, channel_login });
-    } else {
-      const errorData = await followResponse.text();
-      log('warn', 'Follow failed', { 
-        channel_login, 
-        status: followResponse.status, 
-        error: errorData 
-      });
-      return json(followResponse.status, { error: 'Follow failed', detail: errorData });
-    }
-  } catch (e: any) {
-    log('error', 'Follow endpoint error', { error: String(e) });
-    return json(500, { error: 'Follow failed', detail: e?.message });
-  }
-});
 
 // Legacy channel reload endpoint removed - IRC bot uses /channels endpoint
 
