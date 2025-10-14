@@ -96,6 +96,14 @@ const usersWorker = {
         response = request.method === 'POST'
           ? await handleRiotDataFallback(request, env, corsHeaders)
           : new Response('Method Not Allowed', { status: 405 });
+      } else if (url.pathname.includes('/view/qualify')) {
+        response = request.method === 'POST'
+          ? await handleViewerQualify(request, env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
+      } else if (url.pathname === '/view/health') {
+        response = request.method === 'GET'
+          ? await handleViewerHealth(env, corsHeaders)
+          : new Response('Method Not Allowed', { status: 405 });
       } else if (url.pathname.includes('/health')) {
         response = new Response(JSON.stringify({ status: 'ok' }), {
           headers: { 'Content-Type': 'application/json' }
@@ -490,6 +498,141 @@ async function handleUserLookup(request, env, corsHeaders) {
       error.message === 'Invalid JSON' ? null : error.message,
       corsHeaders
     );
+  }
+}
+
+/**
+ * Helper function to get current viewer tracking window start date
+ * Windows reset at 07:00 UTC daily
+ * @returns {string} YYYY-MM-DD format date for current window
+ */
+function getCurrentViewerWindow() {
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  
+  // If before 07:00 UTC, we're still in yesterday's window
+  if (utcHour < 7) {
+    now.setUTCDate(now.getUTCDate() - 1);
+  }
+  
+  // Format as YYYY-MM-DD
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(now.getUTCDate()).padStart(2, '0');
+  
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Validates stat_date is current or previous window
+ * @param {string} statDate - Date to validate in YYYY-MM-DD format
+ * @returns {boolean} Whether the date is valid
+ */
+function isValidStatDate(statDate) {
+  if (!statDate || !/^\d{4}-\d{2}-\d{2}$/.test(statDate)) {
+    return false;
+  }
+  
+  const currentWindow = getCurrentViewerWindow();
+  const yesterday = new Date();
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const previousWindow = `${yesterday.getUTCFullYear()}-${String(yesterday.getUTCMonth() + 1).padStart(2, '0')}-${String(yesterday.getUTCDate()).padStart(2, '0')}`;
+  
+  return statDate === currentWindow || statDate === previousWindow;
+}
+
+/**
+ * Handles viewer qualification tracking
+ * Records when a viewer has watched a channel for 5+ minutes
+ */
+async function handleViewerQualify(request, env, corsHeaders) {
+  try {
+    const body = await parseRequestBody(request);
+    const { stat_date, channel_twitch_id, riot_puuid } = body;
+    
+    // Validate required fields
+    if (!stat_date || !channel_twitch_id || !riot_puuid) {
+      return createErrorResponse(400, 'Missing required fields', 'stat_date, channel_twitch_id, and riot_puuid are required', corsHeaders);
+    }
+    
+    // Validate stat_date is current or previous window
+    if (!isValidStatDate(stat_date)) {
+      return createErrorResponse(400, 'Invalid stat_date', 'stat_date must be current or previous window', corsHeaders);
+    }
+    
+    // Validate channel_twitch_id format (lowercase, max 25 chars)
+    const cleanChannelTwitchId = channel_twitch_id.toLowerCase();
+    if (cleanChannelTwitchId.length > 25 || !/^[a-z0-9_]+$/.test(cleanChannelTwitchId)) {
+      return createErrorResponse(400, 'Invalid channel_twitch_id', 'channel_twitch_id must be lowercase alphanumeric with underscores, max 25 characters', corsHeaders);
+    }
+    
+    // Validate riot_puuid format (basic UUID check)
+    if (!/^[a-f0-9-]{36,78}$/i.test(riot_puuid)) {
+      return createErrorResponse(400, 'Invalid riot_puuid', 'riot_puuid must be a valid UUID format', corsHeaders);
+    }
+    
+    // Upsert the viewer qualification record
+    const query = `
+      INSERT INTO channel_viewers_daily (stat_date, channel_twitch_id, riot_puuid, created_at)
+      VALUES (?, ?, ?, unixepoch('now'))
+      ON CONFLICT (stat_date, channel_twitch_id, riot_puuid) DO NOTHING
+    `;
+    
+    await env.DB.prepare(query)
+      .bind(stat_date, cleanChannelTwitchId, riot_puuid)
+      .run();
+    
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (error) {
+    console.error('Error in handleViewerQualify:', error);
+    return createErrorResponse(
+      error.message === 'Invalid JSON' ? 400 : 500,
+      error.message === 'Invalid JSON' ? 'Invalid JSON' : 'Failed to record viewer qualification',
+      error.message,
+      corsHeaders
+    );
+  }
+}
+
+/**
+ * Handles viewer health check endpoint
+ * Returns today's unique {channel, puuid} count
+ */
+async function handleViewerHealth(env, corsHeaders) {
+  try {
+    const currentWindow = getCurrentViewerWindow();
+    
+    const query = `
+      SELECT 
+        COUNT(*) as total_records,
+        COUNT(DISTINCT channel_twitch_id) as unique_channels,
+        COUNT(DISTINCT riot_puuid) as unique_viewers
+      FROM channel_viewers_daily
+      WHERE stat_date = ?
+    `;
+    
+    const result = await env.DB.prepare(query).bind(currentWindow).first();
+    
+    return new Response(JSON.stringify({
+      status: 'ok',
+      current_window: currentWindow,
+      stats: {
+        total_qualifications: result?.total_records || 0,
+        unique_channels: result?.unique_channels || 0,
+        unique_viewers: result?.unique_viewers || 0
+      }
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+    
+  } catch (error) {
+    console.error('Error in handleViewerHealth:', error);
+    return createErrorResponse(500, 'Failed to get viewer health stats', error.message, corsHeaders);
   }
 }
 
