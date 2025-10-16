@@ -1,7 +1,7 @@
 # EloWard Cloudflare Infrastructure
 
 ## Status
-The extension and site use only the active endpoints listed below.
+The extension and site use only the active endpoints listed below. This architecture includes hybrid bot integration, viewer tracking, peak rank seeding, and HMAC-secured bot communication.
 
 ## D1 Database Configuration
 - Database Name: eloward
@@ -88,6 +88,16 @@ The extension and site use only the active endpoints listed below.
   - `processed_at` (INTEGER): Timestamp when event was processed (NOT NULL)
   - `created_at` (INTEGER): When record was created (default: current timestamp)
 
+### channel_viewers_daily
+- Purpose: Tracks unique viewers per channel per day with 07:00 UTC window reset
+- Primary Key: `(stat_date, channel_twitch_id, riot_puuid)` (Composite)
+- Columns:
+  - `stat_date` (TEXT): Window start date in YYYY-MM-DD format (NOT NULL)
+  - `channel_twitch_id` (TEXT): Twitch channel login (lowercase) (NOT NULL)
+  - `riot_puuid` (TEXT): Riot PUUID of the viewer (NOT NULL)
+  - `created_at` (INTEGER): Unix timestamp when row was created (NOT NULL)
+- Note: A viewer qualifies after 5 minutes (300 seconds) of video playback
+
 ## Worker Architecture
 
 ### Service Bindings Structure
@@ -109,10 +119,11 @@ D1 Database
 - URL: https://eloward-riotauth.unleashai.workers.dev
 - Service Bindings: `RANK_WORKER`, `TWITCH_AUTH_WORKER`, `USERS_WORKER`, `STRIPE_WORKER`
 - Endpoints:
-  - `POST /auth/complete` — Complete OAuth and store rank data
+  - `POST /auth/complete` — Complete OAuth and store rank data with automatic peak rank seeding
   - `POST /riot/refreshrank` — Refresh rank by PUUID
   - `DELETE /disconnect` — Delete rank data by PUUID
   - `GET /auth/redirect` — OAuth redirect handler
+- Features: Op.gg scraping for peak rank seeding, automatic rank comparison and updates
 
 **Twitch Auth Worker** (`twitchauth-worker.ts`)
 - URL: https://eloward-twitchauth.unleashai.workers.dev
@@ -132,8 +143,9 @@ D1 Database
   - `POST /api/ranks/lol` — Store/update rank (internal auth required)
   - `POST /api/ranks/lol/by-puuid` — Get rank data by PUUID
   - `DELETE /api/ranks/lol` — Delete rank data (internal auth required)
-  - `GET /api/options/{puuid}` — Get user display options
+  - `GET /api/options/{puuid}` — Get user display options (show_peak, animate_badge)
   - `PUT /api/options` — Update display options (Plus required)
+- Features: Scheduled rank refreshes, peak rank tracking, user customization options
 
 **Users Worker** (`users-worker.js`)
 - URL: https://eloward-users.unleashai.workers.dev
@@ -148,6 +160,9 @@ D1 Database
   - `POST /user/riot-fallback` — Get consolidated user + rank data
   - `POST /dashboard/data_id` — Get dashboard data by Twitch ID
   - `POST /channel/active/update_id` — Update channel status (internal auth required)
+  - `POST /view/qualify` — Track viewer qualification (5+ min watch time)
+  - `GET /view/health` — Viewer tracking health stats
+- Features: Viewer tracking with daily windows, metrics collection, consolidated data endpoints
 
 #### Utility Workers
 
@@ -156,6 +171,7 @@ D1 Database
 - Storage: R2 binding
 - Endpoints:
   - `GET /{game}/{filename}` — Serve badge images
+- Supported games: lol, chess, valorant, dota2, csgo, rocket, apex
 
 **Stripe Worker** (`stripe-worker.js`)
 - URL: https://eloward-stripe.unleashai.workers.dev
@@ -171,8 +187,8 @@ D1 Database
 #### EloWard Bot Worker (`elowardbot/bot-worker.ts`)
 - URL: https://eloward-bot.unleashai.workers.dev
 - Architecture: Hybrid (CF Workers + AWS Lightsail IRC bot)
-- Storage: KV for bot tokens, D1 for channel config
-- Messaging: SQS + Redis for IRC bot sync
+- Storage: KV for bot tokens, D1 for channel config, Redis for instant updates
+- Messaging: Redis pub/sub for IRC bot sync (1-3s target)
 - Endpoints:
   - `GET /health` — Health check with channel count
   - `POST /bot/config_id` — Get bot config by Twitch ID
@@ -187,19 +203,26 @@ D1 Database
   - `GET /oauth/start` — Start OAuth flow
   - `GET /oauth/callback` — Complete OAuth
   - `GET /oauth/done` — OAuth completion landing page
+- Features: HMAC-secured bot communication, Redis pub/sub for instant config updates, automatic token refresh
 
 ## Architecture Notes
 
 - **Hybrid Bot**: Cloudflare Workers (control plane) + AWS Lightsail IRC bot
 - **Service Bindings**: Auth workers call database workers internally with `X-Internal-Auth`
-- **Peak Ranks**: Automatic tracking + OpGG seeding
+- **Peak Ranks**: Automatic tracking + Op.gg seeding via OpGGScraper
 - **Token Management**: Server-side only, no client token exposure
+- **Viewer Tracking**: Daily windows with 07:00 UTC reset, 5-minute qualification threshold
+- **HMAC Security**: Bot communication secured with timestamp validation (±60s window)
+- **Redis Integration**: Instant config propagation (1-3s target) via pub/sub
+- **Peak Rank Seeding**: Manual scripts available in `peak-rank/` directory
 
 ## Security
 - Service bindings prevent direct client-to-database access
 - Internal auth headers (`X-Internal-Auth`) required for write operations
+- HMAC-signed requests for bot communication with timestamp validation
 - Server-side token handling only
 - PUUID-based operations require existing database entries
+- Redis pub/sub for secure instant config propagation
 
 ##
 
@@ -238,3 +261,9 @@ D1 Database
 - UNIQUE INDEX: `stripe_event_id` (for idempotency)
 - INDEX: `processed_at` (for cleanup queries)
 - INDEX: `event_type` (for event type filtering)
+
+### channel_viewers_daily table
+- PRIMARY KEY: `(stat_date, channel_twitch_id, riot_puuid)` (Composite)
+- INDEX: `channel_twitch_id, stat_date` (for channel queries)
+- INDEX: `riot_puuid, stat_date` (for viewer queries)
+- INDEX: `created_at` (for cleanup queries)
