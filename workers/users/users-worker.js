@@ -140,7 +140,7 @@ export default usersWorker;
  */
 function getCorsHeaders(request) {
   const origin = request.headers.get('Origin');
-  
+
   // Allow browser extensions (they send chrome-extension:// or moz-extension:// origins)
   const isExtensionOrigin = origin && (
     origin.startsWith('chrome-extension://') || 
@@ -148,8 +148,8 @@ function getCorsHeaders(request) {
   );
   
   // Allow specific domains or extension origins
-  const allowedOrigin = allowedOrigins.includes(origin) || isExtensionOrigin 
-    ? origin 
+  const allowedOrigin = allowedOrigins.includes(origin) || isExtensionOrigin
+    ? origin
     : allowedOrigins[0];
 
   return {
@@ -157,6 +157,7 @@ function getCorsHeaders(request) {
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Internal-Auth',
     'Access-Control-Max-Age': '86400',
+    'Access-Control-Allow-Credentials': 'true',
   };
 }
 
