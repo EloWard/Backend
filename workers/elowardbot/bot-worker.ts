@@ -665,30 +665,88 @@ router.post('/irc/channel/remove', async (req: Request, env: Env) => {
     try {
       const body = await req.json();
     ({ channel_login } = body);
-      
+
       if (!channel_login) {
         return json(400, { error: 'channel_login required' });
       }
-      
+
     // Disable channel in database - IRC bot will leave automatically
     await env.DB.prepare(`
-      UPDATE twitch_bot_users 
+      UPDATE twitch_bot_users
       SET bot_enabled = 0, updated_at = CURRENT_TIMESTAMP
       WHERE channel_name = ?
     `).bind(channel_login.toLowerCase()).run();
-    
+
     log('info', 'Channel disabled in database', { channel_login });
-    
+
     // Publish config update to Redis for instant bot notification
     await publishConfigUpdate(env, channel_login.toLowerCase(), { bot_enabled: false });
-      
-      return json(200, { 
+
+      return json(200, {
       message: 'Channel disabled - IRC bot notified to leave immediately',
       channel_login
     });
   } catch (e: any) {
     log('error', 'Failed to disable channel', { error: String(e), channel_login: channel_login || 'unknown' });
     return json(500, { error: 'Failed to disable channel' });
+  }
+});
+
+// Complete disconnection - delete channel from database and leave IRC
+router.post('/disconnect', async (req: Request, env: Env) => {
+  let channel_login: string | undefined;
+  let twitch_id: string | undefined;
+  try {
+    const body = await req.json();
+    ({ channel_login, twitch_id } = body);
+
+    if (!channel_login && !twitch_id) {
+      return json(400, { error: 'channel_login or twitch_id required' });
+    }
+
+    // Publish disconnect message to Redis first (before deletion) so IRC bot can leave
+    if (channel_login) {
+      await publishConfigUpdate(env, channel_login.toLowerCase(), {
+        action: 'disconnect',
+        bot_enabled: false
+      });
+    }
+
+    // Delete channel record from database - complete removal
+    const deleteQuery = twitch_id
+      ? `DELETE FROM twitch_bot_users WHERE twitch_id = ?`
+      : `DELETE FROM twitch_bot_users WHERE channel_name = ?`;
+
+    const result = await env.DB.prepare(deleteQuery)
+      .bind(twitch_id || channel_login!.toLowerCase())
+      .run();
+
+    if (!result.success || (result.meta?.changes === 0)) {
+      log('warn', 'Disconnect attempted but no record found', {
+        channel_login,
+        twitch_id,
+        changes: result.meta?.changes
+      });
+      return json(404, { error: 'Channel not connected' });
+    }
+
+    log('info', 'Channel completely disconnected from database', {
+      channel_login,
+      twitch_id
+    });
+
+    return json(200, {
+      message: 'Bot disconnected successfully - leaving channel',
+      channel_login,
+      twitch_id
+    });
+  } catch (e: any) {
+    log('error', 'Failed to disconnect channel', {
+      error: String(e),
+      channel_login: channel_login || 'unknown',
+      twitch_id: twitch_id || 'unknown'
+    });
+    return json(500, { error: 'Failed to disconnect channel' });
   }
 });
 
