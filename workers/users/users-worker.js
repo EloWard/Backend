@@ -567,9 +567,10 @@ async function handleViewerQualify(request, env, corsHeaders) {
       return createErrorResponse(400, 'Invalid channel_twitch_id', 'channel_twitch_id must be lowercase alphanumeric with underscores, max 25 characters', corsHeaders);
     }
     
-    // Validate riot_puuid format (basic UUID check)
-    if (!/^[a-f0-9-]{36,78}$/i.test(riot_puuid)) {
-      return createErrorResponse(400, 'Invalid riot_puuid', 'riot_puuid must be a valid UUID format', corsHeaders);
+    // Validate riot_puuid format (Riot uses base64-encoded PUUIDs, typically 78 chars)
+    // Format: alphanumeric + underscore + hyphen (base64 charset)
+    if (!/^[A-Za-z0-9_-]{50,100}$/.test(riot_puuid)) {
+      return createErrorResponse(400, 'Invalid riot_puuid', 'riot_puuid must be a valid Riot PUUID format (base64, 50-100 chars)', corsHeaders);
     }
     
     // Upsert the viewer qualification record
