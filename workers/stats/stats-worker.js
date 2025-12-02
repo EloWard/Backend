@@ -63,13 +63,14 @@ export default statsWorker;
 
 /**
  * Main aggregation function - processes all channels
+ * Runs every 3 hours and updates stats for the current day
  */
 async function runDailyAggregation(env, ctx) {
-  const yesterday = getYesterdayWindow();
+  const currentDay = getCurrentWindow();
 
-  console.log(`[StatsCron] Processing stat_date=${yesterday}`);
+  console.log(`[StatsCron] Processing stat_date=${currentDay}`);
 
-  // Get all unique channels that have EVER had viewers (not just yesterday)
+  // Get all unique channels that have EVER had viewers
   const channelsResult = await env.DB.prepare(`
     SELECT DISTINCT channel_twitch_id
     FROM channel_viewers_daily
@@ -94,7 +95,7 @@ async function runDailyAggregation(env, ctx) {
     // Process batch in parallel
     const results = await Promise.allSettled(
       batch.map(({ channel_twitch_id }) =>
-        computeChannelStats(env, channel_twitch_id, yesterday)
+        computeChannelStats(env, channel_twitch_id, currentDay)
       )
     );
 
@@ -400,10 +401,11 @@ function scoreToRank(score) {
 }
 
 /**
- * Get yesterday's stat_date window
+ * Get current stat_date window
  * Windows reset at 07:00 UTC, so this accounts for that
+ * If it's before 07:00 UTC, we're still in yesterday's window
  */
-function getYesterdayWindow() {
+function getCurrentWindow() {
   const now = new Date();
   const utcHour = now.getUTCHours();
 
@@ -411,9 +413,6 @@ function getYesterdayWindow() {
   if (utcHour < 7) {
     now.setUTCDate(now.getUTCDate() - 1);
   }
-
-  // Subtract one more day to get yesterday's window
-  now.setUTCDate(now.getUTCDate() - 1);
 
   const year = now.getUTCFullYear();
   const month = String(now.getUTCMonth() + 1).padStart(2, '0');
