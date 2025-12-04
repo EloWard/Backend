@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS `channel_stats_cache` (
   `avg_rank_score`            REAL,                        -- Average numeric rank score (0-2000 scale)
   `avg_rank_tier`             TEXT,                        -- Human-readable tier (e.g., "PLATINUM")
   `avg_rank_division`         TEXT,                        -- Human-readable division (e.g., "II", null for Master+)
+  `avg_lp`                    INTEGER,                     -- Average LP across all viewers (0-100)
+  `median_rank_score`         REAL,                        -- Median numeric rank score (0-2000 scale)
+  `median_rank_tier`          TEXT,                        -- Median rank tier
+  `median_rank_division`      TEXT,                        -- Median rank division
+  `median_lp`                 INTEGER,                     -- Median LP
 
   -- Top viewers metadata
   `top_viewers_json`          TEXT,                        -- JSON array of top 10 viewers: [{twitch_username, rank_tier, rank_division, score}]

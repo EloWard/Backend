@@ -13,10 +13,16 @@ CREATE TABLE IF NOT EXISTS `channel_daily_snapshots` (
   -- Daily metrics (viewers who qualified on THIS specific day only)
   `daily_viewer_count`      INTEGER NOT NULL,  -- Count of unique viewers on this specific day
   `daily_avg_rank_score`    REAL,              -- Average rank score of viewers on this day
+  `daily_avg_lp`            INTEGER,           -- Average LP of viewers on this day
+  `daily_median_rank_score` REAL,              -- Median rank score of viewers on this day
+  `daily_median_lp`         INTEGER,           -- Median LP of viewers on this day
 
   -- All-time metrics snapshot (as of this date)
   -- These represent the channel's all-time stats as of this specific day
   `alltime_avg_rank_score`  REAL,              -- All-time average rank score as of this date
+  `alltime_avg_lp`          INTEGER,           -- All-time average LP as of this date
+  `alltime_median_rank_score` REAL,            -- All-time median rank score as of this date
+  `alltime_median_lp`       INTEGER,           -- All-time median LP as of this date
   `alltime_viewer_count`    INTEGER,           -- Total unique viewers (lifetime) as of this date
 
   -- Metadata
