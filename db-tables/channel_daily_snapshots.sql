@@ -1,7 +1,7 @@
 -- Channel Daily Snapshots Table
 -- Stores daily metrics for temporal trend charts
 -- One row per channel per day (only created if channel had viewers that day)
--- Updated daily by stats-worker.js cron job at 07:10 UTC
+-- Updated every 3 hours by stats-worker.js cron job (uses ON CONFLICT to update same day's row)
 
 DROP TABLE IF EXISTS `channel_daily_snapshots`;
 
