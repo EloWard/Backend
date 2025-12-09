@@ -70,6 +70,11 @@ async function runDailyAggregation(env, ctx) {
 
   console.log(`[StatsCron] Processing stat_date=${currentDay}`);
 
+  // Get all leaderboard streamers (from previous run) to exclude them as viewers
+  // This prevents streamers from counting as viewers for other channels
+  const streamerUsernames = await getLeaderboardStreamerUsernames(env);
+  console.log(`[StatsCron] Excluding ${streamerUsernames.size} leaderboard streamers from viewer counts`);
+
   // Get all unique channels that have EVER had viewers
   const channelsResult = await env.DB.prepare(`
     SELECT DISTINCT channel_twitch_id
@@ -95,7 +100,7 @@ async function runDailyAggregation(env, ctx) {
     // Process batch in parallel
     const results = await Promise.allSettled(
       batch.map(({ channel_twitch_id }) =>
-        computeChannelStats(env, channel_twitch_id, currentDay)
+        computeChannelStats(env, channel_twitch_id, currentDay, streamerUsernames)
       )
     );
 
@@ -117,8 +122,9 @@ async function runDailyAggregation(env, ctx) {
 
 /**
  * Compute all-time stats for a single channel
+ * @param {Set<string>} streamerUsernames - Set of leaderboard streamer usernames to exclude
  */
-async function computeChannelStats(env, channelTwitchId, statDate) {
+async function computeChannelStats(env, channelTwitchId, statDate, streamerUsernames) {
   // 1. Get all unique viewers for this channel (ALL TIME)
   const uniqueViewersResult = await env.DB.prepare(`
     SELECT DISTINCT riot_puuid
@@ -127,9 +133,8 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
   `).bind(channelTwitchId).all();
 
   const viewerPuuids = uniqueViewersResult.results || [];
-  const totalViewers = viewerPuuids.length;
 
-  if (totalViewers === 0) {
+  if (viewerPuuids.length === 0) {
     console.log(`[StatsCron] Channel ${channelTwitchId} has no viewers, skipping`);
     return;
   }
@@ -138,16 +143,25 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
   // Note: Some viewers may not have rank data - we'll filter them out
   const rankedViewers = await getRankedViewers(env, viewerPuuids.map(v => v.riot_puuid));
 
-  // 3. Get channel owner's PUUID and filter them out from statistics
-  // A channel owner shouldn't be counted as a viewer of their own channel
+  // 3. Get channel owner's PUUID and filter out:
+  //    - Channel owner (self)
+  //    - Any leaderboard streamers
+  // This ensures only genuine non-streamer viewers are counted
   const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
-  const filteredViewers = ownerPuuid
-    ? rankedViewers.filter(v => v.riot_puuid !== ownerPuuid)
-    : rankedViewers;
+  const filteredViewers = rankedViewers.filter(v => {
+    // Exclude channel owner
+    if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
+    // Exclude leaderboard streamers
+    if (streamerUsernames.has(v.twitch_username)) return false;
+    return true;
+  });
 
-  if (filteredViewers.length === 0) {
-    console.log(`[StatsCron] Channel ${channelTwitchId} has ${totalViewers} viewers but none have rank data (excluding self), skipping`);
-    // Update cache to show channel exists but has no ranked viewers
+  // 4. Use filtered count as the total (only non-streamer viewers)
+  const totalViewers = filteredViewers.length;
+
+  if (totalViewers === 0) {
+    console.log(`[StatsCron] Channel ${channelTwitchId} has viewers but none qualify (excluding self and streamers), skipping`);
+    // Update cache to show channel exists but has no qualified viewers
     await env.DB.prepare(`
       INSERT INTO channel_stats_cache
         (channel_twitch_id, total_unique_viewers, avg_rank_score, avg_rank_tier,
@@ -164,14 +178,14 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
         is_eligible = excluded.is_eligible
     `).bind(
       channelTwitchId,
-      totalViewers,
+      0, // totalViewers = 0 since no one qualifies
       Math.floor(Date.now() / 1000),
       statDate
     ).run();
     return;
   }
 
-  // 4. Calculate scores for each viewer (excluding channel owner)
+  // 5. Calculate scores for each viewer (excluding self and streamers)
   const viewerScores = filteredViewers.map(viewer => ({
     puuid: viewer.riot_puuid,
     twitch_username: viewer.twitch_username,
@@ -181,7 +195,7 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
     score: calculateRankScore(viewer.effective_tier, viewer.effective_division, viewer.effective_lp || 0)
   }));
 
-  // 5. Calculate average and median scores
+  // 6. Calculate average and median scores
   const avgScore = viewerScores.reduce((sum, v) => sum + v.score, 0) / viewerScores.length;
   const avgRank = scoreToRank(avgScore); // This now returns { tier, division, lp }
 
@@ -192,7 +206,7 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
     : sortedScores[Math.floor(sortedScores.length / 2)].score;
   const medianRank = scoreToRank(medianScore);
 
-  // 6. Get top 10 viewers by score (excluding channel owner)
+  // 7. Get top 10 viewers by score (excluding self and streamers)
   const top10 = viewerScores
     .sort((a, b) => b.score - a.score)
     .slice(0, 10)
@@ -204,7 +218,7 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
       score: Math.round(v.score * 10) / 10 // Round to 1 decimal
     }));
 
-  // 7. Update channel_stats_cache
+  // 8. Update channel_stats_cache
   await env.DB.prepare(`
     INSERT INTO channel_stats_cache
       (channel_twitch_id, total_unique_viewers, avg_rank_score, avg_rank_tier,
@@ -242,16 +256,17 @@ async function computeChannelStats(env, channelTwitchId, statDate) {
     totalViewers >= 10 ? 1 : 0
   ).run();
 
-  // 8. Compute daily snapshot for yesterday
-  await computeDailySnapshot(env, channelTwitchId, statDate, avgScore, avgRank.lp, medianScore, medianRank.lp, totalViewers);
+  // 9. Compute daily snapshot for yesterday
+  await computeDailySnapshot(env, channelTwitchId, statDate, avgScore, avgRank.lp, medianScore, medianRank.lp, totalViewers, streamerUsernames);
 
-  console.log(`[StatsCron] ${channelTwitchId}: ${totalViewers} viewers (${filteredViewers.length} ranked, excluding self), avg=${avgRank.tier}${avgRank.division ? ' ' + avgRank.division : ''}`);
+  console.log(`[StatsCron] ${channelTwitchId}: ${totalViewers} non-streamer viewers, avg=${avgRank.tier}${avgRank.division ? ' ' + avgRank.division : ''}`);
 }
 
 /**
  * Compute daily snapshot metrics for a specific day
+ * @param {Set<string>} streamerUsernames - Set of leaderboard streamer usernames to exclude
  */
-async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgScore, alltimeAvgLp, alltimeMedianScore, alltimeMedianLp, alltimeViewerCount) {
+async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgScore, alltimeAvgLp, alltimeMedianScore, alltimeMedianLp, alltimeViewerCount, streamerUsernames) {
   // Get viewers who qualified on THIS SPECIFIC DAY
   const dailyViewersResult = await env.DB.prepare(`
     SELECT DISTINCT riot_puuid
@@ -269,18 +284,22 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
   // Get ranks for viewers who watched THIS DAY
   const dailyRankedViewers = await getRankedViewers(env, dailyPuuids.map(v => v.riot_puuid));
 
-  // Filter out channel owner from daily statistics too
+  // Filter out channel owner and leaderboard streamers from daily statistics
   const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
-  const filteredDailyViewers = ownerPuuid
-    ? dailyRankedViewers.filter(v => v.riot_puuid !== ownerPuuid)
-    : dailyRankedViewers;
+  const filteredDailyViewers = dailyRankedViewers.filter(v => {
+    // Exclude channel owner
+    if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
+    // Exclude leaderboard streamers
+    if (streamerUsernames.has(v.twitch_username)) return false;
+    return true;
+  });
 
   if (filteredDailyViewers.length === 0) {
-    // No ranked viewers on this day (excluding self)
+    // No ranked viewers on this day (excluding self and streamers)
     return;
   }
 
-  // Calculate daily average and median scores (excluding channel owner)
+  // Calculate daily average and median scores (excluding self and streamers)
   const dailyScores = filteredDailyViewers.map(v =>
     calculateRankScore(v.effective_tier, v.effective_division, v.effective_lp || 0)
   );
@@ -328,6 +347,21 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
     alltimeMedianLp,
     alltimeViewerCount
   ).run();
+}
+
+/**
+ * Get all channel usernames that are currently on the leaderboard
+ * These are streamers who shouldn't count as viewers for other channels
+ * Returns a Set of twitch usernames for efficient lookup
+ */
+async function getLeaderboardStreamerUsernames(env) {
+  const result = await env.DB.prepare(`
+    SELECT channel_twitch_id
+    FROM channel_stats_cache
+    WHERE is_eligible = 1
+  `).all();
+
+  return new Set((result.results || []).map(r => r.channel_twitch_id));
 }
 
 /**
