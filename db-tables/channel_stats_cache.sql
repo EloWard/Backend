@@ -10,6 +10,7 @@ DROP TABLE IF EXISTS `channel_stats_cache`;
 CREATE TABLE IF NOT EXISTS `channel_stats_cache` (
   -- Primary identifier
   `channel_twitch_id`         TEXT PRIMARY KEY,  -- Twitch channel login (lowercase)
+  `channel_display_name`      TEXT,              -- Display name with proper capitalization
 
   -- All-time aggregate metrics
   `total_unique_viewers`      INTEGER NOT NULL DEFAULT 0,  -- Count of unique riot_puuids across all time
