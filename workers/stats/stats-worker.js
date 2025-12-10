@@ -51,7 +51,7 @@ const statsWorker = {
    * Scheduled cron handler - runs every 6 hours at :10 minutes past the hour
    * Uses Queue to process all channels across multiple invocations
    */
-  async scheduled(event, env, ctx) {
+  async scheduled(_event, env, ctx) {
     try {
       console.log(`[StatsCron] Started at ${new Date().toISOString()}`);
       await queueAllChannels(env, ctx);
@@ -161,7 +161,7 @@ function createDbWithCounter(env, maxQueries = 1000) {
  * Queue all channels for processing across multiple invocations
  * This allows processing all channels even though D1 has a 1,000 query limit per invocation
  */
-async function queueAllChannels(env, ctx) {
+async function queueAllChannels(env, _ctx) {
   const currentDay = getCurrentWindow();
   console.log(`[StatsCron] Queuing channels for stat_date=${currentDay}`);
 
@@ -243,7 +243,6 @@ async function processChannelBatch(env, channels, statDate, streamerUsernames, b
     }
 
     const chunk = channels.slice(i, i + CONCURRENT_SIZE);
-    const queriesBeforeChunk = db.getQueryCount();
 
     // Process concurrent chunk in parallel
     const results = await Promise.allSettled(
@@ -345,7 +344,7 @@ async function computeChannelStats(db, channelTwitchId, statDate, streamerUserna
     await db.prepare(`
       INSERT INTO channel_stats_cache
         (channel_twitch_id, channel_display_name, total_unique_viewers, avg_rank_score, avg_rank_tier,
-         avg_rank_division, top_viewers_json, last_updated, last_computed_stat_date, is_eligible)
+        avg_rank_division, top_viewers_json, last_updated, last_computed_stat_date, is_eligible)
       VALUES (?, ?, ?, NULL, NULL, NULL, '[]', ?, ?, 0)
       ON CONFLICT(channel_twitch_id) DO UPDATE SET
         channel_display_name = excluded.channel_display_name,
@@ -558,8 +557,21 @@ async function getChannelOwnerPuuids(db, channelTwitchId) {
 
 /**
  * Get the channel's display name (proper capitalization) from the database
+ * Priority: cached value > users.display_name > lol_ranks.twitch_username > lowercase fallback
  */
 async function getChannelDisplayName(db, channelTwitchId) {
+  // First, check if we already have a cached display name - this is our source of truth
+  const existingCache = await db.prepare(`
+    SELECT channel_display_name
+    FROM channel_stats_cache
+    WHERE channel_twitch_id = ?
+  `).bind(channelTwitchId).first();
+
+  if (existingCache?.channel_display_name) {
+    return existingCache.channel_display_name;
+  }
+
+  // If no cache exists, this is a new channel - query users table for proper capitalization
   const userResult = await db.prepare(`
     SELECT display_name
     FROM users
@@ -570,6 +582,7 @@ async function getChannelDisplayName(db, channelTwitchId) {
     return userResult.display_name;
   }
 
+  // If not in users table, check lol_ranks for capitalization
   const lolRanksResult = await db.prepare(`
     SELECT twitch_username
     FROM lol_ranks
@@ -580,6 +593,7 @@ async function getChannelDisplayName(db, channelTwitchId) {
     return lolRanksResult.twitch_username;
   }
 
+  // Final fallback: use lowercase channel_twitch_id
   return channelTwitchId;
 }
 
