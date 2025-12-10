@@ -70,7 +70,7 @@ async function runDailyAggregation(env, ctx) {
 
   console.log(`[StatsCron] Processing stat_date=${currentDay}`);
 
-  // Get all leaderboard streamers (from previous run) to exclude them as viewers
+  // Get all eligible leaderboard streamers (from previous run) to exclude them as viewers
   // This prevents streamers from counting as viewers for other channels
   const streamerUsernames = await getLeaderboardStreamerUsernames(env);
   console.log(`[StatsCron] Excluding ${streamerUsernames.size} leaderboard streamers from viewer counts`);
@@ -122,7 +122,7 @@ async function runDailyAggregation(env, ctx) {
 
 /**
  * Compute all-time stats for a single channel
- * @param {Set<string>} streamerUsernames - Set of leaderboard streamer usernames to exclude
+ * @param {Set<string>} streamerUsernames - Set of eligible leaderboard streamer usernames to exclude
  */
 async function computeChannelStats(env, channelTwitchId, statDate, streamerUsernames) {
   // 1. Get all unique viewers for this channel (ALL TIME)
@@ -144,15 +144,19 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
   const rankedViewers = await getRankedViewers(env, viewerPuuids.map(v => v.riot_puuid));
 
   // 3. Get channel owner's PUUID and filter out:
-  //    - Channel owner (self)
-  //    - Any leaderboard streamers
+  //    - Channel owner (self) - by PUUID match
+  //    - Eligible leaderboard streamers (>= 10 viewers) - by username match (case-insensitive)
   // This ensures only genuine non-streamer viewers are counted
   const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
   const filteredViewers = rankedViewers.filter(v => {
-    // Exclude channel owner
+    // Exclude channel owner by PUUID
     if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
-    // Exclude leaderboard streamers
-    if (streamerUsernames.has(v.twitch_username)) return false;
+
+    // Exclude eligible leaderboard streamers (case-insensitive comparison)
+    // This prevents leaderboard streamers from appearing as viewers of other channels
+    const viewerUsernameLower = v.twitch_username?.toLowerCase();
+    if (viewerUsernameLower && streamerUsernames.has(viewerUsernameLower)) return false;
+
     return true;
   });
 
@@ -264,7 +268,7 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
 
 /**
  * Compute daily snapshot metrics for a specific day
- * @param {Set<string>} streamerUsernames - Set of leaderboard streamer usernames to exclude
+ * @param {Set<string>} streamerUsernames - Set of eligible leaderboard streamer usernames to exclude
  */
 async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgScore, alltimeAvgLp, alltimeMedianScore, alltimeMedianLp, alltimeViewerCount, streamerUsernames) {
   // Get viewers who qualified on THIS SPECIFIC DAY
@@ -284,13 +288,16 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
   // Get ranks for viewers who watched THIS DAY
   const dailyRankedViewers = await getRankedViewers(env, dailyPuuids.map(v => v.riot_puuid));
 
-  // Filter out channel owner and leaderboard streamers from daily statistics
+  // Filter out channel owner and eligible leaderboard streamers from daily statistics
   const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
   const filteredDailyViewers = dailyRankedViewers.filter(v => {
-    // Exclude channel owner
+    // Exclude channel owner by PUUID
     if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
-    // Exclude leaderboard streamers
-    if (streamerUsernames.has(v.twitch_username)) return false;
+
+    // Exclude eligible leaderboard streamers (case-insensitive comparison)
+    const viewerUsernameLower = v.twitch_username?.toLowerCase();
+    if (viewerUsernameLower && streamerUsernames.has(viewerUsernameLower)) return false;
+
     return true;
   });
 
@@ -350,13 +357,16 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
 }
 
 /**
- * Get all channel usernames that are currently on the leaderboard
+ * Get all eligible leaderboard channel usernames (>= 10 viewers)
  * These are streamers who shouldn't count as viewers for other channels
- * Returns a Set of twitch usernames for efficient lookup
+ * Returns a Set of lowercase twitch usernames for efficient lookup
+ *
+ * Note: Uses LOWER() to ensure case-insensitive matching since lol_ranks.twitch_username
+ * may have different casing than channel_twitch_id (which is always lowercase)
  */
 async function getLeaderboardStreamerUsernames(env) {
   const result = await env.DB.prepare(`
-    SELECT channel_twitch_id
+    SELECT LOWER(channel_twitch_id) as channel_twitch_id
     FROM channel_stats_cache
     WHERE is_eligible = 1
   `).all();
@@ -367,12 +377,16 @@ async function getLeaderboardStreamerUsernames(env) {
 /**
  * Get the channel owner's riot_puuid (if they have a linked League account)
  * Returns null if the channel owner doesn't have a linked account
+ *
+ * Uses COLLATE NOCASE to handle case-insensitive matching since:
+ * - channel_twitch_id is always lowercase
+ * - lol_ranks.twitch_username may have original casing
  */
 async function getChannelOwnerPuuid(env, channelTwitchId) {
   const result = await env.DB.prepare(`
     SELECT riot_puuid
     FROM lol_ranks
-    WHERE twitch_username = ?
+    WHERE LOWER(twitch_username) = LOWER(?)
   `).bind(channelTwitchId).first();
 
   return result ? result.riot_puuid : null;
