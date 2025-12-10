@@ -161,7 +161,7 @@ async function handleGetChannelStats(request, env, channelName, corsHeaders) {
   if (!cleanChannelName) {
     return new Response(JSON.stringify({
       error: 'Invalid channel name',
-      message: 'Channel name must be 4-25 alphanumeric characters or underscores'
+      message: 'Channel name must be 3-25 alphanumeric characters or underscores'
     }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -250,7 +250,7 @@ async function handleGetChannelTrend(request, env, channelName, corsHeaders) {
   if (!cleanChannelName) {
     return new Response(JSON.stringify({
       error: 'Invalid channel name',
-      message: 'Channel name must be 4-25 alphanumeric characters or underscores'
+      message: 'Channel name must be 3-25 alphanumeric characters or underscores'
     }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -294,7 +294,7 @@ function sanitizeChannelName(name) {
 
   const cleaned = name.toLowerCase().trim();
 
-  if (!/^[a-z0-9_]{4,25}$/.test(cleaned)) {
+  if (!/^[a-z0-9_]{3,25}$/.test(cleaned)) {
     return null;
   }
 
