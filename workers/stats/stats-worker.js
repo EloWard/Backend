@@ -1,14 +1,14 @@
 /**
  * EloWard Channel Statistics Worker
  *
- * Runs daily at 07:10 UTC to compute all-time channel statistics
+ * Runs every 6 hours to compute all-time channel statistics
  * Aggregates viewer data from channel_viewers_daily and lol_ranks tables
  * Updates channel_stats_cache and channel_daily_snapshots tables
  */
 
 const statsWorker = {
   /**
-   * Main fetch handler (for manual testing/health checks)
+   * Main fetch handler
    */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -23,17 +23,20 @@ const statsWorker = {
       });
     }
 
-    // Manual trigger endpoint (for testing)
     if (url.pathname === '/trigger' && request.method === 'POST') {
       try {
-        await runDailyAggregation(env, ctx);
-        return new Response(JSON.stringify({ success: true }), {
+        const summary = await queueAllChannels(env, ctx);
+        return new Response(JSON.stringify({
+          success: true,
+          message: 'Channels queued for processing',
+          ...summary
+        }), {
           headers: { 'Content-Type': 'application/json' }
         });
       } catch (error) {
         return new Response(JSON.stringify({
-          error: error.message,
-          stack: error.stack
+          success: false,
+          error: error.message
         }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' }
@@ -45,16 +48,49 @@ const statsWorker = {
   },
 
   /**
-   * Scheduled cron handler - runs daily at 07:10 UTC
+   * Scheduled cron handler - runs every 6 hours at :10 minutes past the hour
+   * Uses Queue to process all channels across multiple invocations
    */
   async scheduled(event, env, ctx) {
     try {
       console.log(`[StatsCron] Started at ${new Date().toISOString()}`);
-      await runDailyAggregation(env, ctx);
-      console.log(`[StatsCron] Completed at ${new Date().toISOString()}`);
+      await queueAllChannels(env, ctx);
+      console.log(`[StatsCron] Queued all channels for processing`);
     } catch (error) {
       console.error(`[StatsCron] Error during scheduled aggregation:`, error);
       // Don't throw - let the cron complete and try again next time
+    }
+  },
+
+  /**
+   * Queue consumer - processes batches of channels
+   */
+  async queue(batch, env) {
+    const messages = batch.messages;
+    console.log(`[QueueConsumer] Processing ${messages.length} message(s)`);
+
+    for (const message of messages) {
+      try {
+        const payload = message.body;
+        const { channels, statDate, streamerUsernames, batchNumber, totalBatches } = payload;
+        
+        console.log(`[QueueConsumer] Processing batch ${batchNumber}/${totalBatches} with ${channels.length} channels`);
+        
+        await processChannelBatch(env, channels, statDate, streamerUsernames, {
+          batchNumber,
+          totalBatches
+        });
+        
+        message.ack();
+      } catch (error) {
+        console.error(`[QueueConsumer] Error processing batch:`, error);
+        if (message.attempts < 3) {
+          message.retry();
+        } else {
+          console.error(`[QueueConsumer] Max retries reached, acking to prevent infinite loop`);
+          message.ack();
+        }
+      }
     }
   }
 };
@@ -62,71 +98,218 @@ const statsWorker = {
 export default statsWorker;
 
 /**
- * Main aggregation function - processes all channels
- * Runs every 3 hours and updates stats for the current day
+ * Create a D1 database wrapper that tracks query count to stay within per-invocation limits
+ * D1 has a hard limit of 1,000 queries per Worker invocation
+ * 
+ * @param {Object} env - Worker environment with DB
+ * @param {number} maxQueries - Maximum queries allowed (default: 1000)
  */
-async function runDailyAggregation(env, ctx) {
+function createDbWithCounter(env, maxQueries = 1000) {
+  let queryCount = 0;
+  const db = env.DB;
+  const MAX_D1_QUERIES_PER_INVOCATION = maxQueries;
+
+  function checkBudget() {
+    if (queryCount >= MAX_D1_QUERIES_PER_INVOCATION) {
+      throw new Error(
+        `[StatsCron] D1 query budget exhausted (queryCount=${queryCount}, limit=${MAX_D1_QUERIES_PER_INVOCATION})`
+      );
+    }
+  }
+
+  return {
+    getQueryCount() {
+      return queryCount;
+    },
+
+    prepare(statement) {
+      checkBudget();
+      const prepared = db.prepare(statement);
+      
+      let currentStmt = prepared;
+      
+      const wrapper = {
+        bind(...args) {
+          currentStmt = currentStmt.bind(...args);
+          return wrapper;
+        },
+
+        async first(...args) {
+          queryCount++;
+          checkBudget();
+          return currentStmt.first(...args);
+        },
+
+        async run(...args) {
+          queryCount++;
+          checkBudget();
+          return currentStmt.run(...args);
+        },
+
+        async all(...args) {
+          queryCount++;
+          checkBudget();
+          return currentStmt.all(...args);
+        },
+      };
+      return wrapper;
+    },
+  };
+}
+
+/**
+ * Queue all channels for processing across multiple invocations
+ * This allows processing all channels even though D1 has a 1,000 query limit per invocation
+ */
+async function queueAllChannels(env, ctx) {
   const currentDay = getCurrentWindow();
+  console.log(`[StatsCron] Queuing channels for stat_date=${currentDay}`);
 
-  console.log(`[StatsCron] Processing stat_date=${currentDay}`);
+  // Create DB wrapper with query counter (only for getting channel list)
+  const db = createDbWithCounter(env, 1000);
 
-  // Get all eligible leaderboard streamers (from previous run) to exclude them as viewers
-  // This prevents streamers from counting as viewers for other channels
-  const streamerUsernames = await getLeaderboardStreamerUsernames(env);
+  // Get all eligible leaderboard streamers to exclude them as viewers
+  const streamerUsernames = await getLeaderboardStreamerUsernames(db);
   console.log(`[StatsCron] Excluding ${streamerUsernames.size} leaderboard streamers from viewer counts`);
 
   // Get all unique channels that have EVER had viewers
-  const channelsResult = await env.DB.prepare(`
+  const channelsResult = await db.prepare(`
     SELECT DISTINCT channel_twitch_id
     FROM channel_viewers_daily
   `).all();
 
   const channels = channelsResult.results || [];
-  console.log(`[StatsCron] Found ${channels.length} channels with lifetime viewer data`);
+  console.log(`[StatsCron] Found ${channels.length} channels to process`);
 
   if (channels.length === 0) {
     console.log(`[StatsCron] No channels to process, exiting`);
     return;
   }
 
-  // Process channels in batches to avoid timeout
-  const BATCH_SIZE = 50;
+  const CHANNELS_PER_BATCH = 120;
+  const batches = [];
+
+  for (let i = 0; i < channels.length; i += CHANNELS_PER_BATCH) {
+    const batch = channels.slice(i, i + CHANNELS_PER_BATCH);
+    batches.push(batch);
+  }
+
+  console.log(`[StatsCron] Creating ${batches.length} queue batches (${CHANNELS_PER_BATCH} channels per batch)`);
+
+  // Send each batch to the queue
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    await env.CHANNEL_STATS_QUEUE.send({
+      channels: batch,
+      statDate: currentDay,
+      streamerUsernames: Array.from(streamerUsernames),
+      batchNumber: i + 1,
+      totalBatches: batches.length
+    });
+  }
+
+  console.log(`[StatsCron] Queued ${batches.length} batches for processing`);
+  return {
+    totalChannels: channels.length,
+    batchesQueued: batches.length,
+    channelsPerBatch: CHANNELS_PER_BATCH
+  };
+}
+
+/**
+ * Process a batch of channels (called by queue consumer)
+ */
+async function processChannelBatch(env, channels, statDate, streamerUsernames, batchInfo = {}) {
+  const db = createDbWithCounter(env, 1000);
+  const streamerUsernamesSet = new Set(streamerUsernames);
+  const CONCURRENT_SIZE = 6;
+  
   let processed = 0;
   let errors = 0;
+  const queriesAtStart = db.getQueryCount();
 
-  for (let i = 0; i < channels.length; i += BATCH_SIZE) {
-    const batch = channels.slice(i, i + BATCH_SIZE);
+  console.log(
+    `[QueueBatch] Processing batch ${batchInfo.batchNumber || '?'}/${batchInfo.totalBatches || '?'}: ${channels.length} channels`
+  );
 
-    // Process batch in parallel
+  for (let i = 0; i < channels.length; i += CONCURRENT_SIZE) {
+    const currentQueries = db.getQueryCount();
+    
+    if (currentQueries >= 1000) {
+      console.log(
+        `[QueueBatch] Hit query limit (used=${currentQueries}, processed=${processed}, remaining=${channels.length - i})`
+      );
+      break;
+    }
+
+    const chunk = channels.slice(i, i + CONCURRENT_SIZE);
+    const queriesBeforeChunk = db.getQueryCount();
+
+    // Process concurrent chunk in parallel
     const results = await Promise.allSettled(
-      batch.map(({ channel_twitch_id }) =>
-        computeChannelStats(env, channel_twitch_id, currentDay, streamerUsernames)
+      chunk.map(({ channel_twitch_id }) =>
+        computeChannelStats(db, channel_twitch_id, statDate, streamerUsernamesSet)
       )
     );
 
-    // Count successes and failures
+    const queriesAfterChunk = db.getQueryCount();
+
+    let budgetExhausted = false;
     results.forEach((result, idx) => {
       if (result.status === 'fulfilled') {
         processed++;
       } else {
         errors++;
-        console.error(`[StatsCron] Error processing ${batch[idx].channel_twitch_id}:`, result.reason);
+        const reason = result.reason || result;
+        const errorMsg = reason?.message || String(reason);
+        if (errorMsg.includes('query budget') || errorMsg.includes('Too many API requests')) {
+          budgetExhausted = true;
+        } else {
+          console.error(`[QueueBatch] Error processing ${chunk[idx].channel_twitch_id}:`, reason);
+        }
       }
     });
 
-    console.log(`[StatsCron] Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(channels.length / BATCH_SIZE)} complete (${processed} processed, ${errors} errors)`);
+    if (budgetExhausted || queriesAfterChunk >= 1000) {
+      console.log(
+        `[QueueBatch] Stopping due to query budget (used=${queriesAfterChunk}, processed=${processed}, errors=${errors})`
+      );
+      break;
+    }
+
+    if (i + CONCURRENT_SIZE < channels.length) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
   }
 
-  console.log(`[StatsCron] Aggregation complete: ${processed} channels processed, ${errors} errors`);
+  const totalQueries = db.getQueryCount();
+  const queriesUsedForProcessing = totalQueries - queriesAtStart;
+  const avgQueriesPerChannel = processed > 0 ? queriesUsedForProcessing / processed : 0;
+
+  console.log(
+    `[QueueBatch] Batch complete: ${processed}/${channels.length} processed, ${errors} errors, ${totalQueries} queries (avg ${avgQueriesPerChannel.toFixed(1)}/channel)`
+  );
+
+  return {
+    processed,
+    errors,
+    totalChannels: channels.length,
+    queriesUsed: totalQueries,
+    queriesUsedForProcessing,
+    avgQueriesPerChannel: parseFloat(avgQueriesPerChannel.toFixed(2))
+  };
 }
+
 
 /**
  * Compute all-time stats for a single channel
+ * @param {Object} db - D1 database wrapper with query counter
+ * @param {string} channelTwitchId - Channel Twitch ID
+ * @param {string} statDate - Current stat date window
  * @param {Set<string>} streamerUsernames - Set of eligible leaderboard streamer usernames to exclude
  */
-async function computeChannelStats(env, channelTwitchId, statDate, streamerUsernames) {
-  // 1. Get all unique viewers for this channel (ALL TIME)
-  const uniqueViewersResult = await env.DB.prepare(`
+async function computeChannelStats(db, channelTwitchId, statDate, streamerUsernames) {
+  const uniqueViewersResult = await db.prepare(`
     SELECT DISTINCT riot_puuid
     FROM channel_viewers_daily
     WHERE channel_twitch_id = ?
@@ -139,39 +322,33 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
     return;
   }
 
-  // 2. Get rank data for all viewers, respecting show_peak preference
-  // Note: Some viewers may not have rank data - we'll filter them out
-  const rankedViewers = await getRankedViewers(env, viewerPuuids.map(v => v.riot_puuid));
+  const rankedViewers = await getRankedViewers(db, viewerPuuids.map(v => v.riot_puuid));
+  const ownerPuuids = await getChannelOwnerPuuids(db, channelTwitchId);
 
-  // 3. Get channel owner's PUUID and filter out:
-  //    - Channel owner (self) - by PUUID match
-  //    - Eligible leaderboard streamers (>= 10 viewers) - by username match (case-insensitive)
-  // This ensures only genuine non-streamer viewers are counted
-  const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
   const filteredViewers = rankedViewers.filter(v => {
-    // Exclude channel owner by PUUID
-    if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
+    if (ownerPuuids.has(v.riot_puuid)) {
+      return false;
+    }
 
-    // Exclude eligible leaderboard streamers (case-insensitive comparison)
-    // This prevents leaderboard streamers from appearing as viewers of other channels
     const viewerUsernameLower = v.twitch_username?.toLowerCase();
-    if (viewerUsernameLower && streamerUsernames.has(viewerUsernameLower)) return false;
+    if (viewerUsernameLower && streamerUsernames.has(viewerUsernameLower)) {
+      return false;
+    }
 
     return true;
   });
-
-  // 4. Use filtered count as the total (only non-streamer viewers)
   const totalViewers = filteredViewers.length;
 
   if (totalViewers === 0) {
     console.log(`[StatsCron] Channel ${channelTwitchId} has viewers but none qualify (excluding self and streamers), skipping`);
-    // Update cache to show channel exists but has no qualified viewers
-    await env.DB.prepare(`
+    const displayName = await getChannelDisplayName(db, channelTwitchId);
+    await db.prepare(`
       INSERT INTO channel_stats_cache
-        (channel_twitch_id, total_unique_viewers, avg_rank_score, avg_rank_tier,
+        (channel_twitch_id, channel_display_name, total_unique_viewers, avg_rank_score, avg_rank_tier,
          avg_rank_division, top_viewers_json, last_updated, last_computed_stat_date, is_eligible)
-      VALUES (?, ?, NULL, NULL, NULL, '[]', ?, ?, 0)
+      VALUES (?, ?, ?, NULL, NULL, NULL, '[]', ?, ?, 0)
       ON CONFLICT(channel_twitch_id) DO UPDATE SET
+        channel_display_name = excluded.channel_display_name,
         total_unique_viewers = excluded.total_unique_viewers,
         avg_rank_score = excluded.avg_rank_score,
         avg_rank_tier = excluded.avg_rank_tier,
@@ -182,14 +359,14 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
         is_eligible = excluded.is_eligible
     `).bind(
       channelTwitchId,
-      0, // totalViewers = 0 since no one qualifies
+      displayName,
+      0,
       Math.floor(Date.now() / 1000),
       statDate
     ).run();
     return;
   }
 
-  // 5. Calculate scores for each viewer (excluding self and streamers)
   const viewerScores = filteredViewers.map(viewer => ({
     puuid: viewer.riot_puuid,
     twitch_username: viewer.twitch_username,
@@ -199,18 +376,14 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
     score: calculateRankScore(viewer.effective_tier, viewer.effective_division, viewer.effective_lp || 0)
   }));
 
-  // 6. Calculate average and median scores
   const avgScore = viewerScores.reduce((sum, v) => sum + v.score, 0) / viewerScores.length;
-  const avgRank = scoreToRank(avgScore); // This now returns { tier, division, lp }
-
-  // Calculate median score (middle value when sorted)
+  const avgRank = scoreToRank(avgScore);
   const sortedScores = [...viewerScores].sort((a, b) => a.score - b.score);
   const medianScore = sortedScores.length % 2 === 0
     ? (sortedScores[sortedScores.length / 2 - 1].score + sortedScores[sortedScores.length / 2].score) / 2
     : sortedScores[Math.floor(sortedScores.length / 2)].score;
   const medianRank = scoreToRank(medianScore);
 
-  // 7. Get top 10 viewers by score (excluding self and streamers)
   const top10 = viewerScores
     .sort((a, b) => b.score - a.score)
     .slice(0, 10)
@@ -219,17 +392,18 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
       rank_tier: v.tier,
       rank_division: v.division,
       lp: v.lp,
-      score: Math.round(v.score * 10) / 10 // Round to 1 decimal
+      score: Math.round(v.score * 10) / 10
     }));
 
-  // 8. Update channel_stats_cache
-  await env.DB.prepare(`
+  const displayName = await getChannelDisplayName(db, channelTwitchId);
+  await db.prepare(`
     INSERT INTO channel_stats_cache
-      (channel_twitch_id, total_unique_viewers, avg_rank_score, avg_rank_tier,
+      (channel_twitch_id, channel_display_name, total_unique_viewers, avg_rank_score, avg_rank_tier,
        avg_rank_division, avg_lp, median_rank_score, median_rank_tier,
        median_rank_division, median_lp, top_viewers_json, last_updated, last_computed_stat_date, is_eligible)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(channel_twitch_id) DO UPDATE SET
+      channel_display_name = excluded.channel_display_name,
       total_unique_viewers = excluded.total_unique_viewers,
       avg_rank_score = excluded.avg_rank_score,
       avg_rank_tier = excluded.avg_rank_tier,
@@ -245,6 +419,7 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
       is_eligible = excluded.is_eligible
   `).bind(
     channelTwitchId,
+    displayName,
     totalViewers,
     avgScore,
     avgRank.tier,
@@ -260,19 +435,25 @@ async function computeChannelStats(env, channelTwitchId, statDate, streamerUsern
     totalViewers >= 10 ? 1 : 0
   ).run();
 
-  // 9. Compute daily snapshot for yesterday
-  await computeDailySnapshot(env, channelTwitchId, statDate, avgScore, avgRank.lp, medianScore, medianRank.lp, totalViewers, streamerUsernames);
+  await computeDailySnapshot(db, channelTwitchId, statDate, avgScore, avgRank.lp, medianScore, medianRank.lp, totalViewers, streamerUsernames);
 
   console.log(`[StatsCron] ${channelTwitchId}: ${totalViewers} non-streamer viewers, avg=${avgRank.tier}${avgRank.division ? ' ' + avgRank.division : ''}`);
 }
 
 /**
  * Compute daily snapshot metrics for a specific day
+ * @param {Object} db - D1 database wrapper with query counter
+ * @param {string} channelTwitchId - Channel Twitch ID
+ * @param {string} statDate - Current stat date window
+ * @param {number} alltimeAvgScore - All-time average rank score
+ * @param {number} alltimeAvgLp - All-time average LP
+ * @param {number} alltimeMedianScore - All-time median rank score
+ * @param {number} alltimeMedianLp - All-time median LP
+ * @param {number} alltimeViewerCount - All-time viewer count
  * @param {Set<string>} streamerUsernames - Set of eligible leaderboard streamer usernames to exclude
  */
-async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgScore, alltimeAvgLp, alltimeMedianScore, alltimeMedianLp, alltimeViewerCount, streamerUsernames) {
-  // Get viewers who qualified on THIS SPECIFIC DAY
-  const dailyViewersResult = await env.DB.prepare(`
+async function computeDailySnapshot(db, channelTwitchId, statDate, alltimeAvgScore, alltimeAvgLp, alltimeMedianScore, alltimeMedianLp, alltimeViewerCount, streamerUsernames) {
+  const dailyViewersResult = await db.prepare(`
     SELECT DISTINCT riot_puuid
     FROM channel_viewers_daily
     WHERE channel_twitch_id = ? AND stat_date = ?
@@ -281,32 +462,21 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
   const dailyPuuids = dailyViewersResult.results || [];
 
   if (dailyPuuids.length === 0) {
-    // No viewers on this specific day, don't create snapshot
     return;
   }
 
-  // Get ranks for viewers who watched THIS DAY
-  const dailyRankedViewers = await getRankedViewers(env, dailyPuuids.map(v => v.riot_puuid));
-
-  // Filter out channel owner and eligible leaderboard streamers from daily statistics
-  const ownerPuuid = await getChannelOwnerPuuid(env, channelTwitchId);
+  const dailyRankedViewers = await getRankedViewers(db, dailyPuuids.map(v => v.riot_puuid));
+  const dailyOwnerPuuids = await getChannelOwnerPuuids(db, channelTwitchId);
   const filteredDailyViewers = dailyRankedViewers.filter(v => {
-    // Exclude channel owner by PUUID
-    if (ownerPuuid && v.riot_puuid === ownerPuuid) return false;
-
-    // Exclude eligible leaderboard streamers (case-insensitive comparison)
+    if (dailyOwnerPuuids.has(v.riot_puuid)) return false;
     const viewerUsernameLower = v.twitch_username?.toLowerCase();
     if (viewerUsernameLower && streamerUsernames.has(viewerUsernameLower)) return false;
-
     return true;
   });
 
   if (filteredDailyViewers.length === 0) {
-    // No ranked viewers on this day (excluding self and streamers)
     return;
   }
-
-  // Calculate daily average and median scores (excluding self and streamers)
   const dailyScores = filteredDailyViewers.map(v =>
     calculateRankScore(v.effective_tier, v.effective_division, v.effective_lp || 0)
   );
@@ -314,7 +484,6 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
   const dailyRank = scoreToRank(dailyAvgScore);
   const dailyAvgLp = dailyRank.lp;
 
-  // Calculate daily median
   const sortedDailyScores = [...dailyScores].sort((a, b) => a - b);
   const dailyMedianScore = sortedDailyScores.length % 2 === 0
     ? (sortedDailyScores[sortedDailyScores.length / 2 - 1] + sortedDailyScores[sortedDailyScores.length / 2]) / 2
@@ -322,8 +491,7 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
   const dailyMedianRank = scoreToRank(dailyMedianScore);
   const dailyMedianLp = dailyMedianRank.lp;
 
-  // Insert/update daily snapshot
-  await env.DB.prepare(`
+  await db.prepare(`
     INSERT INTO channel_daily_snapshots
       (stat_date, channel_twitch_id, daily_viewer_count, daily_avg_rank_score, daily_avg_lp,
        daily_median_rank_score, daily_median_lp, alltime_avg_rank_score, alltime_avg_lp,
@@ -359,13 +527,9 @@ async function computeDailySnapshot(env, channelTwitchId, statDate, alltimeAvgSc
 /**
  * Get all eligible leaderboard channel usernames (>= 10 viewers)
  * These are streamers who shouldn't count as viewers for other channels
- * Returns a Set of lowercase twitch usernames for efficient lookup
- *
- * Note: Uses LOWER() to ensure case-insensitive matching since lol_ranks.twitch_username
- * may have different casing than channel_twitch_id (which is always lowercase)
  */
-async function getLeaderboardStreamerUsernames(env) {
-  const result = await env.DB.prepare(`
+async function getLeaderboardStreamerUsernames(db) {
+  const result = await db.prepare(`
     SELECT LOWER(channel_twitch_id) as channel_twitch_id
     FROM channel_stats_cache
     WHERE is_eligible = 1
@@ -375,40 +539,70 @@ async function getLeaderboardStreamerUsernames(env) {
 }
 
 /**
- * Get the channel owner's riot_puuid (if they have a linked League account)
- * Returns null if the channel owner doesn't have a linked account
- *
- * Uses COLLATE NOCASE to handle case-insensitive matching since:
- * - channel_twitch_id is always lowercase
- * - lol_ranks.twitch_username may have original casing
+ * Get the channel owner's riot_puuid(s) by exact username match
  */
-async function getChannelOwnerPuuid(env, channelTwitchId) {
-  const result = await env.DB.prepare(`
+async function getChannelOwnerPuuids(db, channelTwitchId) {
+  const ownerPuuids = new Set();
+  const exactMatch = await db.prepare(`
     SELECT riot_puuid
     FROM lol_ranks
     WHERE LOWER(twitch_username) = LOWER(?)
   `).bind(channelTwitchId).first();
 
-  return result ? result.riot_puuid : null;
+  if (exactMatch) {
+    ownerPuuids.add(exactMatch.riot_puuid);
+  }
+
+  return ownerPuuids;
+}
+
+/**
+ * Get the channel's display name (proper capitalization) from the database
+ */
+async function getChannelDisplayName(db, channelTwitchId) {
+  const userResult = await db.prepare(`
+    SELECT display_name
+    FROM users
+    WHERE LOWER(channel_name) = LOWER(?)
+  `).bind(channelTwitchId).first();
+
+  if (userResult?.display_name) {
+    return userResult.display_name;
+  }
+
+  const lolRanksResult = await db.prepare(`
+    SELECT twitch_username
+    FROM lol_ranks
+    WHERE LOWER(twitch_username) = LOWER(?)
+  `).bind(channelTwitchId).first();
+
+  if (lolRanksResult?.twitch_username) {
+    return lolRanksResult.twitch_username;
+  }
+
+  return channelTwitchId;
 }
 
 /**
  * Get rank data for viewers in batches (respects show_peak flag)
- * Handles large viewer lists by batching IN clauses
  */
-async function getRankedViewers(env, puuids) {
+async function getRankedViewers(db, puuids) {
   if (puuids.length === 0) {
     return [];
   }
 
-  const BATCH_SIZE = 500; // SQLite limit is 999, use 500 for safety
+  const BATCH_SIZE = 100;
   const allViewers = [];
+
+  if (puuids.length > BATCH_SIZE) {
+    console.log(`[getRankedViewers] batching ${puuids.length} PUUIDs in chunks of ${BATCH_SIZE}`);
+  }
 
   for (let i = 0; i < puuids.length; i += BATCH_SIZE) {
     const batch = puuids.slice(i, i + BATCH_SIZE);
     const placeholders = batch.map(() => '?').join(',');
 
-    const result = await env.DB.prepare(`
+    const result = await db.prepare(`
       SELECT
         riot_puuid,
         twitch_username,
@@ -439,30 +633,19 @@ async function getRankedViewers(env, puuids) {
 
 /**
  * Calculate numeric score from League of Legends rank
- *
- * Clean linear system: 100 LP = 100 points
- * - Iron IV 0 LP = 0
- * - Each division = 100 points (0-99 LP)
- * - Each tier (Iron-Diamond) = 400 points (4 divisions)
- *
- * Master+ tiers (no divisions):
- * - Diamond I 100 LP promotes to Master 0 LP
- * - Master starts at 2800 (Diamond I maxes at 2799)
- * - All Master+ ranks use continuous LP (no divisions)
- * - GM/Challenger are competitive slots but we treat them as LP thresholds for calculation
  */
 function calculateRankScore(tier, division, lp) {
   const tierBase = {
-    'IRON': 0,        // 0-399
-    'BRONZE': 400,    // 400-799
-    'SILVER': 800,    // 800-1199
-    'GOLD': 1200,     // 1200-1599
-    'PLATINUM': 1600, // 1600-1999
-    'EMERALD': 2000,  // 2000-2399
-    'DIAMOND': 2400,  // 2400-2799 (Diamond I 99 LP = 2799)
-    'MASTER': 2800,   // 2800+ (no upper bound, but GM typically starts ~3000+)
-    'GRANDMASTER': 2800, // Same as Master since they share LP pool
-    'CHALLENGER': 2800   // Same as Master since they share LP pool
+    'IRON': 0,
+    'BRONZE': 400,
+    'SILVER': 800,
+    'GOLD': 1200,
+    'PLATINUM': 1600,
+    'EMERALD': 2000,
+    'DIAMOND': 2400,
+    'MASTER': 2800,
+    'GRANDMASTER': 2800,
+    'CHALLENGER': 2800
   };
 
   const divisionOffset = {
@@ -479,12 +662,10 @@ function calculateRankScore(tier, division, lp) {
   const tierUpper = tier.toUpperCase();
   let score = tierBase[tierUpper] || 0;
 
-  // For Iron-Diamond: add division offset
   if (division && divisionOffset[division.toUpperCase()] !== undefined) {
     score += divisionOffset[division.toUpperCase()];
   }
 
-  // Add LP (full value)
   score += (lp || 0);
 
   return score;
@@ -492,22 +673,11 @@ function calculateRankScore(tier, division, lp) {
 
 /**
  * Convert numeric score back to human-readable rank with LP
- *
- * Score ranges:
- * - 0-2799: Iron IV - Diamond I (with divisions)
- * - 2800+: Master/Grandmaster/Challenger (continuous LP, no divisions)
- *
- * For display purposes, we use rough LP thresholds:
- * - Master: 2800-2999 (0-199 LP)
- * - Grandmaster: 3000-3499 (200-699 LP, typical threshold ~200)
- * - Challenger: 3500+ (500+ LP, typical threshold ~500)
  */
 function scoreToRank(score) {
-  // Master+ tiers (2800+)
   if (score >= 2800) {
     const lpInMaster = score - 2800;
 
-    // Rough thresholds for display (actual GM/Challenger are competitive slots)
     if (lpInMaster >= 700) {
       return { tier: 'CHALLENGER', division: null, lp: Math.round(lpInMaster) };
     } else if (lpInMaster >= 200) {
@@ -517,7 +687,6 @@ function scoreToRank(score) {
     }
   }
 
-  // Iron-Diamond tiers (0-2799)
   const tiers = [
     { name: 'DIAMOND', min: 2400 },
     { name: 'EMERALD', min: 2000 },
@@ -531,8 +700,6 @@ function scoreToRank(score) {
   for (const tier of tiers) {
     if (score >= tier.min) {
       const scoreInTier = score - tier.min;
-
-      // Each division is 100 points (0-99 LP)
       const divisionIndex = Math.floor(scoreInTier / 100);
       const lpInDivision = Math.round(scoreInTier % 100);
 
@@ -548,14 +715,12 @@ function scoreToRank(score) {
 
 /**
  * Get current stat_date window
- * Windows reset at 07:00 UTC, so this accounts for that
- * If it's before 07:00 UTC, we're still in yesterday's window
+ * Windows reset at 07:00 UTC
  */
 function getCurrentWindow() {
   const now = new Date();
   const utcHour = now.getUTCHours();
 
-  // If before 07:00 UTC, we're still in yesterday's window
   if (utcHour < 7) {
     now.setUTCDate(now.getUTCDate() - 1);
   }
