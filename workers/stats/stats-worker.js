@@ -630,9 +630,21 @@ async function getRankedViewers(db, puuids) {
       SELECT
         riot_puuid,
         twitch_username,
-        rank_tier as effective_tier,
-        rank_division as effective_division,
-        lp as effective_lp
+        CASE
+          WHEN plus_active = 1 AND show_peak = 1 AND peak_rank_tier IS NOT NULL
+            THEN peak_rank_tier
+          ELSE rank_tier
+        END as effective_tier,
+        CASE
+          WHEN plus_active = 1 AND show_peak = 1 AND peak_rank_tier IS NOT NULL
+            THEN peak_rank_division
+          ELSE rank_division
+        END as effective_division,
+        CASE
+          WHEN plus_active = 1 AND show_peak = 1 AND peak_rank_tier IS NOT NULL
+            THEN peak_lp
+          ELSE lp
+        END as effective_lp
       FROM lol_ranks
       WHERE riot_puuid IN (${placeholders})
     `).bind(...batch).all();
