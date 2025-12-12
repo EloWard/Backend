@@ -322,9 +322,18 @@ async function computeChannelStats(db, channelTwitchId, statDate, streamerUserna
   }
 
   const rankedViewers = await getRankedViewers(db, viewerPuuids.map(v => v.riot_puuid));
+
+  // Deduplicate by PUUID to avoid double-counting if multiple rank rows exist
+  const rankedViewersByPuuid = [];
+  const seenPuuids = new Set();
+  for (const viewer of rankedViewers) {
+    if (!viewer?.riot_puuid || seenPuuids.has(viewer.riot_puuid)) continue;
+    seenPuuids.add(viewer.riot_puuid);
+    rankedViewersByPuuid.push(viewer);
+  }
   const ownerPuuids = await getChannelOwnerPuuids(db, channelTwitchId);
 
-  const filteredViewers = rankedViewers.filter(v => {
+  const filteredViewers = rankedViewersByPuuid.filter(v => {
     if (ownerPuuids.has(v.riot_puuid)) {
       return false;
     }
@@ -370,7 +379,8 @@ async function computeChannelStats(db, channelTwitchId, statDate, streamerUserna
     puuid: viewer.riot_puuid,
     twitch_username: viewer.twitch_username,
     tier: viewer.effective_tier,
-    division: viewer.effective_division,
+    // Master+ officially have no divisions; sanitize in case data has "I" etc.
+    division: isMasterPlus(viewer.effective_tier) ? null : viewer.effective_division,
     lp: viewer.effective_lp || 0,
     score: calculateRankScore(viewer.effective_tier, viewer.effective_division, viewer.effective_lp || 0)
   }));
@@ -620,21 +630,9 @@ async function getRankedViewers(db, puuids) {
       SELECT
         riot_puuid,
         twitch_username,
-        CASE
-          WHEN show_peak = 1 AND peak_rank_tier IS NOT NULL
-            THEN peak_rank_tier
-          ELSE rank_tier
-        END as effective_tier,
-        CASE
-          WHEN show_peak = 1 AND peak_rank_tier IS NOT NULL
-            THEN peak_rank_division
-          ELSE rank_division
-        END as effective_division,
-        CASE
-          WHEN show_peak = 1 AND peak_rank_tier IS NOT NULL
-            THEN peak_lp
-          ELSE lp
-        END as effective_lp
+        rank_tier as effective_tier,
+        rank_division as effective_division,
+        lp as effective_lp
       FROM lol_ranks
       WHERE riot_puuid IN (${placeholders})
     `).bind(...batch).all();
@@ -649,6 +647,13 @@ async function getRankedViewers(db, puuids) {
  * Calculate numeric score from League of Legends rank
  */
 function calculateRankScore(tier, division, lp) {
+  if (!tier) {
+    return 0;
+  }
+
+  const tierUpper = tier.toUpperCase();
+  const isMasterPlus = tierUpper === 'MASTER' || tierUpper === 'GRANDMASTER' || tierUpper === 'CHALLENGER';
+
   const tierBase = {
     'IRON': 0,
     'BRONZE': 400,
@@ -669,14 +674,10 @@ function calculateRankScore(tier, division, lp) {
     'I': 300
   };
 
-  if (!tier) {
-    return 0;
-  }
-
-  const tierUpper = tier.toUpperCase();
   let score = tierBase[tierUpper] || 0;
 
-  if (division && divisionOffset[division.toUpperCase()] !== undefined) {
+  // Master+ have no divisions; ignore any stored division to avoid inflating score
+  if (!isMasterPlus && division && divisionOffset[division.toUpperCase()] !== undefined) {
     score += divisionOffset[division.toUpperCase()];
   }
 
@@ -725,6 +726,12 @@ function scoreToRank(score) {
   }
 
   return { tier: 'IRON', division: 'IV', lp: 0 };
+}
+
+function isMasterPlus(tier) {
+  if (!tier) return false;
+  const t = tier.toUpperCase();
+  return t === 'MASTER' || t === 'GRANDMASTER' || t === 'CHALLENGER';
 }
 
 /**
