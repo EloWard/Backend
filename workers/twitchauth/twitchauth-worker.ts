@@ -128,8 +128,8 @@ function corsResponse(status: number, data: any, request?: Request): Response {
 }
 
 // Health check endpoint
-router.get('/health', () => {
-  return corsResponse(200, { status: 'ok', service: 'eloward-twitchauth' });
+router.get('/health', (request) => {
+  return corsResponse(200, { status: 'ok', service: 'eloward-twitchauth' }, request);
 });
 
 // Handle OPTIONS requests for CORS
@@ -181,7 +181,7 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
     const redirect_uri = (body?.redirect_uri as string | undefined) || STANDARD_REDIRECT_URI;
 
     if (!code) {
-      return corsResponse(400, { error: 'missing_parameters', error_description: 'Required parameter: code' });
+      return corsResponse(400, { error: 'missing_parameters', error_description: 'Required parameter: code' }, request);
     }
 
     // 1) Exchange code for tokens (server-side only)
@@ -204,7 +204,7 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
       return corsResponse(tokenResponse.status || 400, {
         error: (tokenData as any)?.error || 'token_exchange_error',
         error_description: (tokenData as any)?.error_description || 'Failed to exchange code for token',
-      });
+      }, request);
     }
 
     // 2) Fetch user info from Twitch
@@ -218,13 +218,13 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
 
     if (!userResponse.ok) {
       const errText = await userResponse.text();
-      return corsResponse(userResponse.status, { error: 'twitch_user_error', error_description: errText });
+      return corsResponse(userResponse.status, { error: 'twitch_user_error', error_description: errText }, request);
     }
 
     const userJson = await userResponse.json();
     const twitchUser = (userJson?.data && userJson.data[0]) as TwitchUserInfo | undefined;
     if (!twitchUser?.id || !twitchUser?.login) {
-      return corsResponse(500, { error: 'invalid_user_data', error_description: 'Missing id/login from Twitch' });
+      return corsResponse(500, { error: 'invalid_user_data', error_description: 'Missing id/login from Twitch' }, request);
     }
 
     // 3) Register/update user in Users worker
@@ -244,7 +244,7 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
 
     const usersWorkerRequest = new Request('https://users-worker/user/register', {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
         'X-Internal-Auth': env.USERS_WRITE_KEY
       },
@@ -254,7 +254,7 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
     const usersWorkerResponse = await env.USERS_WORKER.fetch(usersWorkerRequest);
     if (!usersWorkerResponse.ok) {
       const tx = await usersWorkerResponse.text();
-      return corsResponse(usersWorkerResponse.status, { error: 'user_register_failed', error_description: tx });
+      return corsResponse(usersWorkerResponse.status, { error: 'user_register_failed', error_description: tx }, request);
     }
 
     // 4) Return minimal user info to client (no tokens, no email)
@@ -266,9 +266,9 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
         display_name: twitchUser.display_name,
         profile_image_url: twitchUser.profile_image_url
       },
-    });
+    }, request);
   } catch (error: any) {
-    return corsResponse(500, { error: 'server_error', error_description: error?.message || 'Unknown error' });
+    return corsResponse(500, { error: 'server_error', error_description: error?.message || 'Unknown error' }, request);
   }
 });
 
@@ -291,8 +291,8 @@ router.post('/twitch/auth', async (request: Request, env: Env) => {
 // Removed legacy store-user endpoint
 
 // Catch-all handler for 404s
-router.all('*', () => {
-  return corsResponse(404, { error: 'Not found' });
+router.all('*', (request) => {
+  return corsResponse(404, { error: 'Not found' }, request);
 });
 
 // Main fetch handler
@@ -305,7 +305,7 @@ export default {
     
     // Handle all other requests via the router
     return router.handle(request, env, ctx).catch((error: any) => {
-      return corsResponse(500, { error: 'Internal Server Error' });
+      return corsResponse(500, { error: 'Internal Server Error' }, request);
     });
   },
 }; 
