@@ -337,22 +337,23 @@ async function getRankByPuuid(request, env, corsHeaders) {
   try {
     const body = await request.json();
     requestedPuuid = body?.puuid;
-    
+    const rawMode = body?.raw === true;
+
     if (!requestedPuuid) {
       return jsonResponse({ error: "Missing puuid parameter" }, 400, corsHeaders);
     }
-    
+
     const result = await env.DB.prepare(
       "SELECT twitch_username, riot_id, rank_tier, rank_division, lp, region, plus_active, last_updated, peak_rank_tier, peak_rank_division, peak_lp, show_peak, animate_badge FROM lol_ranks WHERE riot_puuid = ?"
     ).bind(requestedPuuid).first();
-    
+
     if (!result) {
       return jsonResponse({ error: "User rank not found" }, 404, corsHeaders);
     }
-    
+
     // Return peak rank data if show_peak is true AND plus_active is true, otherwise current rank
-    // This endpoint is used for frontend sync - return all options for proper state management
-    const showPeak = result.plus_active && result.show_peak;
+    // Raw mode skips substitution for internal worker-to-worker calls
+    const showPeak = !rawMode && result.plus_active && result.show_peak;
     
     const responseData = {
       twitch_username: result.twitch_username,
@@ -453,7 +454,7 @@ async function refreshSingleRank(puuid, env) {
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ puuid })
+    body: JSON.stringify({ puuid, source: 'cron' })
   });
 
   const response = await env.RIOTAUTH_WORKER.fetch(request);

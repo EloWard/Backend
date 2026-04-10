@@ -110,7 +110,6 @@ class OpGGScraper {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'no-cache',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
@@ -315,10 +314,10 @@ async function seedPeakRankAsync(
     try {
       // Scrape op.gg HTML
       const html = await scraper.scrapeUrl(opggUrl);
-      
+
       // Extract ranks and find peak
       const allRanks = scraper.extractAllRanksFromHTML(html);
-      
+
       if (allRanks.length === 0) {
         console.log(`[PeakSeed] No rank history found for ${riotId}`);
         return; // No data to process
@@ -371,7 +370,7 @@ async function updatePeakRank(puuid: string, riotId: string, region: string, pea
         'Content-Type': 'application/json',
         'X-Internal-Auth': env.RANK_WRITE_KEY
       },
-      body: JSON.stringify({ puuid })
+      body: JSON.stringify({ puuid, raw: true })
     });
 
     const lookupResponse = await env.RANK_WORKER.fetch(lookupRequest);
@@ -904,9 +903,9 @@ router.post('/auth/complete', async (request: Request, env: Env, ctx: ExecutionC
 // Removed legacy /riot/league/:platform/:puuid endpoint
 
 // Simplified rank refresh endpoint that uses PUUID only
-router.post('/riot/refreshrank', async (request: Request, env: Env) => {
+router.post('/riot/refreshrank', async (request: Request, env: Env, ctx: ExecutionContext) => {
   try {
-    const { puuid } = await request.json();
+    const { puuid, source } = await request.json() as { puuid?: string; source?: string };
 
     if (!puuid) {
       return corsResponse(400, {
@@ -973,6 +972,21 @@ router.post('/riot/refreshrank', async (request: Request, env: Env) => {
     const updateResponse = await env.RANK_WORKER.fetch(updateRequest);
     if (!updateResponse.ok) {
       throw new Error(`Failed to update rank: ${updateResponse.status}`);
+    }
+
+    // Trigger async peak rank seeding on user-initiated refreshes (skip cron)
+    if (source !== 'cron') {
+      ctx.waitUntil(
+        Promise.race([
+          seedPeakRankAsync(puuid, userData.riot_id, userData.region, currentRank, env),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Peak seeding timeout')), 25000)
+          )
+        ]).catch(error => {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          console.warn(`[RefreshRank] Peak seeding failed for ${userData.riot_id}: ${errorMsg}`);
+        })
+      );
     }
 
     // Get final user data (rank-worker returns correct current/peak based on show_peak setting)
