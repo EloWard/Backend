@@ -96,16 +96,31 @@ const REGION_MAPPING: Record<string, string> = {
 
 // Rank hierarchy for comparison (matches test-opgg-scraper.js)
 const RANK_ORDER: Record<string, number> = {
-  'IRON': 1, 'BRONZE': 2, 'SILVER': 3, 'GOLD': 4, 
+  'IRON': 1, 'BRONZE': 2, 'SILVER': 3, 'GOLD': 4,
   'PLATINUM': 5, 'EMERALD': 6, 'DIAMOND': 7,
   'MASTER': 8, 'GRANDMASTER': 9, 'CHALLENGER': 10
 };
 
+// Non-apex division ordering. Apex tiers (Master+) have no division -- LP
+// alone decides ordering within the tier, so division is ignored there.
 const DIVISION_ORDER: Record<string, number> = { '4': 1, '3': 2, '2': 3, '1': 4 };
+
+const VALID_TIERS: Set<string> = new Set(Object.keys(RANK_ORDER));
+
+// Roman division strings from Riot API -> Arabic strings op.gg emits. Keeping
+// one internal representation avoids silently mis-ordering cross-source data.
+const ROMAN_TO_ARABIC: Record<string, string> = { I: '1', II: '2', III: '3', IV: '4' };
+
+interface ScrapedRank {
+  tier: string;
+  division: string | null;
+  lp: number;
+  season: string;
+  type: string;
+}
 
 // OpGG scraper for Cloudflare Workers
 class OpGGScraper {
-  // Headers that work with op.gg
   private static readonly HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -123,7 +138,6 @@ class OpGGScraper {
       headers: OpGGScraper.HEADERS
     });
 
-    // Handle common HTTP errors
     if (!response.ok) {
       const status = response.status;
       switch (status) {
@@ -143,142 +157,137 @@ class OpGGScraper {
     return await response.text();
   }
 
-  extractAllRanksFromHTML(html: string): any[] {
-    const allRanks: any[] = [];
-    
-    // Extract current rank
-    const currentRank = this.extractCurrentRank(html);
-    if (currentRank) {
-      allRanks.push(currentRank);
+  /**
+   * Extract every usable rank from an op.gg solo-queue profile page.
+   *
+   * op.gg renders with Next.js RSC streaming: the real per-season peak data
+   * lives inside self.__next_f.push([1,"<escaped-JSON>"]) blobs, not in the
+   * HTML markup. For each season the payload contains:
+   *   rank_entries.high_rank_info -- peak reached mid-season (hover tooltip).
+   *                                  tier="" / lp=null when op.gg didn't track
+   *                                  hover-peak for that season.
+   *   rank_entries.rank_info      -- end-of-season placement (always present
+   *                                  when the user played ranked).
+   * We emit every valid block; findHighestRank picks the overall best.
+   */
+  extractAllRanksFromHTML(html: string): ScrapedRank[] {
+    const payloads = this.collectNextPushPayloads(html);
+    if (payloads.length === 0) return [];
+
+    let decoded: string;
+    try {
+      decoded = JSON.parse('"' + payloads.join('') + '"');
+    } catch {
+      return [];
     }
 
-    // Extract peak rank
-    const peakRank = this.extractPeakRank(html);
-    if (peakRank) {
-      allRanks.push(peakRank);
-    }
-
-    // Extract historical ranks
-    const historicalRanks = this.extractHistoricalRanks(html);
-    allRanks.push(...historicalRanks);
-
-    return allRanks;
-  }
-
-  private extractCurrentRank(html: string): any | null {
-    // Exact copy from working manual script
-    const currentPattern = /<strong class="text-xl first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span class="leading-\[26px\]">(\d+)(?:<!--[^>]*-->)?W(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?L<\/span>[\s\S]*?<span>Win rate(?:<!--[^>]*-->)?\s*(?:<!--[^>]*-->)?(\d+)(?:<!--[^>]*-->)?%<\/span>/;
-    
-    const match = html.match(currentPattern);
-    if (match) {
-      const rankText = match[1]?.trim().toLowerCase();
-      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
-      const wins = parseInt(match[3]) || 0;
-      const losses = parseInt(match[4]) || 0;
-      const winRate = parseInt(match[5]) || 0;
-      
-      const rankParts = rankText.split(/\s+/);
-      const tier = rankParts[0]?.toUpperCase();
-      const division = rankParts[1] || null;
-      
-      if (this.isValidTier(tier)) {
-        return {
-          tier,
-          division,
-          lp,
-          wins,
-          losses,
-          winRate,
-          type: 'current'
-        };
+    const ranks: ScrapedRank[] = [];
+    const kinds: Array<[string, string]> = [['high_rank_info', 'high'], ['rank_info', 'ended']];
+    for (const season of this.collectSeasonObjects(decoded)) {
+      const entries = season.rank_entries || {};
+      for (const [field, type] of kinds) {
+        const info = entries[field];
+        if (!info || typeof info.tier !== 'string' || !info.tier || info.lp == null) continue;
+        const r = this.normalizeRank(info.tier, info.lp, season.season, type);
+        if (r) ranks.push(r);
       }
     }
-    
-    return null;
-  }
-
-  private extractPeakRank(html: string): any | null {
-    // Exact copy from working manual script
-    const peakPattern = /<strong class="text-sm first-letter:uppercase">([^<]+)<\/strong>[\s\S]*?<span class="text-xs text-gray-500">([0-9,]+)(?:<!--[^>]*-->)?\s*LP<\/span>[\s\S]*?<span[^>]*>Top Tier<\/span>/;
-    
-    const match = html.match(peakPattern);
-    if (match) {
-      const rankText = match[1]?.trim().toLowerCase();
-      const lp = parseInt(match[2]?.replace(/[^0-9]/g, '')) || 0;
-      
-      const rankParts = rankText.split(/\s+/);
-      const tier = rankParts[0]?.toUpperCase();
-      const division = rankParts[1] || null;
-      
-      if (this.isValidTier(tier)) {
-        return {
-          tier,
-          division,
-          lp,
-          type: 'peak'
-        };
-      }
-    }
-    
-    return null;
-  }
-
-  private extractHistoricalRanks(html: string): any[] {
-    const ranks: any[] = [];
-    
-    // Exact copy from working manual script
-    const tableRowPattern = /<tr class="bg-main-100[^"]*"[^>]*>.*?<strong[^>]*>(S\d{4}[^<]*)<\/strong>.*?<span class="text-xs lowercase first-letter:uppercase">([^<]+)<\/span>.*?<td align="right" class="text-xs text-gray-500">([0-9,]+)<\/td>/gs;
-    
-    let match;
-    while ((match = tableRowPattern.exec(html)) !== null) {
-      const season = match[1]?.trim();
-      const rankText = match[2]?.trim().toLowerCase();
-      const lp = parseInt(match[3]?.replace(/[^0-9]/g, '')) || 0;
-      
-      const rankParts = rankText.split(/\s+/);
-      const tier = rankParts[0]?.toUpperCase();
-      const division = rankParts[1] || null;
-      
-      if (this.isValidTier(tier)) {
-        ranks.push({
-          tier,
-          division,
-          lp,
-          season,
-          type: 'historical'
-        });
-      }
-    }
-    
     return ranks;
   }
 
-  private isValidTier(tier: string): boolean {
-    const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
-    return validTiers.includes(tier);
+  private collectNextPushPayloads(html: string): string[] {
+    const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
+    const out: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) out.push(m[1]);
+    return out;
   }
 
-  findHighestRank(ranks: any[]): any | null {
-    if (ranks.length === 0) return null;
-    
-    return ranks.reduce((highest, current) => {
-      const currentValue = this.calculateRankValue(current);
-      const highestValue = this.calculateRankValue(highest);
-      
-      if (currentValue > highestValue) {
-        return current;
-      } else if (currentValue === highestValue && current.lp > highest.lp) {
-        return current;
+  private collectSeasonObjects(text: string): any[] {
+    const needle = '{"season":"';
+    const out: any[] = [];
+    let idx = 0;
+    while ((idx = text.indexOf(needle, idx)) !== -1) {
+      const end = this.matchBalancedBrace(text, idx);
+      if (end === -1) break;
+      const slice = text.substring(idx, end + 1);
+      idx = end + 1;
+      let obj: any;
+      try { obj = JSON.parse(slice); } catch { continue; }
+      if (obj && typeof obj.season === 'string' && obj.rank_entries) out.push(obj);
+    }
+    return out;
+  }
+
+  // Given text[start] === '{', return the index of the matching '}', or -1.
+  // Skips over JSON string literals so braces inside strings don't confuse us.
+  private matchBalancedBrace(text: string, start: number): number {
+    if (text[start] !== '{') return -1;
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (c === '"') {
+        i++;
+        while (i < text.length && text[i] !== '"') {
+          if (text[i] === '\\') i++;
+          i++;
+        }
+        continue;
       }
-      
-      return highest;
-    });
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
   }
 
-  private calculateRankValue(rank: any): number {
-    const tierValue = RANK_ORDER[rank.tier] || 0;
-    const divisionValue = DIVISION_ORDER[rank.division] || 5;
-    return tierValue * 10000 + divisionValue * 1000 + Math.min(rank.lp || 0, 9999);
+  private normalizeRank(tierStr: string, lpStr: string | number, season: string, type: string): ScrapedRank | null {
+    const parts = String(tierStr).trim().toLowerCase().split(/\s+/);
+    const tier = (parts[0] || '').toUpperCase();
+    if (!VALID_TIERS.has(tier)) return null;
+    const division = parts[1] || null;
+    const lp = parseInt(String(lpStr).replace(/[^0-9]/g, ''), 10) || 0;
+    return { tier, division, lp, season: (season || '').trim(), type };
+  }
+
+  // Convert a Riot API league entry ({tier, rank, leaguePoints}) into the same
+  // shape the scraper emits, so it can participate in findHighestRank.
+  normalizeRiotCurrentRank(current: any): ScrapedRank | null {
+    if (!current || !current.tier) return null;
+    const tier = String(current.tier).toUpperCase();
+    if (!VALID_TIERS.has(tier)) return null;
+    const rawDiv = current.rank ? String(current.rank).toUpperCase() : null;
+    const division = rawDiv ? (ROMAN_TO_ARABIC[rawDiv] || rawDiv) : null;
+    return {
+      tier,
+      division,
+      lp: parseInt(current.leaguePoints, 10) || 0,
+      season: 'CURRENT',
+      type: 'current_riot'
+    };
+  }
+
+  findHighestRank(ranks: ScrapedRank[]): ScrapedRank | null {
+    if (!ranks || ranks.length === 0) return null;
+    return ranks.reduce((best, cur) => (this.isRankHigher(cur, best) ? cur : best));
+  }
+
+  // Mirrors isRankHigher in rank-worker.js so seeding and the live rank-write
+  // path agree on ordering.
+  private isRankHigher(a: ScrapedRank, b: ScrapedRank): boolean {
+    if (!b || !b.tier) return true;
+    if (!a || !a.tier) return false;
+    const aTier = RANK_ORDER[a.tier] || 0;
+    const bTier = RANK_ORDER[b.tier] || 0;
+    if (aTier === 0 || bTier === 0) return false;
+    if (aTier !== bTier) return aTier > bTier;
+    if (aTier >= 8) return (a.lp || 0) > (b.lp || 0); // Master+: LP only.
+    const aDiv = DIVISION_ORDER[a.division || ''] || 0;
+    const bDiv = DIVISION_ORDER[b.division || ''] || 0;
+    if (aDiv !== bDiv) return aDiv > bDiv;
+    return (a.lp || 0) > (b.lp || 0);
   }
 }
 
@@ -315,21 +324,26 @@ async function seedPeakRankAsync(
       // Scrape op.gg HTML
       const html = await scraper.scrapeUrl(opggUrl);
 
-      // Extract ranks and find peak
+      // Extract every per-season rank op.gg exposes in its RSC stream, then
+      // mix in the live current rank from Riot API. Riot data is always
+      // fresher than op.gg's scrape and occasionally op.gg lags a split, so
+      // including both guarantees we never seed a peak below current.
       const allRanks = scraper.extractAllRanksFromHTML(html);
+      const currentNorm = scraper.normalizeRiotCurrentRank(currentRank);
+      if (currentNorm) allRanks.push(currentNorm);
 
       if (allRanks.length === 0) {
         console.log(`[PeakSeed] No rank history found for ${riotId}`);
         return; // No data to process
       }
-      
+
       peakRank = scraper.findHighestRank(allRanks);
-      
+
       if (!peakRank) {
         console.log(`[PeakSeed] No valid peak rank extracted for ${riotId}`);
         return; // Invalid data
       }
-      
+
       console.log(`[PeakSeed] Peak rank found: ${peakRank.tier} ${peakRank.division || 'N/A'} ${peakRank.lp}LP for ${riotId}`);
       
     } catch (error) {
@@ -903,9 +917,9 @@ router.post('/auth/complete', async (request: Request, env: Env, ctx: ExecutionC
 // Removed legacy /riot/league/:platform/:puuid endpoint
 
 // Simplified rank refresh endpoint that uses PUUID only
-router.post('/riot/refreshrank', async (request: Request, env: Env, ctx: ExecutionContext) => {
+router.post('/riot/refreshrank', async (request: Request, env: Env) => {
   try {
-    const { puuid, source } = await request.json() as { puuid?: string; source?: string };
+    const { puuid } = await request.json() as { puuid?: string };
 
     if (!puuid) {
       return corsResponse(400, {
@@ -974,20 +988,13 @@ router.post('/riot/refreshrank', async (request: Request, env: Env, ctx: Executi
       throw new Error(`Failed to update rank: ${updateResponse.status}`);
     }
 
-    // Trigger async peak rank seeding on user-initiated refreshes (skip cron)
-    if (source !== 'cron') {
-      ctx.waitUntil(
-        Promise.race([
-          seedPeakRankAsync(puuid, userData.riot_id, userData.region, currentRank, env),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Peak seeding timeout')), 25000)
-          )
-        ]).catch(error => {
-          const errorMsg = error instanceof Error ? error.message : String(error);
-          console.warn(`[RefreshRank] Peak seeding failed for ${userData.riot_id}: ${errorMsg}`);
-        })
-      );
-    }
+    // Peak-rank seeding intentionally does NOT run on refresh. It only runs
+    // once, on initial Riot account connect (see the /riot/auth handler).
+    // Re-scraping op.gg on every refresh risked overwriting a true peak with
+    // whatever partial/lagging data op.gg happened to expose -- which is how
+    // users got their peak silently demoted. Regular refreshes go through
+    // rank-worker.storeRank, which already raises peak monotonically from
+    // Riot's current-rank data when current > stored peak.
 
     // Get final user data (rank-worker returns correct current/peak based on show_peak setting)
     const getFinalUserRequest = new Request('https://rank-worker/api/ranks/lol/by-puuid', {
